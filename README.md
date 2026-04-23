@@ -18,7 +18,7 @@ Before you begin, `uv` must be installed globally on your system:
 
 * **macOS / Linux:**
     ```bash
-    curl -LsSf [https://astral.sh/uv/install.sh](https://astral.sh/uv/install.sh) | sh
+    curl -LsSf https://astral.sh/uv/install.sh | sh
     ```
 
 ---
