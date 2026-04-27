@@ -39,3 +39,10 @@ uv add package1 package2
 ```bash
 uv lock --upgrade
 ```
+
+## Contributing
+Open a new Branch for a new feature. Open a pull request and let someone else review it instead of merging directly.  
+Before commiting run following command to format and lint the codebase
+```
+uv run ruff check --fix && uv run ruff format
+```
