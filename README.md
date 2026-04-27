@@ -30,19 +30,24 @@ After cloning the repository, navigate to the project directory and run:
 uv sync
 ```
 
-## Adding Packages
+### Adding Packages
 ```bash
 uv add package1 package2
 ```
 
-## Update all Packages to their latest Version
+### Update all Packages to their latest Version
 ```bash
 uv lock --upgrade
 ```
 
-## Contributing
+## 🤝 Contributing
 Open a new Branch for a new feature. Open a pull request and let someone else review it instead of merging directly.  
-Before commiting run following command to format and lint the codebase
+Before commiting run following command to format and lint the codebase  
+Linux:
 ```
 uv run ruff check --fix && uv run ruff format
+```
+bzw (ich glaube) following on Windows:
+```
+uv run ruff check --fix ; uv run ruff format
 ```
