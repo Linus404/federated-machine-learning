@@ -212,6 +212,9 @@ tempCodeRunnerFile.py
 # Ruff stuff:
 .ruff_cache/
 
+# Generated data partitions
+data/
+
 # PyPI configuration file
 .pypirc
 
