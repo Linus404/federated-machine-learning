@@ -1,16 +1,19 @@
 [project]
 name = "federated-machine-learning"
 version = "0.1.0"
-description = "Federated sentiment analysis using Flower and Keras (PyTorch backend)"
+description = "Federated sentiment analysis using Flower and Keras"
 readme = "README.md"
 authors = [
     { name = "LeLinus", email = "linus.code404@gmail.com" }
 ]
-requires-python = ">=3.14"
+requires-python = ">=3.11, <3.14"
 dependencies = [
     "datasets>=4.8.5",
     "flwr[simulation]>=1.29.0",
+    "ipykernel>=7.2.0",
     "keras>=3.14.0",
+    "nbformat>=5.10.4",
+    "tensorflow[and-cuda]>=2.21.0",
     "torch>=2.11.0",
 ]
 
