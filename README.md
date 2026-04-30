@@ -41,7 +41,10 @@ uv lock --upgrade
 ```
 
 ### Running the Project
-TODO
+```
+uv run src/main.py
+```
+Or running the guided walkthrough `research.ipynb` (Does not save data)
 
 ## 🤝 Contributing
 Open a new Branch for a new feature. Open a pull request and let someone else review it instead of merging directly.  

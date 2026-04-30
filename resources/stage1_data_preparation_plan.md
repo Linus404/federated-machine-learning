@@ -5,7 +5,7 @@
 ## Overview
 
 The goal of Stage 1 is to produce **clean, loadable data for each of the four FL clients**.
-A simple random split is sufficient at this stage — the focus is not on model performance (yet) but
+A simple random split is sufficient at this stage — the focus is not on model performance/realism (yet) but
 on having a functioning pipeline that later stages (local training, federated training) can build on.
 
 The pipeline consists of four steps:
