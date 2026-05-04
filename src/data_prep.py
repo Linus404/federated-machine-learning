@@ -1,46 +1,47 @@
+from __future__ import annotations
+
 import os
-
-os.environ["KERAS_BACKEND"] = "torch"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # suppress CUDA warnings
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-
 import re
+
+# TensorFlow/Keras read these before import; set them before Keras loads.
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("KERAS_BACKEND", "tensorflow")
+
+import keras
 import numpy as np
 from datasets import load_dataset
-import keras
 
 
-def main():
+def main() -> None:
+    """Prepare four sentiment partitions and the shared vocabulary."""
     dataset = load_dataset("stanfordnlp/imdb")
+    
+    # Remove HTML markup so the vocabulary stores review words, not tags.
+    texts = np.asarray([re.sub(r"<[^>]+>", " ", x) for x in dataset["train"]["text"]])
+    labels = np.asarray(dataset["train"]["label"], dtype="int32")
 
-    # Clean dataset of HTML artifacts
-    texts = [re.sub(r"<[^>]+>", " ", x) for x in dataset["train"]["text"]]
-    labels = np.array(dataset["train"]["label"])
-
-    # TODO: Try different values
     vectorizer = keras.layers.TextVectorization(
         max_tokens=20_000, output_sequence_length=500, dtype="int32"
     )
     vectorizer.adapt(texts)
 
-    # Set seed
     rng = np.random.default_rng(67)
+    idx = rng.permutation(len(texts))
 
-    # Generate random sequence of indices of the entire test set
-    idx = rng.permutation(25_000)
-
-    # Pass the randomly sorted texts to the vectorizer
-    x = keras.ops.convert_to_numpy(vectorizer([texts[i] for i in idx]))
-    y = labels[idx]  # Contains the corresponding labels
+    x = keras.ops.convert_to_numpy(vectorizer(texts[idx]))
+    y = labels[idx]
 
     os.makedirs("data", exist_ok=True)
-    with open("data/vocab.txt", "w") as f:
-        f.write("\n".join(vectorizer.get_vocabulary()))
+    with open("data/vocab.txt", "w") as file:
+        file.write("\n".join(vectorizer.get_vocabulary()))
 
-    for i in range(4):
-        np.save(f"data/partition_{i}_x.npy", x[i * 6250 : (i + 1) * 6250])
-        np.save(f"data/partition_{i}_y.npy", y[i * 6250 : (i + 1) * 6250])
-
+    samples_per_partition: int = 6_250
+    for partition in range(4):
+        start = partition * samples_per_partition
+        stop = start + samples_per_partition
+        np.save(f"data/partition_{partition}_x.npy", x[start:stop])
+        np.save(f"data/partition_{partition}_y.npy", y[start:stop])
 
 if __name__ == "__main__":
     main()
