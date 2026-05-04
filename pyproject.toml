@@ -3,6 +3,7 @@ name = "federated-machine-learning"
 version = "0.1.0"
 description = "Federated sentiment analysis using Flower and Keras"
 readme = "README.md"
+license = "UNLICENSED"
 authors = [
     { name = "LeLinus", email = "linus.code404@gmail.com" }
 ]
@@ -13,14 +14,21 @@ dependencies = [
     "ipykernel>=7.2.0",
     "keras>=3.14.0",
     "nbformat>=5.10.4",
-    "torch>=2.11.0",
+    "streamlit>=1.57.0",
+    "tensorflow-cpu>=2.20.0,<2.21.0; sys_platform == 'linux'",
+    "tensorflow>=2.20.0,<2.21.0; sys_platform != 'linux'",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "tensorflow[and-cuda]>=2.20.0,<2.21.0; sys_platform == 'linux'",
 ]
 
 [tool.uv]
 package = false
 
 [tool.flwr.app]
-publisher = "Gruppe Sigmas"
+publisher = "AlphaSigmaOmegaWolfLeaderKing"
 
 [tool.flwr.app.components]
 serverapp = "src.server_app:app"
@@ -28,6 +36,10 @@ clientapp = "src.client_app:app"
 
 [tool.flwr.app.config]
 num-server-rounds = 3
+local-epochs = 1
+batch-size = 64
+embedding-dim = 16
+validation-split = 0.2
 
 [tool.ruff]
 line-length = 88
