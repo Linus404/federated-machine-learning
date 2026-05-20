@@ -12,7 +12,7 @@ import keras
 from flwr.app import ArrayRecord, Context, Message, MetricRecord, RecordDict
 from flwr.clientapp import ClientApp
 
-from train import build_model, load_partition, sequence_length, vocab_size
+from .local_training import build_model, load_partition, sequence_length, vocab_size
 
 # Flower ClientApp
 app = ClientApp()
