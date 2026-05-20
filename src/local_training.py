@@ -16,17 +16,18 @@ import numpy as np
 
 ArrayPair: TypeAlias = tuple[np.ndarray, np.ndarray]
 PartitionSplit: TypeAlias = tuple[ArrayPair, ArrayPair]
-
+DEFAULT_EMBEDDING_DIM = 128
+DEFAULT_LOCAL_EPOCHS = 2
 
 def load_partition(
-    partition: int = 0, validation_split: float = 0.2
+    data_dir: str | Path = "data", partition: int = 0, validation_split: float = 0.2
 ) -> PartitionSplit:
     """Load one client partition and keep the last rows for validation."""
 
-    x = np.load(f"data/partition_{partition}_x.npy").astype(
+    x = np.load(Path(data_dir) / f"partition_{partition}_x.npy").astype(
         "int32", copy=False
     )
-    y = np.load(f"data/partition_{partition}_y.npy").astype(
+    y = np.load(Path(data_dir) / f"partition_{partition}_y.npy").astype(
         "float32", copy=False
     )
 
@@ -42,19 +43,35 @@ def vocab_size() -> int:
 
 
 @lru_cache(maxsize=None)
-def sequence_length(partition: int = 0) -> int:
+def sequence_length(data_dir: str | Path = "data", partition: int = 0) -> int:
     """Read the saved token sequence length without loading all samples."""
-    x = np.load(f"data/partition_{partition}_x.npy", mmap_mode="r")
+    x = np.load(Path(data_dir) / f"partition_{partition}_x.npy", mmap_mode="r")
     return int(x.shape[1])
 
 
-def build_model(vocab_size: int, sequence_length: int, embedding_dim: int = 16) -> Any:
+def build_model(
+    vocab_size: int, sequence_length: int, embedding_dim: int = DEFAULT_EMBEDDING_DIM
+) -> Any:
     """Build the small sentiment model reused by local and federated training."""
     inputs = keras.Input(shape=(sequence_length,), dtype="int32")
 
-    # Average word embeddings keep the baseline compact and quick to train.
-    x = keras.layers.Embedding(vocab_size, embedding_dim, mask_zero=True)(inputs)
-    x = keras.layers.GlobalAveragePooling1D()(x)
+    # Keep padding neutral for convolution by explicitly zeroing padded positions.
+    x = keras.layers.Embedding(vocab_size, embedding_dim, name="token_embedding")(
+        inputs
+    )
+    padding_mask = keras.ops.cast(keras.ops.not_equal(inputs, 0), x.dtype)
+    x = x * keras.ops.expand_dims(padding_mask, axis=-1)
+    x = keras.layers.Conv1D(
+        filters=64,
+        kernel_size=3,
+        padding="same",
+        activation="relu",
+        use_bias=False,
+        name="padding_safe_conv",
+    )(x)
+    x = keras.layers.GlobalMaxPooling1D()(x)
+    x = keras.layers.Dense(32, activation="relu")(x)
+    x = keras.layers.Dropout(0.3)(x)
 
     outputs = keras.layers.Dense(1, activation="sigmoid")(x)
 

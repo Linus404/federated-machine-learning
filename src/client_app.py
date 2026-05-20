@@ -1,150 +1,88 @@
 from __future__ import annotations
 
-import os
 from typing import Any
 
-# TensorFlow/Keras read these before import; set them before Keras loads.
-os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-os.environ.setdefault("KERAS_BACKEND", "tensorflow")
-
-import keras
-from flwr.app import ArrayRecord, Context, Message, MetricRecord, RecordDict
+from flwr.client import NumPyClient
 from flwr.clientapp import ClientApp
+from flwr.common import Context
 
-from .local_training import build_model, load_partition, sequence_length, vocab_size
-
-# Flower ClientApp
-app = ClientApp()
-
-
-def load_model(embedding_dim: int = 16) -> Any:
-    """Create a fresh model instance."""
-    return build_model(
-        vocab_size=vocab_size(),
-        sequence_length=sequence_length(),
-        embedding_dim=embedding_dim,
-    )
+from src.local_training import (
+    DEFAULT_EMBEDDING_DIM,
+    DEFAULT_LOCAL_EPOCHS,
+    ArrayPair,
+    build_model,
+    load_partition,
+    vocab_size,
+)
 
 
-@app.train()
-def train(msg: Message, context: Context) -> Message:
-    """Train the global model on local client data."""
+class SentimentClient(NumPyClient):
+    """Flower client that trains on one saved partition."""
 
-    # Reset TensorFlow state between rounds
-    keras.backend.clear_session()
+    def __init__(
+        self,
+        data_dir: str = "data",
+        partition: int = 0,
+        epochs: int = DEFAULT_LOCAL_EPOCHS,
+        batch_size: int = 64,
+        embedding_dim: int = DEFAULT_EMBEDDING_DIM,
+        validation_split: float = 0.2,
+    ) -> None:
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.train_data: ArrayPair
+        self.val_data: ArrayPair
+        self.train_data, self.val_data = load_partition(
+            data_dir, partition, validation_split
+        )
+        self.model = build_model(
+            vocab_size(), self.train_data[0].shape[1], embedding_dim
+        )
 
-    # Node-specific config
-    partition_id = int(context.node_config["partition-id"])
+    def get_parameters(self, config: dict[str, Any]) -> list[Any]:
+        """Retrieve the current local model weights as a list of NumPy arrays."""
+        return self.model.get_weights()
 
-    # Run config (defined in pyproject.toml or passed at runtime)
-    epochs = int(context.run_config.get("local-epochs", 1))
-    batch_size = int(context.run_config.get("batch-size", 64))
-    embedding_dim = int(context.run_config.get("embedding-dim", 16))
-    verbose = int(context.run_config.get("verbose", 1))
-    validation_split = float(context.run_config.get("validation-split", 0.2))
-
-    # Load local partition
-    train_data, val_data = load_partition(
-        partition=partition_id,
-        validation_split=validation_split,
-    )
-
-    x_train, y_train = train_data
-    x_val, y_val = val_data
-
-    # Build model
-    model = load_model(embedding_dim=embedding_dim)
-
-    # Load global weights from server
-    model.set_weights(msg.content["arrays"].to_numpy_ndarrays())
-
-    # Local training
-    history = model.fit(
-        x_train,
-        y_train,
-        validation_data=(x_val, y_val),
-        epochs=epochs,
-        batch_size=batch_size,
-        verbose=verbose,
-    )
-
-    # Final metrics
-    train_loss = float(history.history["loss"][-1])
-    train_acc = float(history.history["accuracy"][-1])
-
-    val_loss = float(history.history["val_loss"][-1])
-    val_acc = float(history.history["val_accuracy"][-1])
-
-    # Pack updated model weights
-    model_record = ArrayRecord(model.get_weights())
-
-    metrics = MetricRecord(
-        {
-            "num-examples": len(x_train),
-            "train_loss": train_loss,
-            "train_accuracy": train_acc,
-            "val_loss": val_loss,
-            "val_accuracy": val_acc,
+    def fit(
+        self, parameters: list[Any], config: dict[str, Any]
+    ) -> tuple[list[Any], int, dict[str, float]]:
+        """Train locally once the server sends the latest global weights."""
+        self.model.set_weights(parameters)
+        history = self.model.fit(
+            *self.train_data,
+            epochs=self.epochs,
+            batch_size=self.batch_size,
+            verbose=0,
+        )
+        metrics: dict[str, float] = {
+            name: float(values[-1]) for name, values in history.history.items()
         }
-    )
+        return self.model.get_weights(), len(self.train_data[0]), metrics
 
-    content = RecordDict(
-        {
-            "arrays": model_record,
-            "metrics": metrics,
-        }
-    )
+    def evaluate(
+        self, parameters: list[Any], config: dict[str, Any]
+    ) -> tuple[float, int, dict[str, float]]:
+        """Evaluate the global model on this client's validation split."""
+        self.model.set_weights(parameters)
+        loss: float
+        accuracy: float
+        loss, accuracy = self.model.evaluate(*self.val_data, verbose=0)
+        return float(loss), len(self.val_data[0]), {"accuracy": float(accuracy)}
 
-    return Message(content=content, reply_to=msg)
+
+def client_fn(context: Context) -> Any:
+    """Create one client; Flower supplies partition-id for each SuperNode."""
+    run_config: dict[str, Any] = context.run_config
+    partition = int(context.node_config.get("partition-id", 0))
+
+    return SentimentClient(
+        data_dir=str(run_config.get("data-dir", "data")),
+        partition=partition,
+        epochs=int(run_config.get("local-epochs", DEFAULT_LOCAL_EPOCHS)),
+        batch_size=int(run_config.get("batch-size", 64)),
+        embedding_dim=int(run_config.get("embedding-dim", DEFAULT_EMBEDDING_DIM)),
+        validation_split=float(run_config.get("validation-split", 0.2)),
+    ).to_client()
 
 
-@app.evaluate()
-def evaluate(msg: Message, context: Context) -> Message:
-    """Evaluate the global model on local validation data."""
-
-    # Reset TensorFlow state
-    keras.backend.clear_session()
-
-    partition_id = int(context.node_config["partition-id"])
-
-    embedding_dim = int(context.run_config.get("embedding-dim", 16))
-    verbose = int(context.run_config.get("verbose", 0))
-    validation_split = float(context.run_config.get("validation-split", 0.2))
-
-    # Only validation data is needed
-    _, val_data = load_partition(
-        partition=partition_id,
-        validation_split=validation_split,
-    )
-
-    x_val, y_val = val_data
-
-    # Build model
-    model = load_model(embedding_dim=embedding_dim)
-
-    # Load global weights from server
-    model.set_weights(msg.content["arrays"].to_numpy_ndarrays())
-
-    # Evaluate
-    loss, accuracy = model.evaluate(
-        x_val,
-        y_val,
-        verbose=verbose,
-    )
-
-    metrics = MetricRecord(
-        {
-            "num-examples": len(x_val),
-            "eval_loss": float(loss),
-            "eval_accuracy": float(accuracy),
-        }
-    )
-
-    content = RecordDict(
-        {
-            "metrics": metrics,
-        }
-    )
-
-    return Message(content=content, reply_to=msg)
+app = ClientApp(client_fn=client_fn)
