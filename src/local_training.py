@@ -16,7 +16,7 @@ import numpy as np
 
 ArrayPair: TypeAlias = tuple[np.ndarray, np.ndarray]
 PartitionSplit: TypeAlias = tuple[ArrayPair, ArrayPair]
-DEFAULT_EMBEDDING_DIM = 128
+DEFAULT_EMBEDDING_DIM = 100
 DEFAULT_LOCAL_EPOCHS = 2
 
 def load_partition(
@@ -48,6 +48,22 @@ def sequence_length(data_dir: str | Path = "data", partition: int = 0) -> int:
     x = np.load(Path(data_dir) / f"partition_{partition}_x.npy", mmap_mode="r")
     return int(x.shape[1])
 
+def load_glove_embeddings(
+    vocab_path: str | Path = "data/vocab.txt", embedding_dim: int = 100
+) -> np.ndarray:
+    """Load GloVe vectors and align to the saved vocabulary."""
+    glove: dict[str, np.ndarray] = {}
+    with open(f"data/glove.6B.{embedding_dim}d.txt", encoding="utf-8") as f:
+        for line in f:
+            parts = line.split()
+            glove[parts[0]] = np.array(parts[1:], dtype="float32")
+
+    vocab = [line.strip() for line in Path(vocab_path).open()]
+    matrix = np.zeros((len(vocab), embedding_dim), dtype="float32")
+    for i, word in enumerate(vocab):
+        if word in glove:
+            matrix[i] = glove[word]
+    return matrix
 
 def build_model(
     vocab_size: int, sequence_length: int, embedding_dim: int = DEFAULT_EMBEDDING_DIM
@@ -55,7 +71,6 @@ def build_model(
     """Build the small sentiment model reused by local and federated training."""
     inputs = keras.Input(shape=(sequence_length,), dtype="int32")
 
-    # Keep padding neutral for convolution by explicitly zeroing padded positions.
     x = keras.layers.Embedding(vocab_size, embedding_dim, name="token_embedding")(
         inputs
     )
@@ -78,7 +93,6 @@ def build_model(
     model = keras.Model(inputs, outputs)
     model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
     return model
-
 
 def train(args: argparse.Namespace) -> tuple[Any, Any]:
     """Train one local baseline model for Stage 2."""

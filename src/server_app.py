@@ -3,10 +3,11 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 from typing import Any
+from xml.parsers.expat import model
 
 from flwr.common import Context, ndarrays_to_parameters, parameters_to_ndarrays
 from flwr.server import ServerAppComponents, ServerConfig
-from flwr.server.strategy import FedAvg
+from flwr.server.strategy import FedAvg, FedProx
 from flwr.serverapp import ServerApp
 
 from src.local_training import (
@@ -30,18 +31,17 @@ def weighted_average(metrics: list[tuple[int, dict[str, float]]]) -> dict[str, f
     return {"accuracy": accuracy}
 
 
-class ArtifactSavingFedAvg(FedAvg):
-    """FedAvg strategy that writes dashboard artifacts after each round."""
-
+class ArtifactSavingFedAvg(FedProx):
     def __init__(
         self,
         data_dir: str | Path = "data",
         embedding_dim: int = DEFAULT_EMBEDDING_DIM,
         artifact_dir: str | Path = "artifacts",
+        proximal_mu: float = 0.1,  # add this
         *args: Any,
         **kwargs: Any,
     ) -> None:
-        super().__init__(*args, **kwargs)
+        super().__init__(proximal_mu=proximal_mu, *args, **kwargs)  # add proximal_mu here
         self.data_dir = data_dir
         self.embedding_dim = embedding_dim
         self.artifact_dir = Path(artifact_dir)
@@ -100,15 +100,18 @@ def create_strategy(
     embedding_dim: int = DEFAULT_EMBEDDING_DIM,
     min_clients: int = 4,
     artifact_dir: str | Path = "artifacts",
+    proximal_mu: float = 0.1,
 ) -> ArtifactSavingFedAvg:
-    """Create the FedAvg strategy shared by simulation and containers."""
-    model = build_model(
+
+    # rename 'model' to 'initial_model' to avoid conflict
+    initial_model = build_model(
         vocab_size(),
         sequence_length(data_dir),
         embedding_dim,
     )
 
     return ArtifactSavingFedAvg(
+        proximal_mu=proximal_mu,
         data_dir=data_dir,
         embedding_dim=embedding_dim,
         artifact_dir=artifact_dir,
@@ -117,11 +120,10 @@ def create_strategy(
         min_fit_clients=min_clients,
         min_evaluate_clients=min_clients,
         min_available_clients=min_clients,
-        initial_parameters=ndarrays_to_parameters(model.get_weights()),
+        initial_parameters=ndarrays_to_parameters(initial_model.get_weights()),  # updated
         fit_metrics_aggregation_fn=weighted_average,
         evaluate_metrics_aggregation_fn=weighted_average,
     )
-
 
 def server_fn(context: Context) -> ServerAppComponents:
     """Configure FedAvg for the four simulated sentiment clients."""

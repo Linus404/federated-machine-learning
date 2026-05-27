@@ -22,8 +22,11 @@ def main() -> None:
     labels = np.asarray(dataset["train"]["label"], dtype="int32")
 
     vectorizer = keras.layers.TextVectorization(
-        max_tokens=20_000, output_sequence_length=500, dtype="int32"
-    )
+    max_tokens=20_000,  # was 20_000
+    output_sequence_length=500,
+    dtype="int32"
+)
+
     vectorizer.adapt(texts)
 
     rng = np.random.default_rng(67)
