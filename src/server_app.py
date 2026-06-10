@@ -3,11 +3,10 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 from typing import Any
-from xml.parsers.expat import model
 
 from flwr.common import Context, ndarrays_to_parameters, parameters_to_ndarrays
 from flwr.server import ServerAppComponents, ServerConfig
-from flwr.server.strategy import FedAvg, FedProx
+from flwr.server.strategy import FedAvg
 from flwr.serverapp import ServerApp
 
 from src.local_training import (
@@ -16,14 +15,22 @@ from src.local_training import (
     sequence_length,
     vocab_size,
 )
+from src.paths import (
+    artifact_dir_path,
+    data_dir_path,
+    default_artifact_dir,
+    default_data_dir,
+    global_model_path,
+    metrics_path,
+)
 
-DEFAULT_SERVER_ROUNDS: int = 5
+DEFAULT_SERVER_ROUNDS = 5
 
 
 def weighted_average(metrics: list[tuple[int, dict[str, float]]]) -> dict[str, float]:
     """Aggregate client accuracies by validation sample count."""
-    total: int = sum(num_examples for num_examples, _ in metrics)
-    accuracy: float = (
+    total = sum(num_examples for num_examples, _ in metrics)
+    accuracy = (
         sum(num_examples * metric["accuracy"] for num_examples, metric in metrics)
         / total
     )
@@ -31,28 +38,27 @@ def weighted_average(metrics: list[tuple[int, dict[str, float]]]) -> dict[str, f
     return {"accuracy": accuracy}
 
 
-class ArtifactSavingFedAvg(FedProx):
+class ArtifactSavingFedAvg(FedAvg):
     def __init__(
         self,
-        data_dir: str | Path = "data",
+        data_dir: str | Path | None = None,
         embedding_dim: int = DEFAULT_EMBEDDING_DIM,
-        artifact_dir: str | Path = "artifacts",
-        proximal_mu: float = 0.1,  # add this
+        artifact_dir: str | Path | None = None,
         *args: Any,
         **kwargs: Any,
     ) -> None:
-        super().__init__(proximal_mu=proximal_mu, *args, **kwargs)  # add proximal_mu here
-        self.data_dir = data_dir
+        super().__init__(*args, **kwargs)
+        self.data_dir = data_dir_path(data_dir)
         self.embedding_dim = embedding_dim
-        self.artifact_dir = Path(artifact_dir)
+        self.artifact_dir = artifact_dir_path(artifact_dir)
 
     @property
     def model_path(self) -> Path:
-        return self.artifact_dir / "global_model.keras"
+        return global_model_path(self.artifact_dir)
 
     @property
     def metrics_path(self) -> Path:
-        return self.artifact_dir / "metrics.csv"
+        return metrics_path(self.artifact_dir)
 
     def aggregate_fit(
         self, server_round: int, results: list[Any], failures: list[Any]
@@ -62,7 +68,7 @@ class ArtifactSavingFedAvg(FedProx):
         if parameters is not None:
             self.artifact_dir.mkdir(parents=True, exist_ok=True)
             model = build_model(
-                vocab_size(),
+                vocab_size(self.data_dir),
                 sequence_length(self.data_dir),
                 self.embedding_dim,
             )
@@ -79,7 +85,7 @@ class ArtifactSavingFedAvg(FedProx):
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         if server_round == 1 and self.metrics_path.exists():
             self.metrics_path.unlink()
-        file_exists: bool = self.metrics_path.exists()
+        file_exists = self.metrics_path.exists()
 
         with self.metrics_path.open("a", newline="") as file:
             writer = csv.DictWriter(file, fieldnames=["round", "loss", "accuracy"])
@@ -96,46 +102,47 @@ class ArtifactSavingFedAvg(FedProx):
 
 
 def create_strategy(
-    data_dir: str | Path = "data",
+    data_dir: str | Path | None = None,
     embedding_dim: int = DEFAULT_EMBEDDING_DIM,
     min_clients: int = 4,
-    artifact_dir: str | Path = "artifacts",
-    proximal_mu: float = 0.1,
+    artifact_dir: str | Path | None = None,
 ) -> ArtifactSavingFedAvg:
+    resolved_data_dir = data_dir_path(data_dir)
+    resolved_artifact_dir = artifact_dir_path(artifact_dir)
 
-    # rename 'model' to 'initial_model' to avoid conflict
     initial_model = build_model(
-        vocab_size(),
-        sequence_length(data_dir),
+        vocab_size(resolved_data_dir),
+        sequence_length(resolved_data_dir),
         embedding_dim,
     )
 
     return ArtifactSavingFedAvg(
-        proximal_mu=proximal_mu,
-        data_dir=data_dir,
+        data_dir=resolved_data_dir,
         embedding_dim=embedding_dim,
-        artifact_dir=artifact_dir,
+        artifact_dir=resolved_artifact_dir,
         fraction_fit=1.0,
         fraction_evaluate=1.0,
         min_fit_clients=min_clients,
         min_evaluate_clients=min_clients,
         min_available_clients=min_clients,
-        initial_parameters=ndarrays_to_parameters(initial_model.get_weights()),  # updated
+        initial_parameters=ndarrays_to_parameters(initial_model.get_weights()),
         fit_metrics_aggregation_fn=weighted_average,
         evaluate_metrics_aggregation_fn=weighted_average,
     )
 
+
 def server_fn(context: Context) -> ServerAppComponents:
     """Configure FedAvg for the four simulated sentiment clients."""
     run_config: dict[str, Any] = context.run_config
-    data_dir = str(run_config.get("data-dir", "data"))
+    data_dir = run_config.get("data-dir", default_data_dir())
+    artifact_dir = run_config.get("artifact-dir", default_artifact_dir())
     num_rounds = int(run_config.get("num-server-rounds", DEFAULT_SERVER_ROUNDS))
 
     strategy = create_strategy(
         data_dir=data_dir,
         embedding_dim=int(run_config.get("embedding-dim", DEFAULT_EMBEDDING_DIM)),
         min_clients=4,
-        artifact_dir=str(run_config.get("artifact-dir", "artifacts")),
+        artifact_dir=artifact_dir,
     )
 
     return ServerAppComponents(

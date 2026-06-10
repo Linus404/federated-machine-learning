@@ -1,65 +1,89 @@
-# federated_machine_learning
-Competing streaming platforms collect customer reviews. Each client represents one platform; clients jointly train a sentiment classifier while each platform's feedback data stays in-house. 
+# Federated Machine Learning
 
-# 🚀 Project Startup & Maintainence
+Competing streaming platforms collect customer reviews. Each client represents one platform; clients jointly train a sentiment classifier while each platform's feedback data stays in-house.
 
-This project utilizes **uv** for efficient management of Python versions and dependencies. This ensures a consistent development environment across all team members.
+## Project setup
 
----
+This project uses [uv](https://docs.astral.sh/uv/) to manage Python versions and dependencies.
 
-## 🛠 1. Install uv
-Before you begin, `uv` must be installed globally on your system:
+### Install uv
 
-* **Windows (PowerShell):**
-    ```powershell
-    powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-    ```
-    *Note: If execution is blocked, run `Set-ExecutionPolicy RemoteSigned -scope CurrentUser` first.*
+**Windows (PowerShell)**
 
-* **macOS / Linux:**
-    ```bash
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    ```
+```powershell
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
 
----
+If execution is blocked, run `Set-ExecutionPolicy RemoteSigned -Scope CurrentUser` first.
 
-## 📦 2. Project Setup
-After cloning the repository, navigate to the project directory and run:
+**macOS / Linux**
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+### Install dependencies
 
 ```bash
 uv sync
 ```
 
-### Adding Packages
+### Common commands
+
+Prepare the local data partitions:
+
 ```bash
-uv add package1 package2
+uv run python -m src.data_prep
 ```
 
-### Update all Packages to their latest Version
+Train one local baseline model:
+
+```bash
+uv run python -m src.local_training
+```
+
+Run the Flower app using the configuration in `pyproject.toml`:
+
+```bash
+uv run flwr run . --stream --federation-config "num-supernodes=4"
+```
+
+### Runtime paths
+
+The default data and artifact directories are configured in `[tool.flwr.app.config]` as `data-dir = "data"` and `artifact-dir = "artifacts"`. You can override them with Flower run config, for example:
+
+```bash
+uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "data-dir='data' artifact-dir='artifacts'"
+```
+
+Local scripts also respect the environment variables `FML_DATA_DIR` and `FML_ARTIFACT_DIR` for their default paths.
+
+## Development
+
+Add dependencies with:
+
+```bash
+uv add package-name
+```
+
+Upgrade locked dependencies with:
+
 ```bash
 uv lock --upgrade
 ```
 
-### Running the Project
-```
-uv run src/main.py
-```
-Or running the guided walkthrough `research.ipynb` (Does not save data)
+Before committing, format and check the codebase:
 
-## 🤝 Contributing
-Open a new Branch for a new feature. Open a pull request and let someone else review it instead of merging directly.  
-Before commiting run following command to format and check the codebase  
-```
-uv run ruff check --fix .
+```bash
 uv run ruff format .
+uv run ruff check .
 ```
 
----
+Open a new branch for each feature and use pull requests for review.
 
-# 🧱 Tech Stack
-1. Data Preparation: HuggingFace, pandas
-2. Local Machine Learning: Keras with TensorFlow (?)
-3. Federated Machine Learning: Flower
-4. Containerization: Docker
-5. Cloud Deployment: Google Cloud
-6. Dashboard & Analysis: Streamlit (?)
+## Tech stack
+
+1. Data preparation: Hugging Face Datasets and pandas
+2. Local machine learning: Keras with TensorFlow
+3. Federated machine learning: Flower
+4. Dashboard and analysis: Streamlit
