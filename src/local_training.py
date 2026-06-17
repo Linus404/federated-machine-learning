@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import os
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, TypeAlias
 
@@ -14,56 +13,43 @@ os.environ.setdefault("KERAS_BACKEND", "tensorflow")
 import keras
 import numpy as np
 
+from src.paths import data_dir_path, default_data_dir, partition_paths, vocab_path
+
 ArrayPair: TypeAlias = tuple[np.ndarray, np.ndarray]
 PartitionSplit: TypeAlias = tuple[ArrayPair, ArrayPair]
 DEFAULT_EMBEDDING_DIM = 100
 DEFAULT_LOCAL_EPOCHS = 2
 
+
 def load_partition(
-    data_dir: str | Path = "data", partition: int = 0, validation_split: float = 0.2
+    data_dir: str | Path | None = None,
+    partition: int = 0,
+    validation_split: float = 0.2,
 ) -> PartitionSplit:
     """Load one client partition and keep the last rows for validation."""
-
-    x = np.load(Path(data_dir) / f"partition_{partition}_x.npy").astype(
-        "int32", copy=False
-    )
-    y = np.load(Path(data_dir) / f"partition_{partition}_y.npy").astype(
-        "float32", copy=False
-    )
+    resolved_data_dir = data_dir_path(data_dir)
+    x_path, y_path = partition_paths(resolved_data_dir, partition)
+    x = np.load(x_path).astype("int32", copy=False)
+    y = np.load(y_path).astype("float32", copy=False)
 
     split = int(len(x) * (1 - validation_split))
     return (x[:split], y[:split]), (x[split:], y[split:])
 
 
-@lru_cache(maxsize=None)
-def vocab_size() -> int:
+def vocab_size(data_dir: str | Path | None = None) -> int:
     """Count the shared Stage 1 vocabulary entries."""
-    vocab_path = Path("data/vocab.txt")
-    return sum(1 for _ in vocab_path.open())
+    resolved_data_dir = data_dir_path(data_dir)
+    with vocab_path(resolved_data_dir).open() as file:
+        return sum(1 for _ in file)
 
 
-@lru_cache(maxsize=None)
-def sequence_length(data_dir: str | Path = "data", partition: int = 0) -> int:
+def sequence_length(data_dir: str | Path | None = None, partition: int = 0) -> int:
     """Read the saved token sequence length without loading all samples."""
-    x = np.load(Path(data_dir) / f"partition_{partition}_x.npy", mmap_mode="r")
+    resolved_data_dir = data_dir_path(data_dir)
+    x_path, _ = partition_paths(resolved_data_dir, partition)
+    x = np.load(x_path, mmap_mode="r")
     return int(x.shape[1])
 
-def load_glove_embeddings(
-    vocab_path: str | Path = "data/vocab.txt", embedding_dim: int = 100
-) -> np.ndarray:
-    """Load GloVe vectors and align to the saved vocabulary."""
-    glove: dict[str, np.ndarray] = {}
-    with open(f"data/glove.6B.{embedding_dim}d.txt", encoding="utf-8") as f:
-        for line in f:
-            parts = line.split()
-            glove[parts[0]] = np.array(parts[1:], dtype="float32")
-
-    vocab = [line.strip() for line in Path(vocab_path).open()]
-    matrix = np.zeros((len(vocab), embedding_dim), dtype="float32")
-    for i, word in enumerate(vocab):
-        if word in glove:
-            matrix[i] = glove[word]
-    return matrix
 
 def build_model(
     vocab_size: int, sequence_length: int, embedding_dim: int = DEFAULT_EMBEDDING_DIM
@@ -94,16 +80,17 @@ def build_model(
     model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
     return model
 
+
 def train(args: argparse.Namespace) -> tuple[Any, Any]:
     """Train one local baseline model for Stage 2."""
-    train_data: ArrayPair
-    val_data: ArrayPair
     train_data, val_data = load_partition(
-        args.partition, args.validation_split
+        data_dir=args.data_dir,
+        partition=args.partition,
+        validation_split=args.validation_split,
     )
 
     model = build_model(
-        vocab_size(), train_data[0].shape[1], args.embedding_dim
+        vocab_size(args.data_dir), train_data[0].shape[1], args.embedding_dim
     )
 
     history = model.fit(
@@ -114,12 +101,8 @@ def train(args: argparse.Namespace) -> tuple[Any, Any]:
         verbose=0 if args.quiet else 1,
     )
 
-    loss: float
-    accuracy: float
     loss, accuracy = model.evaluate(*val_data, verbose=0)
-    final: dict[str, float] = {
-        name: float(values[-1]) for name, values in history.history.items()
-    }
+    final = {name: float(values[-1]) for name, values in history.history.items()}
 
     print(
         f"train_loss={final['loss']:.4f} "
@@ -134,8 +117,9 @@ def train(args: argparse.Namespace) -> tuple[Any, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train one local sentiment model.")
+    parser.add_argument("--data-dir", type=Path, default=default_data_dir())
     parser.add_argument("--partition", type=int, default=0)
-    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--epochs", type=int, default=DEFAULT_LOCAL_EPOCHS)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--embedding-dim", type=int, default=16)
     parser.add_argument("--validation-split", type=float, default=0.2)
