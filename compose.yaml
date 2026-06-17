@@ -1,0 +1,19 @@
+services:
+  fml:
+    build: .
+    shm_size: "1gb"
+    volumes:
+      - ./data:/mnt/fml-data
+      - ./artifacts:/mnt/fml-artifacts
+    command:
+      - uv
+      - run
+      - --no-sync
+      - flwr
+      - run
+      - .
+      - --stream
+      - --federation-config
+      - num-supernodes=4 init-args-num-cpus=4 client-resources-num-cpus=4 init-args-log-to-driver=false init-args-logging-level="ERROR"
+      - --run-config
+      - data-dir='/mnt/fml-data' artifact-dir='/mnt/fml-artifacts'
