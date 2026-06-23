@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,8 @@ from src.paths import (
     global_model_path,
     metrics_path,
 )
+
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"keras\..*")
 
 DEFAULT_SERVER_ROUNDS = 5
 

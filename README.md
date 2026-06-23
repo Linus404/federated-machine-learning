@@ -58,6 +58,22 @@ uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "
 
 Local scripts also respect the environment variables `FML_DATA_DIR` and `FML_ARTIFACT_DIR` for their default paths.
 
+## Docker
+
+Build the image:
+
+```bash
+docker build -t federated-machine-learning .
+```
+
+Run the full Flower simulation with local `data/` and `artifacts/` mounted into the container:
+
+```bash
+docker compose up --build
+```
+
+Prepare data on the host first with `uv run python -m src.data_prep`, or run the same command inside the image by overriding the compose command. The Compose command still runs the full four-supernode simulation, but mounts data outside the packaged app directory and schedules one TensorFlow client at a time to avoid noisy Ray packaging warnings and low-memory Docker Desktop failures.
+
 ## Development
 
 Add dependencies with:

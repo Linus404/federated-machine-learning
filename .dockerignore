@@ -1,0 +1,15 @@
+.git
+.omx
+.venv
+__pycache__
+*.py[cod]
+.ruff_cache
+.pytest_cache
+.mypy_cache
+.ipynb_checkpoints
+.env
+.envrc
+artifacts/
+data/
+resources/
+.DS_Store

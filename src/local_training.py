@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import warnings
 from pathlib import Path
 from typing import Any, TypeAlias
 
@@ -14,6 +15,8 @@ import keras
 import numpy as np
 
 from src.paths import data_dir_path, default_data_dir, partition_paths, vocab_path
+
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"keras\..*")
 
 ArrayPair: TypeAlias = tuple[np.ndarray, np.ndarray]
 PartitionSplit: TypeAlias = tuple[ArrayPair, ArrayPair]
