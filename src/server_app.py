@@ -7,8 +7,10 @@ from typing import Any
 
 from flwr.common import Context, ndarrays_to_parameters, parameters_to_ndarrays
 from flwr.server import ServerAppComponents, ServerConfig
-from flwr.server.strategy import FedAvg
+from flwr.server.strategy import FedProx
 from flwr.serverapp import ServerApp
+from src.huber_strategy import huber_aggregate, _flatten, _unflatten
+from flwr.common import parameters_to_ndarrays, ndarrays_to_parameters
 
 from src.local_training import (
     DEFAULT_EMBEDDING_DIM,
@@ -41,19 +43,25 @@ def weighted_average(metrics: list[tuple[int, dict[str, float]]]) -> dict[str, f
     return {"accuracy": accuracy}
 
 
-class ArtifactSavingFedAvg(FedAvg):
+class ArtifactSavingFedProx(FedProx):
+    """FedProx (non-IID robust) + Huber aggregation (Byzantine robust) + artifact saving."""
+
     def __init__(
         self,
-        data_dir: str | Path | None = None,
-        embedding_dim: int = DEFAULT_EMBEDDING_DIM,
-        artifact_dir: str | Path | None = None,
-        *args: Any,
-        **kwargs: Any,
+        data_dir=None,
+        embedding_dim=DEFAULT_EMBEDDING_DIM,
+        artifact_dir=None,
+        huber_threshold: float = 10.0,
+        use_huber: bool = False,
+        *args,
+        **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.data_dir = data_dir_path(data_dir)
         self.embedding_dim = embedding_dim
         self.artifact_dir = artifact_dir_path(artifact_dir)
+        self.huber_threshold = huber_threshold
+        self.use_huber = use_huber
 
     @property
     def model_path(self) -> Path:
@@ -63,11 +71,24 @@ class ArtifactSavingFedAvg(FedAvg):
     def metrics_path(self) -> Path:
         return metrics_path(self.artifact_dir)
 
-    def aggregate_fit(
-        self, server_round: int, results: list[Any], failures: list[Any]
-    ) -> tuple[Any, dict[str, Any]]:
-        parameters, metrics = super().aggregate_fit(server_round, results, failures)
+    def aggregate_fit(self, server_round, results, failures):
+        if self.use_huber and results:
+            # Robust Huber aggregation instead of plain FedProx averaging
+            reference = parameters_to_ndarrays(results[0][1].parameters)
+            vectors = [_flatten(parameters_to_ndarrays(r.parameters)) for _, r in results]
+            counts = [r.num_examples for _, r in results]
+            aggregated = huber_aggregate(vectors, counts, self.huber_threshold)
+            parameters = ndarrays_to_parameters(_unflatten(aggregated, reference))
+            metrics = {}
+            if self.fit_metrics_aggregation_fn:
+                metrics = self.fit_metrics_aggregation_fn(
+                    [(r.num_examples, r.metrics) for _, r in results]
+                )
+        else:
+            # Standard FedProx averaging
+            parameters, metrics = super().aggregate_fit(server_round, results, failures)
 
+        # Artifact saving (unchanged)
         if parameters is not None:
             self.artifact_dir.mkdir(parents=True, exist_ok=True)
             model = build_model(
@@ -109,6 +130,7 @@ def create_strategy(
     embedding_dim: int = DEFAULT_EMBEDDING_DIM,
     min_clients: int = 4,
     artifact_dir: str | Path | None = None,
+    proximal_mu: float = 0.1,
 ) -> ArtifactSavingFedAvg:
     resolved_data_dir = data_dir_path(data_dir)
     resolved_artifact_dir = artifact_dir_path(artifact_dir)
@@ -119,7 +141,8 @@ def create_strategy(
         embedding_dim,
     )
 
-    return ArtifactSavingFedAvg(
+    return ArtifactSavingFedProx(
+        proximal_mu=proximal_mu,
         data_dir=resolved_data_dir,
         embedding_dim=embedding_dim,
         artifact_dir=resolved_artifact_dir,
