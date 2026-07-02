@@ -10,7 +10,13 @@ from flwr.server import ServerAppComponents, ServerConfig
 from flwr.server.strategy import FedProx
 from flwr.serverapp import ServerApp
 
-from src.huber_strategy import _flatten, _unflatten, huber_aggregate
+from src import parse_run_config_bool
+from src.huber_strategy import (
+    DEFAULT_HUBER_THRESHOLD,
+    _flatten,
+    _unflatten,
+    huber_aggregate,
+)
 from src.local_training import (
     DEFAULT_EMBEDDING_DIM,
     build_model,
@@ -51,7 +57,7 @@ class SentimentServer(FedProx):
         data_dir=None,
         embedding_dim=DEFAULT_EMBEDDING_DIM,
         artifact_dir=None,
-        huber_threshold: float = 10.0,
+        huber_threshold: float = DEFAULT_HUBER_THRESHOLD,
         use_huber: bool = False,
         *args,
         **kwargs,
@@ -133,6 +139,8 @@ def create_strategy(
     min_clients: int = 4,
     artifact_dir: str | Path | None = None,
     proximal_mu: float = 0.1,
+    use_huber: bool = False,
+    huber_threshold: float = DEFAULT_HUBER_THRESHOLD,
 ) -> SentimentServer:
     resolved_data_dir = data_dir_path(data_dir)
     resolved_artifact_dir = artifact_dir_path(artifact_dir)
@@ -148,6 +156,8 @@ def create_strategy(
         data_dir=resolved_data_dir,
         embedding_dim=embedding_dim,
         artifact_dir=resolved_artifact_dir,
+        huber_threshold=huber_threshold,
+        use_huber=use_huber,
         fraction_fit=1.0,
         fraction_evaluate=1.0,
         min_fit_clients=min_clients,
@@ -171,6 +181,11 @@ def server_fn(context: Context) -> ServerAppComponents:
         embedding_dim=int(run_config.get("embedding-dim", DEFAULT_EMBEDDING_DIM)),
         min_clients=4,
         artifact_dir=resolved_artifact_dir,
+        proximal_mu=float(run_config.get("proximal-mu", 0.1)),
+        use_huber=parse_run_config_bool(run_config.get("use-huber"), default=False),
+        huber_threshold=float(
+            run_config.get("huber-threshold", DEFAULT_HUBER_THRESHOLD)
+        ),
     )
 
     return ServerAppComponents(

@@ -42,6 +42,12 @@ embedding-dim = 128
 validation-split = 0.2
 data-dir = "data"
 artifact-dir = "artifacts"
+proximal-mu = 0.1
+use-huber = false
+huber-threshold = 10.0
+use-update-noise = false
+update-noise-l2-norm-clip = 1.0
+update-noise-multiplier = 0.001
 
 [tool.ruff]
 line-length = 88
