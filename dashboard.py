@@ -7,17 +7,16 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Wie im Training: vor Keras-Import setzen
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("KERAS_BACKEND", "tensorflow")
 
-import keras  # noqa: E402
-from keras.layers import TextVectorization  # noqa: E402
-import tensorflow as tf  # noqa: E402
+import keras
+from keras.layers import TextVectorization
+import tensorflow as tf
 
-from src.paths import default_data_dir, vocab_path  # gleiche Pfade wie im Training
-from src.local_training import sequence_length  # nutzt dein aktualisiertes Modul
+from src.paths import default_data_dir, vocab_path
+from src.local_training import sequence_length
 
 
 DATA_DIR: Path = default_data_dir()
@@ -47,11 +46,10 @@ def load_vectorizer():
             "Bitte zuerst Stage 1 Datenvorbereitung ausführen."
         )
 
-    # Vokabular wie in Stage 1 geladen (eine Zeile pro Token).[file:7]
     with VOCAB_PATH.open("r", encoding="utf-8") as f:
         vocab = [line.strip() for line in f if line.strip()]
 
-    seq_len = sequence_length(DATA_DIR, partition=0)  # nutzt dein neues sequence_length()[file:11]
+    seq_len = sequence_length(DATA_DIR, partition=0)
 
     vectorizer = TextVectorization(
         output_mode="int",
@@ -66,7 +64,7 @@ def load_metrics():
     if not METRICS_PATH.exists():
         return None
     df = pd.read_csv(METRICS_PATH)
-    # Erwartet: round, loss, accuracy – genau so schreibt dein Server metrics.csv.[file:10]
+
     return df
 
 
