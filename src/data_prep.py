@@ -40,7 +40,10 @@ def prepare_partitions(data_dir: str | Path, partitions: int = 4) -> None:
     y = labels[idx]
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    vocab_path(output_dir).write_text("\n".join(vectorizer.get_vocabulary()))
+    vocab_path(output_dir).write_text(
+        "\n".join(vectorizer.get_vocabulary()),
+        encoding="utf-8",
+    )
 
     samples_per_partition = len(x) // partitions
     for partition in range(partitions):
