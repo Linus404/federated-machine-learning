@@ -1,2 +1,1 @@
-def main() -> None:
-    print("Hello from federated-machine-learning!")
+"""IMDB Movie Sentiment Analysis Federated ML"""

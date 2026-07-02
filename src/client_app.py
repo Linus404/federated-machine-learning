@@ -3,14 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from flwr.client import NumPyClient
 from flwr.clientapp import ClientApp
 from flwr.common import Context
-import numpy as np
-
-# Differential Privacy settings
-DP_L2_NORM_CLIP = 1.0        # gradient clipping threshold
-DP_NOISE_MULTIPLIER = 0.001  # gaussian noise scale
 
 from src.local_training import (
     DEFAULT_EMBEDDING_DIM,
@@ -21,6 +17,10 @@ from src.local_training import (
     vocab_size,
 )
 from src.paths import data_dir_path, default_data_dir
+
+# Differential Privacy settings
+DP_L2_NORM_CLIP = 1.0  # gradient clipping threshold
+DP_NOISE_MULTIPLIER = 0.001  # gaussian noise scale
 
 
 class SentimentClient(NumPyClient):
@@ -46,9 +46,11 @@ class SentimentClient(NumPyClient):
         self.model = build_model(
             vocab_size(self.data_dir), self.train_data[0].shape[1], embedding_dim
         )
+
     def _add_dp_noise(self, weights_before: list, weights_after: list) -> list:
         """Clip and noise the weight update for differential privacy."""
         noisy_weights = []
+
         for w_before, w_after in zip(weights_before, weights_after):
             update = w_after - w_before
             norm = np.linalg.norm(update)
@@ -57,8 +59,9 @@ class SentimentClient(NumPyClient):
                 0, DP_NOISE_MULTIPLIER * DP_L2_NORM_CLIP, update.shape
             )
             noisy_weights.append(w_before + update + noise)
+
         return noisy_weights
-    
+
     def get_parameters(self, config: dict[str, Any]) -> list[Any]:
         """Retrieve the current local model weights as a list of NumPy arrays."""
         return self.model.get_weights()
@@ -69,25 +72,24 @@ class SentimentClient(NumPyClient):
         """Train locally with differential privacy noise on weight updates."""
         self.model.set_weights(parameters)
         weights_before = [w.copy() for w in self.model.get_weights()]
-
         history = self.model.fit(
             *self.train_data,
             epochs=self.epochs,
             batch_size=self.batch_size,
             verbose=0,
         )
-
         noisy_weights = self._add_dp_noise(weights_before, self.model.get_weights())
-
         metrics = {name: float(values[-1]) for name, values in history.history.items()}
+
         return noisy_weights, len(self.train_data[0]), metrics
-    
+
     def evaluate(
         self, parameters: list[Any], config: dict[str, Any]
     ) -> tuple[float, int, dict[str, float]]:
         """Evaluate the global model on this client's validation split."""
         self.model.set_weights(parameters)
         loss, accuracy = self.model.evaluate(*self.val_data, verbose=0)
+
         return float(loss), len(self.val_data[0]), {"accuracy": float(accuracy)}
 
 

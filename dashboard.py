@@ -112,7 +112,9 @@ st.title("Review inference & Training metrics")
 
 with st.sidebar:
     st.subheader("Dashboard settings")
-    st.session_state.auto_refresh = st.toggle("Auto refresh", value=st.session_state.auto_refresh)
+    st.session_state.auto_refresh = st.toggle(
+        "Auto refresh", value=st.session_state.auto_refresh
+    )
     st.session_state.refresh_seconds = st.slider(
         "Refresh interval (seconds)",
         1,
@@ -169,10 +171,14 @@ with col_right:
 
         expected_cols = {"round", "loss", "accuracy"}
         if expected_cols <= set(df_metrics.columns):
-            chart_data = df_metrics.sort_values("round").set_index("round")[["accuracy", "loss"]]
+            chart_data = df_metrics.sort_values("round").set_index("round")[
+                ["accuracy", "loss"]
+            ]
             st.line_chart(chart_data)
         else:
-            st.warning("metrics.csv hat nicht die erwarteten Spalten ('round', 'loss', 'accuracy').")
+            st.warning(
+                "metrics.csv hat nicht die erwarteten Spalten ('round', 'loss', 'accuracy')."
+            )
 
 if st.session_state.auto_refresh:
     time.sleep(st.session_state.refresh_seconds)

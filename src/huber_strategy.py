@@ -31,6 +31,7 @@ def _unflatten(vector: np.ndarray, reference: NDArrays) -> NDArrays:
         size = ref.size
         out.append(vector[idx : idx + size].reshape(ref.shape))
         idx += size
+
     return out
 
 
@@ -62,7 +63,10 @@ class HuberRobustFedAvg(FedAvg):
     """FedAvg variant that aggregates with multi-dimensional Huber loss."""
 
     def __init__(
-        self, *args: Any, huber_threshold: float = DEFAULT_HUBER_THRESHOLD, **kwargs: Any
+        self,
+        *args: Any,
+        huber_threshold: float = DEFAULT_HUBER_THRESHOLD,
+        **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.huber_threshold = huber_threshold

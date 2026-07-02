@@ -36,11 +36,12 @@ def load_partition(
     y = np.load(y_path).astype("float32", copy=False)
 
     split = int(len(x) * (1 - validation_split))
+
     return (x[:split], y[:split]), (x[split:], y[split:])
 
 
 def vocab_size(data_dir: str | Path | None = None) -> int:
-    """Count the shared Stage 1 vocabulary entries."""
+    """Count the shared vocabulary entries."""
     resolved_data_dir = data_dir_path(data_dir)
     with vocab_path(resolved_data_dir).open() as file:
         return sum(1 for _ in file)
@@ -51,13 +52,14 @@ def sequence_length(data_dir: str | Path | None = None, partition: int = 0) -> i
     resolved_data_dir = data_dir_path(data_dir)
     x_path, _ = partition_paths(resolved_data_dir, partition)
     x = np.load(x_path, mmap_mode="r")
+
     return int(x.shape[1])
 
 
 def build_model(
     vocab_size: int, sequence_length: int, embedding_dim: int = DEFAULT_EMBEDDING_DIM
 ) -> Any:
-    """Build the small sentiment model reused by local and federated training."""
+    """Build the sentiment model reused by local and federated training."""
     inputs = keras.Input(shape=(sequence_length,), dtype="int32")
 
     x = keras.layers.Embedding(vocab_size, embedding_dim, name="token_embedding")(
@@ -81,11 +83,12 @@ def build_model(
 
     model = keras.Model(inputs, outputs)
     model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
+
     return model
 
 
 def train(args: argparse.Namespace) -> tuple[Any, Any]:
-    """Train one local baseline model for Stage 2."""
+    """Train one local baseline model."""
     train_data, val_data = load_partition(
         data_dir=args.data_dir,
         partition=args.partition,
@@ -115,6 +118,7 @@ def train(args: argparse.Namespace) -> tuple[Any, Any]:
         f"eval_loss={loss:.4f} "
         f"eval_accuracy={accuracy:.4f}"
     )
+
     return model, history
 
 
