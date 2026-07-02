@@ -52,8 +52,9 @@ def load_vectorizer():
             "Bitte zuerst Stage 1 Datenvorbereitung ausführen."
         )
 
-    with VOCAB_PATH.open("r", encoding="utf-8") as f:
-        vocab = [line.strip() for line in f if line.strip()]
+    saved_vocab = VOCAB_PATH.read_text(encoding="utf-8").splitlines()
+    # TextVectorization adds "" and "[UNK]" itself when a vocabulary is supplied.
+    vocab = [term for term in saved_vocab[2:] if term]
 
     seq_len = sequence_length(DATA_DIR, partition=0)
     return TextVectorization(
