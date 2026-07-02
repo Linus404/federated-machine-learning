@@ -9,9 +9,8 @@ from flwr.common import Context, ndarrays_to_parameters, parameters_to_ndarrays
 from flwr.server import ServerAppComponents, ServerConfig
 from flwr.server.strategy import FedProx
 from flwr.serverapp import ServerApp
-from src.huber_strategy import huber_aggregate, _flatten, _unflatten
-from flwr.common import parameters_to_ndarrays, ndarrays_to_parameters
 
+from src.huber_strategy import _flatten, _unflatten, huber_aggregate
 from src.local_training import (
     DEFAULT_EMBEDDING_DIM,
     build_model,
@@ -20,6 +19,7 @@ from src.local_training import (
 )
 from src.paths import (
     artifact_dir_path,
+    clear_artifact_dir,
     data_dir_path,
     default_artifact_dir,
     default_data_dir,
@@ -43,7 +43,7 @@ def weighted_average(metrics: list[tuple[int, dict[str, float]]]) -> dict[str, f
     return {"accuracy": accuracy}
 
 
-class ArtifactSavingFedProx(FedProx):
+class SentimentServer(FedProx):
     """FedProx (non-IID robust) + Huber aggregation (Byzantine robust) + artifact saving."""
 
     def __init__(
@@ -75,7 +75,9 @@ class ArtifactSavingFedProx(FedProx):
         if self.use_huber and results:
             # Robust Huber aggregation instead of plain FedProx averaging
             reference = parameters_to_ndarrays(results[0][1].parameters)
-            vectors = [_flatten(parameters_to_ndarrays(r.parameters)) for _, r in results]
+            vectors = [
+                _flatten(parameters_to_ndarrays(r.parameters)) for _, r in results
+            ]
             counts = [r.num_examples for _, r in results]
             aggregated = huber_aggregate(vectors, counts, self.huber_threshold)
             parameters = ndarrays_to_parameters(_unflatten(aggregated, reference))
@@ -88,7 +90,7 @@ class ArtifactSavingFedProx(FedProx):
             # Standard FedProx averaging
             parameters, metrics = super().aggregate_fit(server_round, results, failures)
 
-        # Artifact saving (unchanged)
+        # Artifact saving
         if parameters is not None:
             self.artifact_dir.mkdir(parents=True, exist_ok=True)
             model = build_model(
@@ -131,7 +133,7 @@ def create_strategy(
     min_clients: int = 4,
     artifact_dir: str | Path | None = None,
     proximal_mu: float = 0.1,
-) -> ArtifactSavingFedAvg:
+) -> SentimentServer:
     resolved_data_dir = data_dir_path(data_dir)
     resolved_artifact_dir = artifact_dir_path(artifact_dir)
 
@@ -141,7 +143,7 @@ def create_strategy(
         embedding_dim,
     )
 
-    return ArtifactSavingFedProx(
+    return SentimentServer(
         proximal_mu=proximal_mu,
         data_dir=resolved_data_dir,
         embedding_dim=embedding_dim,
@@ -158,17 +160,17 @@ def create_strategy(
 
 
 def server_fn(context: Context) -> ServerAppComponents:
-    """Configure FedAvg for the four simulated sentiment clients."""
     run_config: dict[str, Any] = context.run_config
     data_dir = run_config.get("data-dir", default_data_dir())
     artifact_dir = run_config.get("artifact-dir", default_artifact_dir())
     num_rounds = int(run_config.get("num-server-rounds", DEFAULT_SERVER_ROUNDS))
+    resolved_artifact_dir = clear_artifact_dir(artifact_dir, protected_paths=[data_dir])
 
     strategy = create_strategy(
         data_dir=data_dir,
         embedding_dim=int(run_config.get("embedding-dim", DEFAULT_EMBEDDING_DIM)),
         min_clients=4,
-        artifact_dir=artifact_dir,
+        artifact_dir=resolved_artifact_dir,
     )
 
     return ServerAppComponents(
