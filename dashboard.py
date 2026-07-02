@@ -15,15 +15,21 @@ import keras
 from keras.layers import TextVectorization
 import tensorflow as tf
 
-from src.paths import default_data_dir, vocab_path
 from src.local_training import sequence_length
+from src.paths import (
+    default_artifact_dir,
+    default_data_dir,
+    global_model_path,
+    metrics_path,
+    vocab_path,
+)
 
 
 DATA_DIR: Path = default_data_dir()
 VOCAB_PATH: Path = vocab_path(DATA_DIR)
-ARTIFACT_DIR: Path = Path(os.getenv("FML_ARTIFACT_DIR", "artifacts"))
-MODEL_PATH: Path = ARTIFACT_DIR / "global_model.keras"
-METRICS_PATH: Path = ARTIFACT_DIR / "metrics.csv"
+ARTIFACT_DIR: Path = default_artifact_dir()
+MODEL_PATH: Path = global_model_path(ARTIFACT_DIR)
+METRICS_PATH: Path = metrics_path(ARTIFACT_DIR)
 DEFAULT_REFRESH_SECONDS = 6
 IDLE_STOP_AFTER = 7
 
@@ -46,8 +52,9 @@ def load_vectorizer():
             "Bitte zuerst Stage 1 Datenvorbereitung ausführen."
         )
 
-    with VOCAB_PATH.open("r", encoding="utf-8") as f:
-        vocab = [line.strip() for line in f if line.strip()]
+    saved_vocab = VOCAB_PATH.read_text(encoding="utf-8").splitlines()
+    # TextVectorization adds "" and "[UNK]" itself when a vocabulary is supplied.
+    vocab = [term for term in saved_vocab[2:] if term]
 
     seq_len = sequence_length(DATA_DIR, partition=0)
     return TextVectorization(
@@ -112,7 +119,9 @@ st.title("Review inference & Training metrics")
 
 with st.sidebar:
     st.subheader("Dashboard settings")
-    st.session_state.auto_refresh = st.toggle("Auto refresh", value=st.session_state.auto_refresh)
+    st.session_state.auto_refresh = st.toggle(
+        "Auto refresh", value=st.session_state.auto_refresh
+    )
     st.session_state.refresh_seconds = st.slider(
         "Refresh interval (seconds)",
         1,
@@ -151,8 +160,8 @@ with col_left:
             st.markdown("### Positive sentiment probability")
             st.markdown(f"**{positive_prob * 100:.1f}%**")
             st.markdown(f"**Prediction:** {label}")
-        except Exception as e:
-            st.error(f"Fehler bei der Vorhersage: {e}")
+        except (FileNotFoundError, OSError, ValueError, tf.errors.OpError) as error:
+            st.error(f"Fehler bei der Vorhersage: {error}")
 
 with col_right:
     st.subheader("Training metrics")
@@ -169,10 +178,14 @@ with col_right:
 
         expected_cols = {"round", "loss", "accuracy"}
         if expected_cols <= set(df_metrics.columns):
-            chart_data = df_metrics.sort_values("round").set_index("round")[["accuracy", "loss"]]
+            chart_data = df_metrics.sort_values("round").set_index("round")[
+                ["accuracy", "loss"]
+            ]
             st.line_chart(chart_data)
         else:
-            st.warning("metrics.csv hat nicht die erwarteten Spalten ('round', 'loss', 'accuracy').")
+            st.warning(
+                "metrics.csv hat nicht die erwarteten Spalten ('round', 'loss', 'accuracy')."
+            )
 
 if st.session_state.auto_refresh:
     time.sleep(st.session_state.refresh_seconds)

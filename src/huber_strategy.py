@@ -1,17 +1,7 @@
 from __future__ import annotations
 
-from typing import Any
-
 import numpy as np
-from flwr.common import (
-    FitRes,
-    NDArrays,
-    Parameters,
-    ndarrays_to_parameters,
-    parameters_to_ndarrays,
-)
-from flwr.server.client_proxy import ClientProxy
-from flwr.server.strategy import FedAvg
+from flwr.common import NDArrays
 
 DEFAULT_HUBER_THRESHOLD = 10.0
 WEISZFELD_ITERS = 10
@@ -31,6 +21,7 @@ def _unflatten(vector: np.ndarray, reference: NDArrays) -> NDArrays:
         size = ref.size
         out.append(vector[idx : idx + size].reshape(ref.shape))
         idx += size
+
     return out
 
 
@@ -56,40 +47,3 @@ def huber_aggregate(
         centre = np.average(client_vectors, axis=0, weights=coeffs)
 
     return centre
-
-
-class HuberRobustFedAvg(FedAvg):
-    """FedAvg variant that aggregates with multi-dimensional Huber loss."""
-
-    def __init__(
-        self, *args: Any, huber_threshold: float = DEFAULT_HUBER_THRESHOLD, **kwargs: Any
-    ) -> None:
-        super().__init__(*args, **kwargs)
-        self.huber_threshold = huber_threshold
-
-    def aggregate_fit(
-        self,
-        server_round: int,
-        results: list[tuple[ClientProxy, FitRes]],
-        failures: list[Any],
-    ) -> tuple[Parameters | None, dict[str, Any]]:
-        if not results:
-            return None, {}
-
-        reference = parameters_to_ndarrays(results[0][1].parameters)
-        vectors = [
-            _flatten(parameters_to_ndarrays(fit_res.parameters))
-            for _, fit_res in results
-        ]
-        counts = [fit_res.num_examples for _, fit_res in results]
-
-        aggregated_vector = huber_aggregate(vectors, counts, self.huber_threshold)
-        aggregated_ndarrays = _unflatten(aggregated_vector, reference)
-        parameters = ndarrays_to_parameters(aggregated_ndarrays)
-
-        metrics: dict[str, Any] = {}
-        if self.fit_metrics_aggregation_fn:
-            fit_metrics = [(res.num_examples, res.metrics) for _, res in results]
-            metrics = self.fit_metrics_aggregation_fn(fit_metrics)
-
-        return parameters, metrics
