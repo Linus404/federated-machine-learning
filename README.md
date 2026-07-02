@@ -97,6 +97,93 @@ docker compose up --build
 
 Prepare data on the host first with `uv run python -m src.data_prep`, or run the same command inside the image by overriding the compose command. The Compose command still runs the full four-supernode simulation, but mounts data outside the packaged app directory and schedules one TensorFlow client at a time to avoid noisy Ray packaging warnings and low-memory Docker Desktop failures.
 
+## Google Cloud deployment
+
+The configured cloud deployment runs this project on a Google Compute Engine VM with Docker Compose. The VM runs the Flower training container and the Streamlit dashboard container, while `data/` and `artifacts/` are mounted into both containers.
+
+### Local setup
+
+Install and authenticate the Google Cloud CLI, then select the project that owns the VM:
+
+```powershell
+gcloud auth login
+gcloud config set project YOUR_PROJECT_ID
+```
+
+### Connect to the VM
+
+```powershell
+gcloud compute ssh fml-vm
+```
+
+On the VM, enter the repository:
+
+```bash
+cd federated-machine-learning
+```
+
+### Run the training and dashboard on the VM
+
+Prepare the data partitions once:
+
+```bash
+docker compose run --rm federated uv run --no-sync python -m src.data_prep
+```
+
+Run the federated training:
+
+```bash
+docker compose up --build federated
+```
+
+Start the dashboard:
+
+```bash
+docker compose up -d dashboard
+```
+
+Inspect running containers and logs:
+
+```bash
+docker compose ps
+docker compose logs -f federated
+docker compose logs -f dashboard
+```
+
+### Open the dashboard from Windows
+
+Keep this PowerShell session open while using the dashboard:
+
+```powershell
+gcloud compute ssh fml-vm --ssh-flag="-L 8502:localhost:8501"
+```
+
+Then open:
+
+```text
+http://localhost:8502
+```
+
+The tunnel maps Windows `localhost:8502` to the Streamlit dashboard running on VM port `8501`. Use another local port, for example `8510`, if `8502` is already in use:
+
+```powershell
+gcloud compute ssh fml-vm --ssh-flag="-L 8510:localhost:8501"
+```
+
+### Stop cloud costs after the demo
+
+Stop the VM when it is not needed:
+
+```powershell
+gcloud compute instances stop fml-vm
+```
+
+Delete the VM when the deployment is no longer needed:
+
+```powershell
+gcloud compute instances delete fml-vm
+```
+
 ## Development
 
 Add dependencies with:
