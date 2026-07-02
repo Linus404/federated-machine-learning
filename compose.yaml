@@ -1,19 +1,27 @@
 services:
-  fml:
+  federated:
     build: .
-    shm_size: "1gb"
+    container_name: fml_federated
+    command: [
+      "uv", "run", "--no-sync",
+      "flwr", "run", ".", "--stream",
+      "--federation-config", "num-supernodes=4"
+    ]
     volumes:
-      - ./data:/mnt/fml-data
-      - ./artifacts:/mnt/fml-artifacts
-    command:
-      - uv
-      - run
-      - --no-sync
-      - flwr
-      - run
-      - .
-      - --stream
-      - --federation-config
-      - num-supernodes=4 init-args-num-cpus=4 client-resources-num-cpus=4 init-args-log-to-driver=false init-args-logging-level="ERROR"
-      - --run-config
-      - data-dir='/mnt/fml-data' artifact-dir='/mnt/fml-artifacts'
+      - ./data:/app/data
+      - ./artifacts:/app/artifacts
+
+  dashboard:
+    build: .
+    container_name: fml_dashboard
+    command: [
+      "uv", "run", "--no-sync",
+      "streamlit", "run", "dashboard.py",
+      "--server.address=0.0.0.0",
+      "--server.port=8501"
+    ]
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+      - ./artifacts:/app/artifacts
