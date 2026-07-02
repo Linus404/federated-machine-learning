@@ -2,8 +2,15 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from src.paths import clear_artifact_dir
+from src.paths import (
+    ARTIFACT_DIR_ENV,
+    clear_artifact_dir,
+    default_artifact_dir,
+    global_model_path,
+    metrics_path,
+)
 
 
 class ClearArtifactDirTests(unittest.TestCase):
@@ -115,6 +122,25 @@ class ClearArtifactDirTests(unittest.TestCase):
 
             self.assertTrue(data_link.is_symlink())
             self.assertTrue((data_target / "partition_0_x.npy").exists())
+
+
+class ArtifactPathContractTests(unittest.TestCase):
+    def test_default_artifact_paths_follow_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_dir = Path(tmpdir) / "selected-artifacts"
+
+            with patch.dict(os.environ, {ARTIFACT_DIR_ENV: str(artifact_dir)}):
+                resolved_artifact_dir = default_artifact_dir()
+
+            self.assertEqual(resolved_artifact_dir, artifact_dir.resolve())
+            self.assertEqual(
+                global_model_path(resolved_artifact_dir),
+                artifact_dir.resolve() / "global_model.keras",
+            )
+            self.assertEqual(
+                metrics_path(resolved_artifact_dir),
+                artifact_dir.resolve() / "metrics.csv",
+            )
 
 
 if __name__ == "__main__":
