@@ -54,7 +54,6 @@ def load_vectorizer():
     seq_len = sequence_length(DATA_DIR, partition=0)  # nutzt dein neues sequence_length()[file:11]
 
     vectorizer = TextVectorization(
-        max_tokens=len(vocab),
         output_mode="int",
         output_sequence_length=seq_len,
         vocabulary=vocab,
