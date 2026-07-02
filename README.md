@@ -48,6 +48,19 @@ Run the Flower app using the configuration in `pyproject.toml`:
 uv run flwr run . --stream --federation-config "num-supernodes=4"
 ```
 
+Run the dashboard against the selected artifact directory:
+
+```bash
+FML_ARTIFACT_DIR=artifacts/baseline uv run streamlit run dashboard.py
+```
+
+On PowerShell:
+
+```powershell
+$env:FML_ARTIFACT_DIR = "artifacts/baseline"
+uv run streamlit run dashboard.py
+```
+
 ### Runtime paths
 
 The default data and artifact directories are configured in `[tool.flwr.app.config]` as `data-dir = "data"` and `artifact-dir = "artifacts"`. You can override them with Flower run config, for example:
@@ -57,6 +70,16 @@ uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "
 ```
 
 Local scripts also respect the environment variables `FML_DATA_DIR` and `FML_ARTIFACT_DIR` for their default paths.
+
+The server clears the configured artifact directory at the start of each run so stale metrics or models cannot bleed into fresh experiments. Use a distinct `artifact-dir` for each experiment you want to compare:
+
+```powershell
+uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "artifact-dir='artifacts/baseline' use-update-noise=false use-huber=false"
+uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "artifact-dir='artifacts/huber' use-update-noise=false use-huber=true huber-threshold=10.0"
+uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "artifact-dir='artifacts/update-noise' use-update-noise=true use-huber=false"
+```
+
+`use-huber` enables the robust aggregation path for outlier-resistant experiments. `use-update-noise` enables a small illustrative client update-noise ablation; it is not a production differential-privacy guarantee.
 
 ## Docker
 
