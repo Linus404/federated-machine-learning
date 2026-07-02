@@ -22,13 +22,18 @@ class ServerStartupArtifactCleanupTests(unittest.TestCase):
                     "data-dir": data_dir,
                     "artifact-dir": artifact_dir,
                     "num-server-rounds": 1,
+                    "proximal-mu": 0.25,
+                    "use-huber": "true",
+                    "huber-threshold": 3.5,
                 }
             )
             cleanup_saw_stale_file = False
+            captured_strategy_kwargs = {}
 
             def create_strategy_probe(**kwargs):
                 nonlocal cleanup_saw_stale_file
                 cleanup_saw_stale_file = not stale_file.exists()
+                captured_strategy_kwargs.update(kwargs)
                 return Mock(name="strategy")
 
             with (
@@ -45,6 +50,12 @@ class ServerStartupArtifactCleanupTests(unittest.TestCase):
 
             self.assertTrue(cleanup_saw_stale_file)
             self.assertFalse(stale_file.exists())
+            self.assertEqual(
+                captured_strategy_kwargs["artifact_dir"], artifact_dir.resolve()
+            )
+            self.assertEqual(captured_strategy_kwargs["proximal_mu"], 0.25)
+            self.assertTrue(captured_strategy_kwargs["use_huber"])
+            self.assertEqual(captured_strategy_kwargs["huber_threshold"], 3.5)
             self.assertEqual(components["config"].num_rounds, 1)
 
     def test_server_fn_refuses_to_clear_data_dir(self) -> None:
@@ -67,6 +78,16 @@ class ServerStartupArtifactCleanupTests(unittest.TestCase):
 
             create_strategy.assert_not_called()
             self.assertTrue(data_file.exists())
+
+
+class MetricAggregationTests(unittest.TestCase):
+    def test_weighted_average_uses_num_examples(self) -> None:
+        metrics = [
+            (2, {"accuracy": 0.5}),
+            (6, {"accuracy": 1.0}),
+        ]
+
+        self.assertEqual(server_app.weighted_average(metrics), {"accuracy": 0.875})
 
 
 if __name__ == "__main__":
