@@ -1,5 +1,6 @@
 services:
   federated:
+    shm_size: "4gb"
     build: .
     container_name: fml_federated
     command: [

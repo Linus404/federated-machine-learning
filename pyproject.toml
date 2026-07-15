@@ -15,8 +15,8 @@ dependencies = [
     "keras>=3.14.0",
     "nbformat>=5.10.4",
     "streamlit>=1.57.0",
-    "tensorflow-cpu>=2.20.0,<2.21.0; sys_platform == 'linux'",
-    "tensorflow>=2.20.0,<2.21.0; sys_platform != 'linux'",
+    "tensorflow-cpu>=2.20.0,<2.21.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "tensorflow>=2.20.0,<2.21.0",
 ]
 
 [project.optional-dependencies]
@@ -48,6 +48,35 @@ huber-threshold = 10.0
 use-update-noise = false
 update-noise-l2-norm-clip = 1.0
 update-noise-multiplier = 0.001
+#for red team
+attack-simulation = false
+malicious-partition = 0
+attack-type = "scale"
+attack-scale = 50.0
+
+
+
+#######################################################################
+# CONFIGURATION MIGRATION NOTICE:
+#
+# What was previously called "federation config" for SuperLink
+# connections in pyproject.toml has been renamed and moved.
+#
+# These settings are now **SuperLink connection configuration**
+# and are defined in the Flower configuration file.
+#
+# The entries below are commented out intentionally and are kept
+# only as a migration reference.
+#
+# Docs: https://flower.ai/docs/framework/ref-flower-configuration.html
+#######################################################################
+
+# [tool.flwr.federations]
+# default = "local-simulation"
+
+# [tool.flwr.federations.local-simulation]
+# options.num-supernodes = 4
+# options.backend.client-resources.num-cpus = 4
 
 [tool.ruff]
 line-length = 88

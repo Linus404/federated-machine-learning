@@ -37,7 +37,15 @@ class SentimentClient(NumPyClient):
         use_update_noise: bool = False,
         update_noise_l2_norm_clip: float = UPDATE_NOISE_L2_NORM_CLIP,
         update_noise_multiplier: float = UPDATE_NOISE_MULTIPLIER,
+        is_malicious: bool = False,
+        attack_type: str = "scale",
+        attack_scale: float = 50.0,
+
     ) -> None:
+        ##every client object remebers now if its malicious or not, and the attack type and scale.
+        self.is_malicious = is_malicious
+        self.attack_type = attack_type
+        self.attack_scale = attack_scale
         self.data_dir = data_dir_path(data_dir)
         self.epochs = epochs
         self.batch_size = batch_size
@@ -69,6 +77,12 @@ class SentimentClient(NumPyClient):
             noisy_weights.append(w_before + update + noise)
 
         return noisy_weights
+    def _corrupt_weights(self, weights: list) -> list :
+        if self.attack_type == "scale":
+            return [w * self.attack_scale for w in weights]
+        elif self.attack_type == "noise":
+            return [np.random.normal(0, self.attack_scale, w.shape).astype(w.dtype) for w in weights]
+        return weights
 
     def get_parameters(self, config: dict[str, Any]) -> list[Any]:
         """Retrieve the current local model weights as a list of NumPy arrays."""
@@ -93,8 +107,15 @@ class SentimentClient(NumPyClient):
             else trained_weights
         )
         metrics = {name: float(values[-1]) for name, values in history.history.items()}
+        if self.is_malicious:
+            corrupted_weights = self._corrupt_weights(self.model.get_weights())
+            return corrupted_weights, len(self.train_data[0]), metrics
+        noisy_weights = self._add_update_noise(weights_before, self.model.get_weights())
+        return noisy_weights, len(self.train_data[0]), metrics
+##an attacker doesn't need to skip training, they just need to lie about the result before transmitting it 
+##metrics look completley normal only the weights are poisoned. So we can just return the poisoned weights and the metrics from training.
 
-        return weights, len(self.train_data[0]), metrics
+    
 
     def evaluate(
         self, parameters: list[Any], config: dict[str, Any]
@@ -110,6 +131,9 @@ def client_fn(context: Context) -> Any:
     """Create one client; Flower supplies partition-id for each SuperNode."""
     run_config: dict[str, Any] = context.run_config
     partition = int(context.node_config.get("partition-id", 0))
+    attack_on = parse_run_config_bool(run_config.get("attack-simulation"), default=False)
+    malicious_partition = int(run_config.get("malicious-partition", 0))
+    is_malicious = attack_on and partition == malicious_partition
 
     return SentimentClient(
         data_dir=run_config.get("data-dir", default_data_dir()),
@@ -127,6 +151,9 @@ def client_fn(context: Context) -> Any:
         update_noise_multiplier=float(
             run_config.get("update-noise-multiplier", UPDATE_NOISE_MULTIPLIER)
         ),
+        is_malicious=is_malicious,
+        attack_type=str(run_config.get("attack-type", "scale")),
+        attack_scale=float(run_config.get("attack-scale", 50.0)),
     ).to_client()
 
 
