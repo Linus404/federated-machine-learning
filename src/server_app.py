@@ -20,6 +20,8 @@ from src.huber_strategy import (
 )
 from src.local_training import DEFAULT_EMBEDDING_DIM, build_model_from_manifest
 from src.paths import (
+    RunArtifactLock,
+    acquire_run_artifact_lock,
     client_metrics_path,
     clear_artifact_dir,
     default_server_artifact_dir,
@@ -51,6 +53,7 @@ class SentimentServer(FedProx):
         self,
         app_manifest,
         artifact_dir=None,
+        artifact_lock: RunArtifactLock | None = None,
         huber_threshold: float = DEFAULT_HUBER_THRESHOLD,
         use_huber: bool = False,
         *args,
@@ -58,6 +61,7 @@ class SentimentServer(FedProx):
     ) -> None:
         super().__init__(*args, **kwargs)
         self.artifact_dir = resolve_dir(artifact_dir or default_server_artifact_dir())
+        self._artifact_lock = artifact_lock
         self.app_manifest = app_manifest
         self.huber_threshold = huber_threshold
         self.use_huber = use_huber
@@ -157,6 +161,7 @@ def create_strategy(
     embedding_dim: int = DEFAULT_EMBEDDING_DIM,
     min_clients: int = 4,
     artifact_dir: str | Path | None = None,
+    artifact_lock: RunArtifactLock | None = None,
     public_manifest_path: str | Path | None = None,
     public_artifact_dir: str | Path | None = None,
     proximal_mu: float = 0.1,
@@ -175,6 +180,7 @@ def create_strategy(
     return SentimentServer(
         proximal_mu=proximal_mu,
         artifact_dir=resolved_artifact_dir,
+        artifact_lock=artifact_lock,
         app_manifest=app_manifest,
         huber_threshold=huber_threshold,
         use_huber=use_huber,
@@ -195,27 +201,31 @@ def server_fn(context: Context) -> ServerAppComponents:
     num_rounds = int(run_config.get("num-server-rounds", DEFAULT_SERVER_ROUNDS))
     public_artifact_dir = resolve_public_artifact_dir(run_config)
     protected_paths = [public_artifact_dir]
-    resolved_artifact_dir = clear_artifact_dir(
-        artifact_dir, protected_paths=protected_paths
-    )
-
-    strategy = create_strategy(
-        embedding_dim=int(run_config["embedding-dim"]),
-        min_clients=4,
-        artifact_dir=resolved_artifact_dir,
-        public_manifest_path=run_config.get("public-manifest-path"),
-        public_artifact_dir=run_config.get("public-artifact-dir"),
-        proximal_mu=float(run_config.get("proximal-mu", 0.1)),
-        use_huber=parse_run_config_bool(run_config.get("use-huber"), default=False),
-        huber_threshold=float(
-            run_config.get("huber-threshold", DEFAULT_HUBER_THRESHOLD)
-        ),
-    )
-
-    return ServerAppComponents(
-        strategy=strategy,
-        config=ServerConfig(num_rounds=num_rounds),
-    )
+    artifact_lock = acquire_run_artifact_lock(artifact_dir)
+    try:
+        resolved_artifact_dir = clear_artifact_dir(
+            artifact_dir, protected_paths=protected_paths
+        )
+        strategy = create_strategy(
+            embedding_dim=int(run_config["embedding-dim"]),
+            min_clients=4,
+            artifact_dir=resolved_artifact_dir,
+            artifact_lock=artifact_lock,
+            public_manifest_path=run_config.get("public-manifest-path"),
+            public_artifact_dir=run_config.get("public-artifact-dir"),
+            proximal_mu=float(run_config.get("proximal-mu", 0.1)),
+            use_huber=parse_run_config_bool(run_config.get("use-huber"), default=False),
+            huber_threshold=float(
+                run_config.get("huber-threshold", DEFAULT_HUBER_THRESHOLD)
+            ),
+        )
+        return ServerAppComponents(
+            strategy=strategy,
+            config=ServerConfig(num_rounds=num_rounds),
+        )
+    except BaseException:
+        artifact_lock.release()
+        raise
 
 
 app = ServerApp(server_fn=server_fn)

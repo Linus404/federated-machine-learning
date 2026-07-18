@@ -1,17 +1,62 @@
 import os
+import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from src.paths import (
     SERVER_ARTIFACT_DIR_ENV,
+    acquire_run_artifact_lock,
     client_metrics_path,
     clear_artifact_dir,
     default_server_artifact_dir,
     global_model_path,
     metrics_path,
 )
+
+
+class RunArtifactLockTests(unittest.TestCase):
+    def test_lock_excludes_a_second_process(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_dir = Path(tmpdir) / "server"
+            child_code = textwrap.dedent(
+                """
+                import sys
+                from pathlib import Path
+
+                from src.paths import acquire_run_artifact_lock
+
+                lock = acquire_run_artifact_lock(Path(sys.argv[1]))
+                print("locked", flush=True)
+                sys.stdin.readline()
+                lock.release()
+                """
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-c", child_code, str(artifact_dir)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                if process.stdout is None:
+                    self.fail("child stdout was not captured")
+                self.assertEqual(process.stdout.readline().strip(), "locked")
+                with self.assertRaisesRegex(RuntimeError, "already writing"):
+                    acquire_run_artifact_lock(artifact_dir)
+            finally:
+                if process.stdin is not None:
+                    process.stdin.write("\n")
+                    process.stdin.flush()
+                _, stderr = process.communicate(timeout=5)
+
+            self.assertEqual(process.returncode, 0, stderr)
+            lock = acquire_run_artifact_lock(artifact_dir)
+            lock.release()
 
 
 class ClearArtifactDirTests(unittest.TestCase):
