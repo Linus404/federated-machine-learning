@@ -28,7 +28,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync
 ```
 
-### Common commands
+## Artifact preparation
 
 Prepare the raw client shards and shared public vocabulary:
 
@@ -48,7 +48,10 @@ Train one client locally from its raw shard:
 uv run python -m src.local_training --client-data-dir artifacts/clients/client-0 --public-artifact-dir artifacts/public
 ```
 
-Run the Flower app using the per-partition raw directories generated above:
+## Direct Flower simulation
+
+Run the Flower app directly using the per-partition raw directories generated
+above. This is the fast local development path and does not use Docker:
 
 ```bash
 uv run flwr run . --stream --federation-config "num-supernodes=4"
@@ -92,29 +95,47 @@ uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "
 
 `use-huber` enables the robust aggregation path for outlier-resistant experiments. `use-update-noise` enables a small illustrative client update-noise ablation; it is not a production differential-privacy guarantee.
 
-## Docker
+## Local distributed Docker runtime
 
-Build the image:
-
-```bash
-docker build -t federated-machine-learning .
-```
-
-Run the Flower simulation with generated raw shards and artifacts mounted into the container:
+Prepare the four client shards and public artifacts on the host before starting
+the runtime:
 
 ```bash
-docker compose up --build
+uv run python -m src.data_prep --partitions 4 --client-shard-dir artifacts/clients --public-artifact-dir artifacts/public
 ```
 
-Prepare data on the host first with `uv run python -m src.data_prep`. The Compose
-command runs the four-supernode simulation and schedules one TensorFlow client at
-a time to avoid low-memory Docker Desktop failures.
+Build the single application image and start the separate SuperLink, ServerApp,
+four SuperNode/ClientApp pairs, and dashboard services:
 
-## Google Cloud deployment
+```bash
+docker compose up --build -d
+```
 
-The top-level `compose.yaml` flow runs a single-VM shared-filesystem simulation.
+Submit the Flower app to the running local federation:
 
-For realistic multi-VM Flower Runtime on Google Cloud (one server plus client VMs), use the deployment guide in [deploy/README.md](deploy/README.md).
+```bash
+uv run python -m src.flower_config
+uv run flwr run . local-docker --stream
+```
+
+Flower 1.29 reads SuperLink connection profiles from `~/.flwr/config.toml` rather
+than the project configuration. The configuration command preserves unrelated
+profiles and rejects an existing `local-docker` profile unless it already points
+to the loopback Control API with insecure local transport. The insecure connection
+is appropriate only for this loopback-only local runtime; do not use it for a
+remote or public SuperLink.
+
+The dashboard is available at <http://127.0.0.1:8501>. Each ClientApp receives
+only its matching `artifacts/clients/client-N` shard as a read-only mount. Public
+artifacts are read-only in every consuming service; only ServerApp can write
+`artifacts/server`, which the dashboard mounts read-only. Stop the runtime with
+`docker compose down`.
+
+## GCE deployment
+
+The retained multi-VM GCE deployment is separate from the root local Compose
+stack. See [deploy/README.md](deploy/README.md) for its server and client VM
+workflow and validation status.
 
 ## Development
 
