@@ -1,25 +1,169 @@
+x-flower-service: &flower-service
+  image: federated-machine-learning:latest
+  restart: unless-stopped
+
+x-clientapp: &clientapp
+  <<: *flower-service
+  environment:
+    CLIENT_DATA_DIR: /app/client-data
+    FML_PUBLIC_ARTIFACT_DIR: /app/artifacts/public
+
 services:
-  federated:
+  superlink:
+    <<: *flower-service
     build: .
-    container_name: fml_federated
-    command: [
-      "uv", "run", "--no-sync",
-      "flwr", "run", ".", "--stream",
-      "--federation-config", "num-supernodes=4"
-    ]
+    command: >
+      uv run --no-sync
+      flower-superlink
+      --insecure
+      --isolation process
+    ports:
+      - "127.0.0.1:9093:9093"
+
+  serverapp:
+    <<: *flower-service
+    command: >
+      uv run --no-sync
+      flwr-serverapp
+      --insecure
+      --serverappio-api-address superlink:9091
+    environment:
+      FML_PUBLIC_ARTIFACT_DIR: /app/artifacts/public
+      FML_SERVER_ARTIFACT_DIR: /app/artifacts/server
+    depends_on:
+      - superlink
     volumes:
-      - ./artifacts:/app/artifacts
+      - ./artifacts/public:/app/artifacts/public:ro
+      - ./artifacts/server:/app/artifacts/server
+
+  supernode-0:
+    <<: *flower-service
+    command: >
+      uv run --no-sync
+      flower-supernode
+      --insecure
+      --superlink superlink:9092
+      --node-config partition-id=0
+      --clientappio-api-address 0.0.0.0:9094
+      --isolation process
+    depends_on:
+      - superlink
+
+  clientapp-0:
+    <<: *clientapp
+    command: >
+      uv run --no-sync
+      flwr-clientapp
+      --insecure
+      --clientappio-api-address supernode-0:9094
+    depends_on:
+      - supernode-0
+    volumes:
+      - ./artifacts/public:/app/artifacts/public:ro
+      - type: bind
+        source: ./artifacts/clients/client-0
+        target: /app/client-data
+        read_only: true
+
+  supernode-1:
+    <<: *flower-service
+    command: >
+      uv run --no-sync
+      flower-supernode
+      --insecure
+      --superlink superlink:9092
+      --node-config partition-id=1
+      --clientappio-api-address 0.0.0.0:9094
+      --isolation process
+    depends_on:
+      - superlink
+
+  clientapp-1:
+    <<: *clientapp
+    command: >
+      uv run --no-sync
+      flwr-clientapp
+      --insecure
+      --clientappio-api-address supernode-1:9094
+    depends_on:
+      - supernode-1
+    volumes:
+      - ./artifacts/public:/app/artifacts/public:ro
+      - type: bind
+        source: ./artifacts/clients/client-1
+        target: /app/client-data
+        read_only: true
+
+  supernode-2:
+    <<: *flower-service
+    command: >
+      uv run --no-sync
+      flower-supernode
+      --insecure
+      --superlink superlink:9092
+      --node-config partition-id=2
+      --clientappio-api-address 0.0.0.0:9094
+      --isolation process
+    depends_on:
+      - superlink
+
+  clientapp-2:
+    <<: *clientapp
+    command: >
+      uv run --no-sync
+      flwr-clientapp
+      --insecure
+      --clientappio-api-address supernode-2:9094
+    depends_on:
+      - supernode-2
+    volumes:
+      - ./artifacts/public:/app/artifacts/public:ro
+      - type: bind
+        source: ./artifacts/clients/client-2
+        target: /app/client-data
+        read_only: true
+
+  supernode-3:
+    <<: *flower-service
+    command: >
+      uv run --no-sync
+      flower-supernode
+      --insecure
+      --superlink superlink:9092
+      --node-config partition-id=3
+      --clientappio-api-address 0.0.0.0:9094
+      --isolation process
+    depends_on:
+      - superlink
+
+  clientapp-3:
+    <<: *clientapp
+    command: >
+      uv run --no-sync
+      flwr-clientapp
+      --insecure
+      --clientappio-api-address supernode-3:9094
+    depends_on:
+      - supernode-3
+    volumes:
+      - ./artifacts/public:/app/artifacts/public:ro
+      - type: bind
+        source: ./artifacts/clients/client-3
+        target: /app/client-data
+        read_only: true
 
   dashboard:
-    build: .
-    container_name: fml_dashboard
-    command: [
-      "uv", "run", "--no-sync",
-      "streamlit", "run", "dashboard.py",
-      "--server.address=0.0.0.0",
-      "--server.port=8501"
-    ]
+    <<: *flower-service
+    command: >
+      uv run --no-sync
+      streamlit run dashboard.py
+      --server.address=0.0.0.0
+      --server.port=8501
+    environment:
+      FML_PUBLIC_ARTIFACT_DIR: /app/artifacts/public
+      FML_SERVER_ARTIFACT_DIR: /app/artifacts/server
     ports:
-      - "8501:8501"
+      - "127.0.0.1:8501:8501"
     volumes:
-      - ./artifacts:/app/artifacts
+      - ./artifacts/public:/app/artifacts/public:ro
+      - ./artifacts/server:/app/artifacts/server:ro
