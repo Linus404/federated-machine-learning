@@ -4,7 +4,7 @@ set -euo pipefail
 
 PROJECT_ID="${PROJECT_ID:-}"
 ZONE="${ZONE:-europe-west3-a}"
-CLIENT_COUNT="${CLIENT_COUNT:-4}"
+CLIENT_COUNT=4
 SERVER_VM="${SERVER_VM:-fml-server}"
 CLIENT_PREFIX="${CLIENT_PREFIX:-fml-client}"
 REMOTE_APP="${REMOTE_APP:-/opt/federated-machine-learning}"
@@ -18,7 +18,6 @@ Usage: ./deploy/gce/gce-bootstrap.sh --project PROJECT_ID [options]
 Options:
   --project PROJECT_ID   Google Cloud project (or set PROJECT_ID)
   --zone ZONE            Compute Engine zone (default: europe-west3-a)
-  --clients COUNT        Number of client VMs (default: 4)
 EOF
 }
 
@@ -26,14 +25,12 @@ while (($#)); do
   case "$1" in
     --project) PROJECT_ID="$2"; shift 2 ;;
     --zone) ZONE="$2"; shift 2 ;;
-    --clients) CLIENT_COUNT="$2"; shift 2 ;;
     --help|-h) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 
 [[ -n "$PROJECT_ID" ]] || { echo "--project is required" >&2; exit 2; }
-[[ "$CLIENT_COUNT" =~ ^[1-9][0-9]*$ ]] || { echo "--clients must be a positive integer" >&2; exit 2; }
 
 gcloud_cmd=(gcloud --quiet --project="$PROJECT_ID")
 
@@ -159,6 +156,7 @@ for vm in "$SERVER_VM" $(seq 0 $((CLIENT_COUNT - 1)) | sed "s|^|${CLIENT_PREFIX}
     sudo mkdir -p '$REMOTE_APP'
     sudo chown \"\$USER:\$USER\" '$REMOTE_APP'
     tar -xzf /tmp/fml-source.tar.gz -C '$REMOTE_APP'
+    mkdir -p '$REMOTE_APP/artifacts'
     find '$REMOTE_APP/deploy' -type f -name '*.sh' -exec sed -i 's/\r$//' {} +
   "
 done

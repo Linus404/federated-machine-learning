@@ -16,5 +16,11 @@ exec docker run --rm \
   -v "$HOME/.flwr:/root/.flwr" \
   -w /workspace \
   federated-machine-learning:latest \
-  uv run --no-sync flwr run . gce-fml --stream \
-    --run-config "embedding-dim=100"
+  sh -c '
+    uv run --no-sync python -m src.flower_readiness \
+      --address 127.0.0.1:9093 \
+      --expected-online 4 \
+      --timeout 120 &&
+    exec uv run --no-sync flwr run . gce-fml --stream \
+      --run-config "embedding-dim=100"
+  '

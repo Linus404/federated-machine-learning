@@ -1,4 +1,4 @@
-"""Configure the local Flower SuperLink connection without clobbering user settings."""
+"""Configure the local Flower connection and verify federation readiness."""
 
 from __future__ import annotations
 
@@ -8,6 +8,12 @@ import stat
 import tempfile
 import tomllib
 from pathlib import Path
+
+from src.flower_readiness import (
+    DEFAULT_EXPECTED_ONLINE_SUPERNODES,
+    DEFAULT_READINESS_TIMEOUT_SECONDS,
+    wait_for_online_supernodes,
+)
 
 LOCAL_SUPERLINK_PROFILE = "local-docker"
 LOCAL_SUPERLINK_ADDRESS = "127.0.0.1:9093"
@@ -131,7 +137,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         Parsed command-line values.
     """
     parser = argparse.ArgumentParser(
-        description="Create or validate the local Docker Flower connection."
+        description="Configure local Docker Flower and wait for its four SuperNodes."
     )
     parser.add_argument(
         "--config",
@@ -139,11 +145,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=default_flower_config_path(),
         help="Flower config.toml path (default: FLWR_HOME/config.toml or ~/.flwr/config.toml)",
     )
+    parser.add_argument(
+        "--readiness-timeout",
+        type=float,
+        default=DEFAULT_READINESS_TIMEOUT_SECONDS,
+        help="seconds to wait for all four SuperNodes (default: 120)",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Configure the local Docker Flower profile.
+    """Configure the local Docker Flower profile and verify readiness.
 
     Parameters
     ----------
@@ -157,10 +169,19 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     try:
         created = ensure_local_superlink_profile(args.config)
-    except ValueError as error:
+        wait_for_online_supernodes(
+            address=LOCAL_SUPERLINK_ADDRESS,
+            expected_online=DEFAULT_EXPECTED_ONLINE_SUPERNODES,
+            timeout_seconds=args.readiness_timeout,
+        )
+    except (TimeoutError, ValueError) as error:
         raise SystemExit(f"error: {error}") from error
     action = "created" if created else "validated"
     print(f"{action} [superlink.{LOCAL_SUPERLINK_PROFILE}] in {args.config}")
+    print(
+        f"validated exactly {DEFAULT_EXPECTED_ONLINE_SUPERNODES} online SuperNodes "
+        f"at {LOCAL_SUPERLINK_ADDRESS}"
+    )
 
 
 if __name__ == "__main__":
