@@ -134,7 +134,7 @@ artifacts are read-only in every consuming service; only ServerApp can write
 ## GCE deployment
 
 The retained multi-VM GCE deployment is separate from the root local Compose
-stack. See [deploy/README.md](deploy/README.md) for its server and client VM
+stack. See [deploy/gce/README.md](deploy/gce/README.md) for its server and client VM
 workflow and validation status.
 
 ## Development

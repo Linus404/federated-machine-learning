@@ -128,19 +128,64 @@ class DistributedDeploymentContractTests(unittest.TestCase):
 
     def test_gce_capability_is_retained_behind_deployment_boundary(self) -> None:
         retained_files = {
-            Path("deploy/README.md"),
-            Path("deploy/gce-bootstrap.sh"),
-            Path("deploy/gce-run.sh"),
-            Path("deploy/server.compose.yaml"),
-            Path("deploy/client.compose.yaml"),
+            Path("deploy/gce/README.md"),
+            Path("deploy/gce/gce-bootstrap.sh"),
+            Path("deploy/gce/gce-run.sh"),
+            Path("deploy/gce/server.compose.yaml"),
+            Path("deploy/gce/client.compose.yaml"),
         }
 
         self.assertTrue(all(path.is_file() for path in retained_files))
+        self.assertEqual(
+            {path.name for path in Path("deploy").iterdir()},
+            {"gce"},
+        )
         self.assertFalse(
             any("gce" in path.name.lower() for path in Path("src").glob("*.py"))
         )
         self.assertNotIn("gce", self.compose.lower())
         self.assertNotIn("gcloud", self.compose.lower())
+
+        gce_readme = Path("deploy/gce/README.md").read_text(encoding="utf-8")
+        self.assertIn("cloud credits are unavailable", gce_readme)
+        self.assertIn("docker compose config", gce_readme)
+        self.assertIn("bash -n", gce_readme)
+
+    def test_gce_control_plane_has_no_artifact_access(self) -> None:
+        server_compose = Path("deploy/gce/server.compose.yaml").read_text(
+            encoding="utf-8"
+        )
+        client_compose = Path("deploy/gce/client.compose.yaml").read_text(
+            encoding="utf-8"
+        )
+
+        for compose, service in (
+            (server_compose, "superlink"),
+            (client_compose, "supernode"),
+        ):
+            with self.subTest(service=service):
+                block = service_block(compose, service)
+                self.assertNotIn("/app/artifacts", block)
+                self.assertNotIn("CLIENT_DATA_DIR", block)
+
+    def test_gce_app_roles_receive_only_required_artifacts(self) -> None:
+        server_compose = Path("deploy/gce/server.compose.yaml").read_text(
+            encoding="utf-8"
+        )
+        client_compose = Path("deploy/gce/client.compose.yaml").read_text(
+            encoding="utf-8"
+        )
+
+        clientapp = service_block(client_compose, "clientapp")
+        self.assertIn("source: ${CLIENT_SHARD_DIR:?set CLIENT_SHARD_DIR}", clientapp)
+        self.assertIn("target: /app/client-data", clientapp)
+        self.assertIn("read_only: true", clientapp)
+        self.assertIn("../../artifacts/public:/app/artifacts/public:ro", clientapp)
+
+        serverapp = service_block(server_compose, "serverapp")
+        dashboard = service_block(server_compose, "dashboard")
+        self.assertIn("../../artifacts/server:/app/artifacts/server\n", serverapp)
+        self.assertIn("../../artifacts/server:/app/artifacts/server:ro", dashboard)
 
 
 if __name__ == "__main__":
