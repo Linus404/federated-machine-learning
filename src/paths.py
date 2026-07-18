@@ -3,12 +3,42 @@ from __future__ import annotations
 import os
 import shutil
 from pathlib import Path
-from typing import Iterable
+from typing import BinaryIO, Iterable
 
 PUBLIC_ARTIFACT_DIR_ENV = "FML_PUBLIC_ARTIFACT_DIR"
 SERVER_ARTIFACT_DIR_ENV = "FML_SERVER_ARTIFACT_DIR"
 DEFAULT_PUBLIC_ARTIFACT_DIR = Path("artifacts/public")
 DEFAULT_SERVER_ARTIFACT_DIR = Path("artifacts/server")
+
+
+class RunArtifactLock:
+    """Hold an operating-system lock for one server artifact directory."""
+
+    def __init__(self, path: Path, file: BinaryIO) -> None:
+        self.path = path
+        self._file = file
+        self._released = False
+
+    def release(self) -> None:
+        """Release the artifact lock.
+
+        Returns
+        -------
+        None
+        """
+        if self._released:
+            return
+        if os.name == "nt":
+            import msvcrt
+
+            self._file.seek(0)
+            msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+        self._file.close()
+        self._released = True
 
 
 def resolve_dir(value: str | Path) -> Path:
@@ -33,6 +63,52 @@ def default_server_artifact_dir() -> Path:
     return resolve_dir(
         os.environ.get(SERVER_ARTIFACT_DIR_ENV, DEFAULT_SERVER_ARTIFACT_DIR)
     )
+
+
+def acquire_run_artifact_lock(artifact_dir: str | Path) -> RunArtifactLock:
+    """Acquire exclusive ownership of one server artifact directory.
+
+    Parameters
+    ----------
+    artifact_dir : str or pathlib.Path
+        Directory whose run artifacts require a single writer.
+
+    Returns
+    -------
+    RunArtifactLock
+        Lock held until ``release`` is called or the owning process exits.
+
+    Raises
+    ------
+    RuntimeError
+        If another process already owns the artifact directory.
+    """
+    artifact_path = resolve_dir(artifact_dir)
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = artifact_path.parent / f".{artifact_path.name}.run.lock"
+    lock_file = lock_path.open("a+b")
+
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        lock_file.close()
+        raise RuntimeError(
+            f"Another server run is already writing to {artifact_path}"
+        ) from error
+
+    return RunArtifactLock(lock_path, lock_file)
 
 
 def clear_artifact_dir(

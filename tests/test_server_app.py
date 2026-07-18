@@ -66,6 +66,7 @@ class ServerStartupArtifactCleanupTests(unittest.TestCase):
             self.assertTrue(captured_strategy_kwargs["use_huber"])
             self.assertEqual(captured_strategy_kwargs["huber_threshold"], 3.5)
             self.assertEqual(components["config"].num_rounds, 1)
+            captured_strategy_kwargs["artifact_lock"].release()
 
     def test_server_fn_refuses_to_clear_public_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -91,6 +92,75 @@ class ServerStartupArtifactCleanupTests(unittest.TestCase):
 
             create_strategy.assert_not_called()
             self.assertTrue(manifest.exists())
+
+    def test_server_fn_rejects_overlapping_artifact_writers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            public_dir = Path(tmpdir) / "public"
+            artifact_dir = Path(tmpdir) / "server"
+            public_dir.mkdir()
+            context = cast(
+                Context,
+                SimpleNamespace(
+                    run_config={
+                        "public-artifact-dir": public_dir,
+                        "server-artifact-dir": artifact_dir,
+                        "num-server-rounds": 1,
+                        "embedding-dim": 100,
+                    }
+                ),
+            )
+            strategies = []
+
+            def create_strategy_probe(**kwargs):
+                strategy = SimpleNamespace(artifact_lock=kwargs["artifact_lock"])
+                strategies.append(strategy)
+                return strategy
+
+            with (
+                patch.object(
+                    server_app, "create_strategy", side_effect=create_strategy_probe
+                ),
+                patch.object(
+                    server_app,
+                    "ServerAppComponents",
+                    side_effect=lambda **kwargs: kwargs,
+                ),
+            ):
+                first = cast(dict[str, Any], server_app.server_fn(context))
+                with self.assertRaisesRegex(RuntimeError, "already writing"):
+                    server_app.server_fn(context)
+
+                first["strategy"].artifact_lock.release()
+                second = cast(dict[str, Any], server_app.server_fn(context))
+                second["strategy"].artifact_lock.release()
+
+            self.assertEqual(len(strategies), 2)
+
+    def test_server_fn_releases_artifact_lock_after_startup_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            public_dir = Path(tmpdir) / "public"
+            artifact_dir = Path(tmpdir) / "server"
+            public_dir.mkdir()
+            context = cast(
+                Context,
+                SimpleNamespace(
+                    run_config={
+                        "public-artifact-dir": public_dir,
+                        "server-artifact-dir": artifact_dir,
+                        "num-server-rounds": 1,
+                        "embedding-dim": 100,
+                    }
+                ),
+            )
+
+            with patch.object(
+                server_app, "create_strategy", side_effect=ValueError("invalid app")
+            ):
+                with self.assertRaisesRegex(ValueError, "invalid app"):
+                    server_app.server_fn(context)
+
+            lock = server_app.acquire_run_artifact_lock(artifact_dir)
+            lock.release()
 
 
 class MetricAggregationTests(unittest.TestCase):
