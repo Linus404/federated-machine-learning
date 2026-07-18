@@ -120,10 +120,11 @@ uv run flwr run . local-docker --stream
 
 Flower 1.29 reads SuperLink connection profiles from `~/.flwr/config.toml` rather
 than the project configuration. The configuration command preserves unrelated
-profiles and rejects an existing `local-docker` profile unless it already points
-to the loopback Control API with insecure local transport. The insecure connection
-is appropriate only for this loopback-only local runtime; do not use it for a
-remote or public SuperLink.
+profiles, rejects an existing `local-docker` profile unless it already points to
+the loopback Control API with insecure local transport, and waits until exactly
+four SuperNodes are registered online. The insecure connection is appropriate
+only for this loopback-only local runtime; do not use it for a remote or public
+SuperLink.
 
 The dashboard is available at <http://127.0.0.1:8501>. Each ClientApp receives
 only its matching `artifacts/clients/client-N` shard as a read-only mount. Public

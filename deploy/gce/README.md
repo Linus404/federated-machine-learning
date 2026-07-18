@@ -32,14 +32,15 @@ Optional arguments:
 ```bash
 ./deploy/gce/gce-bootstrap.sh \
   --project fedml-501219 \
-  --zone europe-west3-a \
-  --clients 4
+  --zone europe-west3-a
 ```
 
-The script is idempotent. It enables Compute Engine and IAP, creates or starts
-the VMs, configures IAP and Flower firewall rules, installs Docker correctly,
-copies your checked-out project to every VM, creates the public artifacts and private shards,
-copies exactly one shard to each client, and starts every Compose stack.
+The deployment uses exactly four client VMs to match the application's fixed
+four-client strategy contract. The script is idempotent. It enables Compute
+Engine and IAP, creates or starts the VMs, configures IAP and Flower firewall
+rules, installs Docker correctly, copies your checked-out project to every VM,
+creates the public artifacts and private shards, copies exactly one shard to each
+client, and starts every Compose stack.
 
 > The initial build and IMDB data preparation take several minutes. Do not stop
 > the script while it is running.
@@ -61,7 +62,8 @@ cd /opt/federated-machine-learning
 ./deploy/gce/gce-run.sh
 ```
 
-`gce-run.sh` creates the local Flower connection and streams the training run.
+`gce-run.sh` creates the local Flower connection, verifies that exactly four
+SuperNodes are registered online, and then streams the training run.
 
 ## Open the dashboard
 

@@ -2,9 +2,24 @@ x-flower-service: &flower-service
   image: federated-machine-learning:latest
   restart: unless-stopped
 
+x-supernode: &supernode
+  <<: *flower-service
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      - >-
+        import socket;
+        socket.create_connection(("127.0.0.1", 9094), timeout=2).close()
+    interval: 5s
+    timeout: 3s
+    retries: 12
+    start_period: 10s
+
 services:
   supernode:
-    <<: *flower-service
+    <<: *supernode
     build:
       context: ../../
     command: >
@@ -19,12 +34,14 @@ services:
   clientapp:
     <<: *flower-service
     depends_on:
-      - supernode
+      supernode:
+        condition: service_healthy
     command: >
       uv run --no-sync
-      flwr-clientapp
+      flower-superexec
       --insecure
-      --clientappio-api-address supernode:9094
+      --plugin-type clientapp
+      --appio-api-address supernode:9094
     environment:
       CLIENT_DATA_DIR: /app/client-data
       FML_PUBLIC_ARTIFACT_DIR: /app/artifacts/public

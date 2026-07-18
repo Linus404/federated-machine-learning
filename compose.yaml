@@ -8,6 +8,21 @@ x-clientapp: &clientapp
     CLIENT_DATA_DIR: /app/client-data
     FML_PUBLIC_ARTIFACT_DIR: /app/artifacts/public
 
+x-supernode: &supernode
+  <<: *flower-service
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      - >-
+        import socket;
+        socket.create_connection(("127.0.0.1", 9094), timeout=2).close()
+    interval: 5s
+    timeout: 3s
+    retries: 12
+    start_period: 10s
+
 services:
   superlink:
     <<: *flower-service
@@ -17,27 +32,45 @@ services:
       flower-superlink
       --insecure
       --isolation process
+      --database /app/state/state.db
+      --health-server-address 0.0.0.0:9099
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import socket;
+          socket.create_connection(("127.0.0.1", 9099), timeout=2).close()
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
     ports:
       - "127.0.0.1:9093:9093"
+    volumes:
+      - superlink-state:/app/state
 
   serverapp:
     <<: *flower-service
     command: >
       uv run --no-sync
-      flwr-serverapp
+      flower-superexec
       --insecure
-      --serverappio-api-address superlink:9091
+      --plugin-type serverapp
+      --appio-api-address superlink:9091
     environment:
       FML_PUBLIC_ARTIFACT_DIR: /app/artifacts/public
       FML_SERVER_ARTIFACT_DIR: /app/artifacts/server
     depends_on:
-      - superlink
+      superlink:
+        condition: service_healthy
     volumes:
       - ./artifacts/public:/app/artifacts/public:ro
       - ./artifacts/server:/app/artifacts/server
 
   supernode-0:
-    <<: *flower-service
+    <<: *supernode
     command: >
       uv run --no-sync
       flower-supernode
@@ -47,17 +80,20 @@ services:
       --clientappio-api-address 0.0.0.0:9094
       --isolation process
     depends_on:
-      - superlink
+      superlink:
+        condition: service_healthy
 
   clientapp-0:
     <<: *clientapp
     command: >
       uv run --no-sync
-      flwr-clientapp
+      flower-superexec
       --insecure
-      --clientappio-api-address supernode-0:9094
+      --plugin-type clientapp
+      --appio-api-address supernode-0:9094
     depends_on:
-      - supernode-0
+      supernode-0:
+        condition: service_healthy
     volumes:
       - ./artifacts/public:/app/artifacts/public:ro
       - type: bind
@@ -66,7 +102,7 @@ services:
         read_only: true
 
   supernode-1:
-    <<: *flower-service
+    <<: *supernode
     command: >
       uv run --no-sync
       flower-supernode
@@ -76,17 +112,20 @@ services:
       --clientappio-api-address 0.0.0.0:9094
       --isolation process
     depends_on:
-      - superlink
+      superlink:
+        condition: service_healthy
 
   clientapp-1:
     <<: *clientapp
     command: >
       uv run --no-sync
-      flwr-clientapp
+      flower-superexec
       --insecure
-      --clientappio-api-address supernode-1:9094
+      --plugin-type clientapp
+      --appio-api-address supernode-1:9094
     depends_on:
-      - supernode-1
+      supernode-1:
+        condition: service_healthy
     volumes:
       - ./artifacts/public:/app/artifacts/public:ro
       - type: bind
@@ -95,7 +134,7 @@ services:
         read_only: true
 
   supernode-2:
-    <<: *flower-service
+    <<: *supernode
     command: >
       uv run --no-sync
       flower-supernode
@@ -105,17 +144,20 @@ services:
       --clientappio-api-address 0.0.0.0:9094
       --isolation process
     depends_on:
-      - superlink
+      superlink:
+        condition: service_healthy
 
   clientapp-2:
     <<: *clientapp
     command: >
       uv run --no-sync
-      flwr-clientapp
+      flower-superexec
       --insecure
-      --clientappio-api-address supernode-2:9094
+      --plugin-type clientapp
+      --appio-api-address supernode-2:9094
     depends_on:
-      - supernode-2
+      supernode-2:
+        condition: service_healthy
     volumes:
       - ./artifacts/public:/app/artifacts/public:ro
       - type: bind
@@ -124,7 +166,7 @@ services:
         read_only: true
 
   supernode-3:
-    <<: *flower-service
+    <<: *supernode
     command: >
       uv run --no-sync
       flower-supernode
@@ -134,17 +176,20 @@ services:
       --clientappio-api-address 0.0.0.0:9094
       --isolation process
     depends_on:
-      - superlink
+      superlink:
+        condition: service_healthy
 
   clientapp-3:
     <<: *clientapp
     command: >
       uv run --no-sync
-      flwr-clientapp
+      flower-superexec
       --insecure
-      --clientappio-api-address supernode-3:9094
+      --plugin-type clientapp
+      --appio-api-address supernode-3:9094
     depends_on:
-      - supernode-3
+      supernode-3:
+        condition: service_healthy
     volumes:
       - ./artifacts/public:/app/artifacts/public:ro
       - type: bind
@@ -167,3 +212,6 @@ services:
     volumes:
       - ./artifacts/public:/app/artifacts/public:ro
       - ./artifacts/server:/app/artifacts/server:ro
+
+volumes:
+  superlink-state:

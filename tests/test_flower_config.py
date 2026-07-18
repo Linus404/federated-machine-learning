@@ -2,8 +2,9 @@ import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from src.flower_config import ensure_local_superlink_profile
+from src.flower_config import ensure_local_superlink_profile, main
 
 
 class LocalFlowerProfileTests(unittest.TestCase):
@@ -79,6 +80,26 @@ class LocalFlowerProfileTests(unittest.TestCase):
                 ensure_local_superlink_profile(config_path)
 
             self.assertEqual(config_path.read_text(encoding="utf-8"), invalid)
+
+    def test_main_waits_for_four_online_supernodes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+
+            with patch("src.flower_config.wait_for_online_supernodes") as wait:
+                main(
+                    [
+                        "--config",
+                        str(config_path),
+                        "--readiness-timeout",
+                        "7.5",
+                    ]
+                )
+
+            wait.assert_called_once_with(
+                address="127.0.0.1:9093",
+                expected_online=4,
+                timeout_seconds=7.5,
+            )
 
 
 if __name__ == "__main__":
