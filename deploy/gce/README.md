@@ -1,10 +1,19 @@
-# Google Cloud deployment
+# Retained GCE deployment
 
 This deployment runs one Flower server VM and four Flower client VMs on Google
 Compute Engine. It is intentionally a first-pass deployment: Flower uses
 `--insecure` (no TLS or SuperNode authentication).
 
-`compose.yaml` in the repository root is for local simulation only.
+`compose.yaml` in the repository root is the local distributed Docker runtime
+and does not depend on these cloud-specific files.
+
+## Validation status
+
+Live GCE validation is unavailable because cloud credits are unavailable.
+The Compose files are still validated statically with
+`docker compose config`, and both scripts are checked with `bash -n`. Do not
+treat the deployment as production-ready or infer live-cloud validation from
+those static checks.
 
 ## One-command setup
 
@@ -15,13 +24,13 @@ and run:
 git clone https://github.com/Linus404/federated-machine-learning.git
 cd federated-machine-learning
 
-./deploy/gce-bootstrap.sh --project fedml-501219
+./deploy/gce/gce-bootstrap.sh --project fedml-501219
 ```
 
 Optional arguments:
 
 ```bash
-./deploy/gce-bootstrap.sh \
+./deploy/gce/gce-bootstrap.sh \
   --project fedml-501219 \
   --zone europe-west3-a \
   --clients 4
@@ -49,7 +58,7 @@ Then run exactly one command on the server:
 
 ```bash
 cd /opt/federated-machine-learning
-./deploy/gce-run.sh
+./deploy/gce/gce-run.sh
 ```
 
 `gce-run.sh` creates the local Flower connection and streams the training run.
@@ -90,7 +99,7 @@ Then open <http://127.0.0.1:8501>.
 gcloud compute ssh --tunnel-through-iap fml-server \
   --project fedml-501219 \
   --zone europe-west3-a \
-  --command='cd /opt/federated-machine-learning && docker compose -f deploy/server.compose.yaml ps'
+  --command='cd /opt/federated-machine-learning && docker compose -f deploy/gce/server.compose.yaml ps'
 ```
 
 ## Stop and delete

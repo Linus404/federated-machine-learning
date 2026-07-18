@@ -2,7 +2,7 @@
 # Submit one training run from the server VM after gce-bootstrap.sh has completed.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 mkdir -p "$HOME/.flwr"
 cat >"$HOME/.flwr/config.toml" <<'EOF'
 [superlink.gce-fml]

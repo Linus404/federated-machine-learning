@@ -9,11 +9,11 @@ SERVER_VM="${SERVER_VM:-fml-server}"
 CLIENT_PREFIX="${CLIENT_PREFIX:-fml-client}"
 REMOTE_APP="${REMOTE_APP:-/opt/federated-machine-learning}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 usage() {
   cat <<'EOF'
-Usage: ./deploy/gce-bootstrap.sh --project PROJECT_ID [options]
+Usage: ./deploy/gce/gce-bootstrap.sh --project PROJECT_ID [options]
 
 Options:
   --project PROJECT_ID   Google Cloud project (or set PROJECT_ID)
@@ -168,7 +168,7 @@ remote "$SERVER_VM" "
   set -e
   cd '$REMOTE_APP'
   mkdir -p artifacts/public artifacts/server artifacts/clients
-  docker compose -f deploy/server.compose.yaml build
+  docker compose -f deploy/gce/server.compose.yaml build
   docker run --rm -v \"\$PWD/artifacts:/app/artifacts\" \
     federated-machine-learning:latest \
     uv run --no-sync python -m src.data_prep \
@@ -192,7 +192,7 @@ remote "$SERVER_VM" "
   set -e
   cd '$REMOTE_APP'
   sudo rm -rf artifacts/clients
-  docker compose -f deploy/server.compose.yaml up -d
+  docker compose -f deploy/gce/server.compose.yaml up -d
 "
 for i in $(seq 0 $((CLIENT_COUNT - 1))); do
   remote "${CLIENT_PREFIX}-${i}" "
@@ -204,13 +204,13 @@ for i in $(seq 0 $((CLIENT_COUNT - 1))); do
     cat > .env <<EOF
 CLIENT_ID=${i}
 SUPERLINK_ADDRESS=${SERVER_INTERNAL_IP}:9092
-    CLIENT_SHARD_DIR=$REMOTE_APP/artifacts/client-data/client-${i}
+CLIENT_SHARD_DIR=$REMOTE_APP/artifacts/client-data/client-${i}
 EOF
-    docker compose --env-file .env -f deploy/client.compose.yaml up -d --build
+    docker compose --env-file .env -f deploy/gce/client.compose.yaml up -d --build
   "
 done
 
 echo "==> Deployment is ready"
 echo "Connect: gcloud compute ssh --tunnel-through-iap $SERVER_VM --project=$PROJECT_ID --zone=$ZONE"
-echo "Run:     cd $REMOTE_APP && ./deploy/gce-run.sh"
+echo "Run:     cd $REMOTE_APP && ./deploy/gce/gce-run.sh"
 echo "Dashboard tunnel: gcloud compute ssh --tunnel-through-iap $SERVER_VM --project=$PROJECT_ID --zone=$ZONE --ssh-flag='-N' --ssh-flag='-L 8501:localhost:8501'"

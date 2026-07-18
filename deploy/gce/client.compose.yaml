@@ -1,9 +1,12 @@
+x-flower-service: &flower-service
+  image: federated-machine-learning:latest
+  restart: unless-stopped
+
 services:
   supernode:
-    image: federated-machine-learning:latest
-    restart: unless-stopped
+    <<: *flower-service
     build:
-      context: ../
+      context: ../../
     command: >
       uv run --no-sync
       flower-supernode
@@ -12,17 +15,9 @@ services:
       --node-config partition-id=${CLIENT_ID:?set CLIENT_ID}
       --clientappio-api-address 0.0.0.0:9094
       --isolation process
-    environment:
-      CLIENT_ID: ${CLIENT_ID:?set CLIENT_ID}
-      SUPERLINK_ADDRESS: ${SUPERLINK_ADDRESS:?set SUPERLINK_ADDRESS}
-      CLIENT_DATA_DIR: /app/client-data
-      FML_PUBLIC_ARTIFACT_DIR: /app/artifacts/public
-    volumes:
-      - ../artifacts/public:/app/artifacts/public:ro
 
   clientapp:
-    image: federated-machine-learning:latest
-    restart: unless-stopped
+    <<: *flower-service
     depends_on:
       - supernode
     command: >
@@ -31,13 +26,10 @@ services:
       --insecure
       --clientappio-api-address supernode:9094
     environment:
-      CLIENT_ID: ${CLIENT_ID:?set CLIENT_ID}
-      SUPERLINK_ADDRESS: ${SUPERLINK_ADDRESS:?set SUPERLINK_ADDRESS}
-      CLIENT_SHARD_DIR: ${CLIENT_SHARD_DIR:?set CLIENT_SHARD_DIR}
       CLIENT_DATA_DIR: /app/client-data
       FML_PUBLIC_ARTIFACT_DIR: /app/artifacts/public
     volumes:
-      - ../artifacts/public:/app/artifacts/public:ro
+      - ../../artifacts/public:/app/artifacts/public:ro
       - type: bind
         source: ${CLIENT_SHARD_DIR:?set CLIENT_SHARD_DIR}
         target: /app/client-data

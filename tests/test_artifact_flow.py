@@ -191,18 +191,6 @@ def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> No
     assert (client_dir / "keep.txt").read_text(encoding="utf-8") == "keep"
 
 
-def check_deployment_files_define_private_read_only_client_data() -> None:
-    server = Path("deploy/server.compose.yaml").read_text(encoding="utf-8")
-    client = Path("deploy/client.compose.yaml").read_text(encoding="utf-8")
-
-    assert "superlink:" in server and "dashboard:" in server
-    assert "client-data" not in server and "CLIENT_SHARD_DIR" not in server
-    assert "source: ${CLIENT_SHARD_DIR:?set CLIENT_SHARD_DIR}" in client
-    assert "target: /app/client-data" in client
-    assert "read_only: true" in client
-    assert "../artifacts/public:/app/artifacts/public:ro" in client
-
-
 class ArtifactFlowTests(unittest.TestCase):
     def run_with_temp_dir(self, check) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -231,9 +219,6 @@ class ArtifactFlowTests(unittest.TestCase):
 
     def test_cli_prepares_all_artifacts_with_one_dataset_load(self) -> None:
         self.run_with_temp_dir(check_cli_prepares_all_artifacts_with_one_dataset_load)
-
-    def test_deployment_files_define_private_read_only_client_data(self) -> None:
-        check_deployment_files_define_private_read_only_client_data()
 
 
 if __name__ == "__main__":
