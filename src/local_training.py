@@ -1,0 +1,209 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import warnings
+from pathlib import Path
+from typing import Any, TypeAlias
+
+# TensorFlow/Keras read these before import; set them before Keras loads.
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("KERAS_BACKEND", "tensorflow")
+
+import keras
+import numpy as np
+
+from src.app_manifest import AppManifest, load_app_manifest
+
+from src.paths import default_public_artifact_dir, resolve_dir
+
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"keras\..*")
+
+ArrayPair: TypeAlias = tuple[np.ndarray, np.ndarray]
+PartitionSplit: TypeAlias = tuple[ArrayPair, ArrayPair]
+DEFAULT_LOCAL_EPOCHS = 1
+DEFAULT_EMBEDDING_DIM = 100
+CLIENT_REVIEWS_FILENAME = "reviews.jsonl"
+DEFAULT_VALIDATION_SEED = 67
+
+
+def _stratified_split_indices(
+    labels: np.ndarray,
+    validation_split: float,
+    seed: int = DEFAULT_VALIDATION_SEED,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Create deterministic train/validation indices without label-order bias."""
+    if not 0 < validation_split < 1:
+        raise ValueError("validation_split must be between 0 and 1")
+
+    rng = np.random.default_rng(seed)
+    train_indices: list[int] = []
+    validation_indices: list[int] = []
+
+    for label in np.unique(labels):
+        label_indices = np.flatnonzero(labels == label)
+        rng.shuffle(label_indices)
+        validation_count = int(round(len(label_indices) * validation_split))
+        if len(label_indices) > 1:
+            validation_count = min(max(validation_count, 1), len(label_indices) - 1)
+        else:
+            validation_count = 0
+        validation_indices.extend(label_indices[:validation_count].tolist())
+        train_indices.extend(label_indices[validation_count:].tolist())
+
+    rng.shuffle(train_indices)
+    rng.shuffle(validation_indices)
+    if not validation_indices and len(labels) > 1:
+        all_indices = np.arange(len(labels))
+        rng.shuffle(all_indices)
+        validation_count = min(
+            max(int(round(len(labels) * validation_split)), 1), len(labels) - 1
+        )
+        validation_indices = all_indices[:validation_count].tolist()
+        train_indices = all_indices[validation_count:].tolist()
+    if not train_indices or not validation_indices:
+        raise ValueError("client shard is too small for a train/validation split")
+
+    return np.asarray(train_indices), np.asarray(validation_indices)
+
+
+def load_client_shard(
+    client_data_dir: str | Path,
+    manifest: AppManifest,
+    validation_split: float = 0.2,
+) -> PartitionSplit:
+    """Load raw private reviews and tokenize them inside the client process."""
+    resolved_client_dir = resolve_dir(client_data_dir)
+    with (resolved_client_dir / CLIENT_REVIEWS_FILENAME).open(
+        encoding="utf-8"
+    ) as review_file:
+        records = [json.loads(line) for line in review_file]
+    with manifest.vocabulary_path.open(encoding="utf-8") as vocabulary_file:
+        saved_vocab = [
+            line.removesuffix("\n").removesuffix("\r") for line in vocabulary_file
+        ]
+    vectorizer = keras.layers.TextVectorization(
+        output_mode="int",
+        output_sequence_length=int(manifest.payload["sequence_length"]),
+        vocabulary=saved_vocab[2:],
+        dtype="int32",
+    )
+    x = np.asarray(vectorizer([record["text"] for record in records]), dtype="int32")
+    y = np.asarray([record["label"] for record in records], dtype="float32")
+
+    train_indices, validation_indices = _stratified_split_indices(y, validation_split)
+
+    return (
+        (x[train_indices], y[train_indices]),
+        (x[validation_indices], y[validation_indices]),
+    )
+
+
+def build_model(
+    vocab_size: int,
+    sequence_length: int,
+    embedding_dim: int,
+) -> Any:
+    """Build the sentiment model reused by local and federated training."""
+    inputs = keras.Input(shape=(sequence_length,), dtype="int32")
+
+    x = keras.layers.Embedding(vocab_size, embedding_dim, name="token_embedding")(
+        inputs
+    )
+    padding_mask = keras.ops.cast(keras.ops.not_equal(inputs, 0), x.dtype)
+    x = x * keras.ops.expand_dims(padding_mask, axis=-1)
+    x = keras.layers.Conv1D(
+        filters=64,
+        kernel_size=3,
+        padding="same",
+        activation="relu",
+        use_bias=False,
+        name="padding_safe_conv",
+    )(x)
+    x = keras.layers.GlobalMaxPooling1D()(x)
+    x = keras.layers.Dense(32, activation="relu")(x)
+    x = keras.layers.Dropout(0.3)(x)
+
+    outputs = keras.layers.Dense(1, activation="sigmoid")(x)
+
+    model = keras.Model(inputs, outputs)
+    model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
+
+    return model
+
+
+def train(args: argparse.Namespace) -> tuple[Any, Any]:
+    """Train one model from a client's raw private shard."""
+    manifest = load_app_manifest(public_artifact_dir=args.public_artifact_dir)
+    train_data, val_data = load_client_shard(
+        args.client_data_dir,
+        manifest,
+        args.validation_split,
+    )
+    model = build_model_from_manifest(manifest)
+
+    history = model.fit(
+        *train_data,
+        validation_data=val_data,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        verbose=0 if args.quiet else 1,
+    )
+
+    loss, accuracy = model.evaluate(*val_data, verbose=0)
+    final = {name: float(values[-1]) for name, values in history.history.items()}
+
+    print(
+        f"train_loss={final['loss']:.4f} "
+        f"train_accuracy={final['accuracy']:.4f} "
+        f"val_loss={final['val_loss']:.4f} "
+        f"val_accuracy={final['val_accuracy']:.4f} "
+        f"eval_loss={loss:.4f} "
+        f"eval_accuracy={accuracy:.4f}"
+    )
+
+    return model, history
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train one local sentiment model.")
+    parser.add_argument("--client-data-dir", type=Path, required=True)
+    parser.add_argument(
+        "--public-artifact-dir", type=Path, default=default_public_artifact_dir()
+    )
+    parser.add_argument("--epochs", type=int, default=DEFAULT_LOCAL_EPOCHS)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--validation-split", type=float, default=0.2)
+    parser.add_argument("--quiet", action="store_true")
+    return parser.parse_args(argv)
+
+
+def build_model_from_manifest(
+    manifest=None,
+    *,
+    config_embedding_dim=None,
+    public_manifest_path=None,
+    public_artifact_dir=None,
+):
+    """Build the sentiment model from public manifest metadata."""
+    if isinstance(manifest, AppManifest):
+        app_manifest = manifest
+    else:
+        app_manifest = load_app_manifest(
+            public_manifest_path=manifest or public_manifest_path,
+            public_artifact_dir=public_artifact_dir,
+            config_embedding_dim=config_embedding_dim,
+        )
+    payload = app_manifest.payload
+
+    return build_model(
+        int(payload["vocabulary_size"]),
+        int(payload["sequence_length"]),
+        int(payload["embedding_dim"]),
+    )
+
+
+if __name__ == "__main__":
+    train(parse_args())

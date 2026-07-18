@@ -1,0 +1,65 @@
+[project]
+name = "federated-machine-learning"
+version = "0.1.0"
+description = "Federated sentiment analysis using Flower and Keras"
+readme = "README.md"
+license = "UNLICENSED"
+authors = [
+    { name = "LeLinus", email = "linus.code404@gmail.com" }
+]
+requires-python = ">=3.11, <3.14"
+dependencies = [
+    "datasets>=4.8.5",
+    "flwr[simulation]>=1.29.0",
+    "ipykernel>=7.2.0",
+    "keras>=3.14.0",
+    "nbformat>=5.10.4",
+    "streamlit>=1.57.0",
+    "tensorflow-cpu>=2.20.0,<2.21.0; sys_platform == 'linux'",
+    "tensorflow>=2.20.0,<2.21.0; sys_platform != 'linux'",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "tensorflow[and-cuda]>=2.20.0,<2.21.0; sys_platform == 'linux'",
+]
+
+[tool.uv]
+package = false
+
+[tool.flwr.app]
+publisher = "GruppeSigma"
+
+[tool.flwr.app.components]
+serverapp = "src.server_app:app"
+clientapp = "src.client_app:app"
+
+[tool.flwr.app.config]
+num-server-rounds = 20
+local-epochs = 1
+batch-size = 64
+embedding-dim = 100
+validation-split = 0.2
+public-manifest-path = "artifacts/public/manifest.json"
+public-artifact-dir = "artifacts/public"
+server-artifact-dir = "artifacts/server"
+client-data-dir = "artifacts/clients/client-{partition}"
+proximal-mu = 0.1
+use-huber = false
+huber-threshold = 10.0
+use-update-noise = false
+update-noise-l2-norm-clip = 1.0
+update-noise-multiplier = 0.001
+
+[tool.ruff]
+line-length = 88
+target-version = "py314"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.12",
+]

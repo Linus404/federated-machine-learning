@@ -1,0 +1,25 @@
+services:
+  federated:
+    build: .
+    container_name: fml_federated
+    command: [
+      "uv", "run", "--no-sync",
+      "flwr", "run", ".", "--stream",
+      "--federation-config", "num-supernodes=4"
+    ]
+    volumes:
+      - ./artifacts:/app/artifacts
+
+  dashboard:
+    build: .
+    container_name: fml_dashboard
+    command: [
+      "uv", "run", "--no-sync",
+      "streamlit", "run", "dashboard.py",
+      "--server.address=0.0.0.0",
+      "--server.port=8501"
+    ]
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./artifacts:/app/artifacts

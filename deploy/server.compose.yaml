@@ -1,0 +1,58 @@
+services:
+  superlink:
+    image: federated-machine-learning:latest
+    restart: unless-stopped
+    build:
+      context: ../
+    # First-pass insecure deployment:
+    # TLS certificates and SuperNode authentication are intentionally out of scope.
+    command: >
+      uv run --no-sync
+      flower-superlink
+      --insecure
+      --isolation process
+    environment:
+      FML_PUBLIC_ARTIFACT_DIR: /app/artifacts/public
+      FML_SERVER_ARTIFACT_DIR: /app/artifacts/server
+    volumes:
+      - ../artifacts/public:/app/artifacts/public:ro
+      - ../artifacts/server:/app/artifacts/server
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+
+  serverapp:
+    image: federated-machine-learning:latest
+    restart: unless-stopped
+    command: >
+      uv run --no-sync
+      flwr-serverapp
+      --insecure
+      --serverappio-api-address superlink:9091
+    environment:
+      FML_PUBLIC_ARTIFACT_DIR: /app/artifacts/public
+      FML_SERVER_ARTIFACT_DIR: /app/artifacts/server
+    depends_on:
+      - superlink
+    volumes:
+      - ../artifacts/public:/app/artifacts/public:ro
+      - ../artifacts/server:/app/artifacts/server
+
+  dashboard:
+    image: federated-machine-learning:latest
+    restart: unless-stopped
+    command: >
+      uv run --no-sync
+      streamlit run dashboard.py
+      --server.address=0.0.0.0
+      --server.port=8501
+      --server.enableCORS=false
+      --server.enableXsrfProtection=false
+    environment:
+      FML_PUBLIC_ARTIFACT_DIR: /app/artifacts/public
+      FML_SERVER_ARTIFACT_DIR: /app/artifacts/server
+    volumes:
+      - ../artifacts/public:/app/artifacts/public:ro
+      - ../artifacts/server:/app/artifacts/server
+    ports:
+      - "127.0.0.1:8501:8501"
