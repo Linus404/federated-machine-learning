@@ -36,3 +36,19 @@ jobs:
       - run: uv sync --frozen
       - run: uv run coverage run -m unittest discover -s tests -v
       - run: uv run coverage report
+
+  containers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+      - name: Build application image
+        run: docker compose build superlink
+      - name: Smoke test application image
+        run: >-
+          docker compose run --rm --no-deps superlink
+          uv run --no-sync python -c
+          'from src.client_app import app as client_app;
+          from src.server_app import app as server_app;
+          assert client_app is not None and server_app is not None'
