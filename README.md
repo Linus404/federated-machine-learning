@@ -132,12 +132,6 @@ artifacts are read-only in every consuming service; only ServerApp can write
 `artifacts/server`, which the dashboard mounts read-only. Stop the runtime with
 `docker compose down`.
 
-## GCE deployment
-
-The retained multi-VM GCE deployment is separate from the root local Compose
-stack. See [deploy/gce/README.md](deploy/gce/README.md) for its server and client VM
-workflow and validation status.
-
 ## Development
 
 Add dependencies with:
