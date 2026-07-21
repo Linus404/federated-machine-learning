@@ -37,13 +37,13 @@ def huber_aggregate(
     centre = np.average(client_vectors, axis=0, weights=weights)
 
     for _ in range(WEISZFELD_ITERS):
-        coeffs = []
+        coeffs: list[float] = []
         for vec, w in zip(client_vectors, weights):
             dist = np.linalg.norm(centre - vec)
             scale = 1.0 if dist <= threshold else threshold / (dist + WEISZFELD_EPS)
             coeffs.append(w * scale)
-        coeffs = np.asarray(coeffs)
-        coeffs = coeffs / coeffs.sum()
-        centre = np.average(client_vectors, axis=0, weights=coeffs)
+        coefficient_array = np.asarray(coeffs)
+        coefficient_array = coefficient_array / coefficient_array.sum()
+        centre = np.average(client_vectors, axis=0, weights=coefficient_array)
 
     return centre

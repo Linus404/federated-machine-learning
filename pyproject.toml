@@ -55,7 +55,24 @@ target-version = "py311"
 quote-style = "double"
 indent-style = "space"
 
+[tool.mypy]
+python_version = "3.11"
+files = ["src", "dashboard.py"]
+check_untyped_defs = true
+ignore_missing_imports = true
+warn_unused_ignores = true
+
+[tool.coverage.run]
+branch = true
+source = ["src"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+
 [dependency-groups]
 dev = [
+    "coverage>=7.15.2",
+    "mypy>=1.19.1",
     "ruff>=0.15.12",
 ]

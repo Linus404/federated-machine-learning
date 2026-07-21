@@ -32,7 +32,9 @@ class RunArtifactLock:
             import msvcrt
 
             self._file.seek(0)
-            msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
+            locking = msvcrt.locking  # type: ignore[attr-defined]
+            unlock_mode = msvcrt.LK_UNLCK  # type: ignore[attr-defined]
+            locking(self._file.fileno(), unlock_mode, 1)
         else:
             import fcntl
 
@@ -97,7 +99,9 @@ def acquire_run_artifact_lock(artifact_dir: str | Path) -> RunArtifactLock:
                 lock_file.write(b"\0")
                 lock_file.flush()
             lock_file.seek(0)
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            locking = msvcrt.locking  # type: ignore[attr-defined]
+            nonblocking_mode = msvcrt.LK_NBLCK  # type: ignore[attr-defined]
+            locking(lock_file.fileno(), nonblocking_mode, 1)
         else:
             import fcntl
 
