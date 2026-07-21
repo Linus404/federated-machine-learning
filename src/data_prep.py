@@ -15,6 +15,7 @@ os.environ.setdefault("KERAS_BACKEND", "tensorflow")
 
 import numpy as np
 
+from src.artifact_compatibility import ARTIFACT_SCHEMA_VERSION
 from src.contracts import (
     DEFAULT_DIRICHLET_ALPHA,
     DEFAULT_SPLIT_SEED,
@@ -171,6 +172,7 @@ def publish_public_artifacts(vectorizer: Any, output_dir: str | Path) -> dict[st
     vocabulary = vectorizer.get_vocabulary()
     (output_path / "vocab.txt").write_text("\n".join(vocabulary), encoding="utf-8")
     manifest = {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
         "embedding_dim": DEFAULT_EMBEDDING_DIM,
         "sequence_length": DEFAULT_SEQUENCE_LENGTH,
         "vocabulary_size": len(vocabulary),

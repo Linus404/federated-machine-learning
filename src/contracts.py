@@ -6,6 +6,8 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from src.artifact_compatibility import ARTIFACT_SCHEMA_VERSION
+
 DEFAULT_SPLIT_SEED = 67
 DEFAULT_DIRICHLET_ALPHA = 0.5
 
@@ -53,6 +55,7 @@ def client_shard_metadata(
     extra_metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     metadata = {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
         "client_id": client_id,
         "split_seed": split_seed,
         "alpha": alpha,
