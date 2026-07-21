@@ -6,6 +6,7 @@ x-clientapp: &clientapp
   <<: *flower-service
   environment:
     CLIENT_DATA_DIR: /app/client-data
+    FML_CODE_REVISION: "${FML_CODE_REVISION:-}"
     FML_PUBLIC_ARTIFACT_DIR: /app/artifacts/public
 
 x-supernode: &supernode
@@ -60,6 +61,7 @@ services:
       --plugin-type serverapp
       --appio-api-address superlink:9091
     environment:
+      FML_CODE_REVISION: "${FML_CODE_REVISION:-}"
       FML_PUBLIC_ARTIFACT_DIR: /app/artifacts/public
       FML_SERVER_ARTIFACT_DIR: /app/artifacts/server
     depends_on:

@@ -121,6 +121,31 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         for deprecated_entrypoint in ("flwr-serverapp", "flwr-clientapp"):
             self.assertNotIn(deprecated_entrypoint, self.compose)
 
+    def test_training_services_receive_documented_host_git_revision(self) -> None:
+        readme = Path("README.md").read_text(encoding="utf-8")
+        revision_environment = 'FML_CODE_REVISION: "${FML_CODE_REVISION:-}"'
+        clientapp_defaults = self.compose.split("x-supernode:", maxsplit=1)[0]
+
+        self.assertIn(revision_environment, clientapp_defaults)
+        self.assertIn(revision_environment, service_block(self.compose, "serverapp"))
+        for index in range(4):
+            with self.subTest(index=index):
+                self.assertIn(
+                    "<<: *clientapp",
+                    service_block(self.compose, f"clientapp-{index}"),
+                )
+        self.assertIn(
+            'FML_CODE_REVISION="$(git rev-parse HEAD)" docker compose up --build -d',
+            readme,
+        )
+
+    def test_container_build_context_excludes_git_metadata(self) -> None:
+        dockerignore = Path(".dockerignore").read_text(encoding="utf-8").splitlines()
+        dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+
+        self.assertIn(".git", dockerignore)
+        self.assertNotIn("COPY .git", dockerfile)
+
     def test_contract_helpers_follow_project_docstring_conventions(self) -> None:
         docstring = service_block.__doc__ or ""
 

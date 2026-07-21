@@ -120,8 +120,11 @@ Build the single application image and start the separate SuperLink, ServerApp,
 four SuperNode/ClientApp pairs, and dashboard services:
 
 ```bash
-docker compose up --build -d
+FML_CODE_REVISION="$(git rev-parse HEAD)" docker compose up --build -d
 ```
+
+The launch command passes the exact host Git revision to ServerApp and every
+ClientApp without adding repository metadata to the image.
 
 Submit the Flower app to the running local federation:
 
