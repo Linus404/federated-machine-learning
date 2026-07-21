@@ -84,6 +84,7 @@ class ScientificContractTests(unittest.TestCase):
                 "validation-split": 0.2,
                 "public-artifact-dir": "artifacts/public",
                 "server-artifact-dir": "artifacts/server",
+                "artifact-retention-runs": 10,
                 "client-data-dir": "artifacts/clients/client-{partition}",
                 "proximal-mu": 0.1,
                 "use-huber": False,

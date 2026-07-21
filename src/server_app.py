@@ -17,6 +17,12 @@ from flwr.serverapp import ServerApp
 
 from src import parse_run_config_bool
 from src.app_manifest import load_app_manifest, resolve_public_artifact_dir
+from src.artifact_history import (
+    DEFAULT_ARTIFACT_RETENTION_RUNS,
+    create_run_artifact_dir,
+    prune_run_history,
+    publish_completed_run,
+)
 from src.artifact_compatibility import write_server_artifact_manifest
 from src.huber_strategy import (
     DEFAULT_HUBER_THRESHOLD,
@@ -29,13 +35,11 @@ from src.paths import (
     RunArtifactLock,
     acquire_run_artifact_lock,
     client_metrics_path,
-    clear_artifact_dir,
     default_server_artifact_dir,
     global_model_path,
     metrics_path,
     resolve_dir,
 )
-from src.run_provenance import write_run_provenance_manifest
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"keras\..*")
 
@@ -61,6 +65,9 @@ class SentimentServer(FedProx):
         app_manifest,
         artifact_dir=None,
         artifact_lock: RunArtifactLock | None = None,
+        artifact_root: str | Path | None = None,
+        artifact_retention_runs: int = DEFAULT_ARTIFACT_RETENTION_RUNS,
+        final_round: int | None = None,
         huber_threshold: float = DEFAULT_HUBER_THRESHOLD,
         use_huber: bool = False,
         *args,
@@ -69,6 +76,9 @@ class SentimentServer(FedProx):
         super().__init__(*args, **kwargs)
         self.artifact_dir = resolve_dir(artifact_dir or default_server_artifact_dir())
         self._artifact_lock = artifact_lock
+        self.artifact_root = resolve_dir(artifact_root or self.artifact_dir)
+        self.artifact_retention_runs = artifact_retention_runs
+        self.final_round = final_round
         self.app_manifest = app_manifest
         self.huber_threshold = huber_threshold
         self.use_huber = use_huber
@@ -163,6 +173,17 @@ class SentimentServer(FedProx):
                     "accuracy": metrics.get("accuracy"),
                 }
             )
+        if server_round == self.final_round:
+            try:
+                publish_completed_run(self.artifact_root, self.artifact_dir)
+                prune_run_history(
+                    self.artifact_root,
+                    self.artifact_retention_runs,
+                    active_run_dir=self.artifact_dir,
+                )
+            finally:
+                if self._artifact_lock is not None:
+                    self._artifact_lock.release()
         return loss, metrics
 
 
@@ -170,6 +191,9 @@ def create_strategy(
     min_clients: int = 4,
     artifact_dir: str | Path | None = None,
     artifact_lock: RunArtifactLock | None = None,
+    artifact_root: str | Path | None = None,
+    artifact_retention_runs: int = DEFAULT_ARTIFACT_RETENTION_RUNS,
+    final_round: int | None = None,
     public_artifact_dir: str | Path | None = None,
     proximal_mu: float = 0.1,
     use_huber: bool = False,
@@ -186,6 +210,9 @@ def create_strategy(
         proximal_mu=proximal_mu,
         artifact_dir=resolved_artifact_dir,
         artifact_lock=artifact_lock,
+        artifact_root=artifact_root,
+        artifact_retention_runs=artifact_retention_runs,
+        final_round=final_round,
         app_manifest=app_manifest,
         huber_threshold=huber_threshold,
         use_huber=use_huber,
@@ -202,25 +229,42 @@ def create_strategy(
 
 def server_fn(context: Context) -> ServerAppComponents:
     run_config: dict[str, Any] = context.run_config
-    artifact_dir = run_config.get("server-artifact-dir", default_server_artifact_dir())
+    artifact_root = resolve_dir(
+        run_config.get("server-artifact-dir", default_server_artifact_dir())
+    )
     num_rounds = int(run_config.get("num-server-rounds", DEFAULT_SERVER_ROUNDS))
+    retention_runs = int(
+        run_config.get("artifact-retention-runs", DEFAULT_ARTIFACT_RETENTION_RUNS)
+    )
+    if num_rounds < 1:
+        raise ValueError("num-server-rounds must be a positive integer")
+    if retention_runs < 1:
+        raise ValueError("artifact-retention-runs must be a positive integer")
     public_artifact_dir = resolve_public_artifact_dir(run_config)
-    protected_paths = [public_artifact_dir]
-    artifact_lock = acquire_run_artifact_lock(artifact_dir)
+    resolved_public_dir = public_artifact_dir.resolve()
+    resolved_artifact_root = artifact_root.resolve()
+    if (
+        resolved_artifact_root == resolved_public_dir
+        or resolved_artifact_root.is_relative_to(resolved_public_dir)
+        or resolved_public_dir.is_relative_to(resolved_artifact_root)
+    ):
+        raise ValueError("server and public artifact directories must not overlap")
+    artifact_lock = acquire_run_artifact_lock(artifact_root)
     try:
-        resolved_artifact_dir = clear_artifact_dir(
-            artifact_dir, protected_paths=protected_paths
-        )
-        write_run_provenance_manifest(
-            resolved_artifact_dir,
+        run_dir = create_run_artifact_dir(
+            artifact_root,
             run_config,
             public_artifact_dir=public_artifact_dir,
             flower_run_id=getattr(context, "run_id", None),
         )
+        prune_run_history(artifact_root, retention_runs, active_run_dir=run_dir)
         strategy = create_strategy(
             min_clients=4,
-            artifact_dir=resolved_artifact_dir,
+            artifact_dir=run_dir,
             artifact_lock=artifact_lock,
+            artifact_root=artifact_root,
+            artifact_retention_runs=retention_runs,
+            final_round=num_rounds,
             public_artifact_dir=run_config.get("public-artifact-dir"),
             proximal_mu=float(run_config.get("proximal-mu", 0.1)),
             use_huber=parse_run_config_bool(run_config.get("use-huber"), default=False),

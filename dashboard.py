@@ -17,6 +17,7 @@ from keras.layers import TextVectorization
 import tensorflow as tf
 
 from src.app_manifest import load_app_manifest
+from src.artifact_history import resolve_current_run_dir
 from src.artifact_compatibility import load_server_artifact_manifest
 from src.paths import (
     client_metrics_path,
@@ -28,7 +29,8 @@ from src.paths import (
 
 
 PUBLIC_ARTIFACT_DIR: Path = default_public_artifact_dir()
-ARTIFACT_DIR: Path = default_server_artifact_dir()
+ARTIFACT_ROOT: Path = default_server_artifact_dir()
+ARTIFACT_DIR: Path = resolve_current_run_dir(ARTIFACT_ROOT)
 MODEL_PATH: Path = global_model_path(ARTIFACT_DIR)
 METRICS_PATH: Path = metrics_path(ARTIFACT_DIR)
 CLIENT_METRICS_PATH: Path = client_metrics_path(ARTIFACT_DIR)

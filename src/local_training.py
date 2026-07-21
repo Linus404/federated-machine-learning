@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import warnings
@@ -16,10 +17,22 @@ import keras
 import numpy as np
 
 from src.app_manifest import AppManifest, load_app_manifest
-from src.artifact_compatibility import validate_artifact_schema
+from src.artifact_compatibility import (
+    validate_artifact_schema,
+    write_server_artifact_manifest,
+)
+from src.artifact_history import (
+    DEFAULT_ARTIFACT_RETENTION_RUNS,
+    create_run_artifact_dir,
+    prune_run_history,
+    publish_completed_run,
+)
 from src.contracts import DEFAULT_VALIDATION_SEED
-from src.paths import default_public_artifact_dir, resolve_dir
-from src.run_provenance import write_run_provenance_manifest
+from src.paths import (
+    acquire_run_artifact_lock,
+    default_public_artifact_dir,
+    resolve_dir,
+)
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"keras\..*")
 
@@ -176,38 +189,65 @@ def train(args: argparse.Namespace) -> tuple[Any, Any]:
     tuple of Any
         Trained model and its Keras training history.
     """
-    manifest = load_app_manifest(public_artifact_dir=args.public_artifact_dir)
-    write_run_provenance_manifest(
-        args.run_artifact_dir,
-        {
-            "batch-size": args.batch_size,
-            "client-data-dir": args.client_data_dir,
-            "epochs": args.epochs,
-            "public-artifact-dir": args.public_artifact_dir,
-            "quiet": args.quiet,
-            "run-artifact-dir": args.run_artifact_dir,
-            "validation-seed": DEFAULT_VALIDATION_SEED,
-            "validation-split": args.validation_split,
-        },
-        public_artifact_dir=args.public_artifact_dir,
+    artifact_root = resolve_dir(args.run_artifact_dir)
+    retention_runs = int(
+        getattr(args, "artifact_retention_runs", DEFAULT_ARTIFACT_RETENTION_RUNS)
     )
-    train_data, val_data = load_client_shard(
-        args.client_data_dir,
-        manifest,
-        args.validation_split,
-    )
-    model = build_model_from_manifest(manifest)
+    if retention_runs < 1:
+        raise ValueError("artifact retention must be a positive integer")
+    run_config = {
+        "artifact-retention-runs": retention_runs,
+        "batch-size": args.batch_size,
+        "client-data-dir": args.client_data_dir,
+        "epochs": args.epochs,
+        "public-artifact-dir": args.public_artifact_dir,
+        "quiet": args.quiet,
+        "run-artifact-dir": args.run_artifact_dir,
+        "validation-seed": DEFAULT_VALIDATION_SEED,
+        "validation-split": args.validation_split,
+    }
+    lock = acquire_run_artifact_lock(artifact_root)
+    try:
+        manifest = load_app_manifest(public_artifact_dir=args.public_artifact_dir)
+        run_dir = create_run_artifact_dir(
+            artifact_root,
+            run_config,
+            public_artifact_dir=args.public_artifact_dir,
+        )
+        prune_run_history(artifact_root, retention_runs, active_run_dir=run_dir)
+        write_server_artifact_manifest(run_dir)
+        train_data, val_data = load_client_shard(
+            args.client_data_dir,
+            manifest,
+            args.validation_split,
+        )
+        model = build_model_from_manifest(manifest)
 
-    history = model.fit(
-        *train_data,
-        validation_data=val_data,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        verbose=0 if args.quiet else 1,
-    )
+        history = model.fit(
+            *train_data,
+            validation_data=val_data,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            verbose=0 if args.quiet else 1,
+        )
 
-    loss, accuracy = model.evaluate(*val_data, verbose=0)
-    final = {name: float(values[-1]) for name, values in history.history.items()}
+        loss, accuracy = model.evaluate(*val_data, verbose=0)
+        final = {name: float(values[-1]) for name, values in history.history.items()}
+        model.save(str(run_dir / "global_model.keras"))
+        with (run_dir / "metrics.csv").open("w", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=["round", "loss", "accuracy"])
+            writer.writeheader()
+            for epoch, (epoch_loss, epoch_accuracy) in enumerate(
+                zip(history.history["val_loss"], history.history["val_accuracy"]),
+                start=1,
+            ):
+                writer.writerow(
+                    {"round": epoch, "loss": epoch_loss, "accuracy": epoch_accuracy}
+                )
+        publish_completed_run(artifact_root, run_dir)
+        prune_run_history(artifact_root, retention_runs, active_run_dir=run_dir)
+    finally:
+        lock.release()
 
     print(
         f"train_loss={final['loss']:.4f} "
@@ -228,6 +268,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--public-artifact-dir", type=Path, default=default_public_artifact_dir()
     )
     parser.add_argument("--run-artifact-dir", type=Path, required=True)
+    parser.add_argument(
+        "--artifact-retention-runs",
+        type=int,
+        default=DEFAULT_ARTIFACT_RETENTION_RUNS,
+    )
     parser.add_argument("--epochs", type=int, default=DEFAULT_LOCAL_EPOCHS)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--validation-split", type=float, default=0.2)

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import importlib.metadata
 import json
 import math
@@ -18,6 +17,7 @@ from src.app_manifest import load_app_manifest
 from src.artifact_compatibility import (
     ARTIFACT_SCHEMA_VERSION,
     validate_artifact_schema,
+    sha256_file,
     write_json_atomically,
 )
 from src.contracts import DEFAULT_SPLIT_SEED, DEFAULT_VALIDATION_SEED
@@ -249,26 +249,6 @@ def _validate_dataset(dataset: Mapping[str, Any]) -> None:
         )
 
 
-def _sha256(path: Path) -> str:
-    """Return the SHA-256 digest of one file.
-
-    Parameters
-    ----------
-    path : pathlib.Path
-        File to hash.
-
-    Returns
-    -------
-    str
-        Algorithm-prefixed hexadecimal digest.
-    """
-    digest = hashlib.sha256()
-    with path.open("rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return f"sha256:{digest.hexdigest()}"
-
-
 def _canonical_run_config(run_config: Mapping[str, Any]) -> dict[str, Any]:
     """Validate and canonicalize Flower run configuration.
 
@@ -417,8 +397,8 @@ def _dataset_metadata(public_artifact_dir: str | Path | None) -> dict[str, Any]:
     return {
         "identity": identity,
         "checksums": {
-            "manifest.json": _sha256(public_dir / "manifest.json"),
-            manifest.vocabulary_path.name: _sha256(vocabulary_path),
+            "manifest.json": sha256_file(public_dir / "manifest.json"),
+            manifest.vocabulary_path.name: sha256_file(vocabulary_path),
         },
         "status": "available",
         "private_client_shards": private_status,
@@ -432,6 +412,7 @@ def write_run_provenance_manifest(
     public_artifact_dir: str | Path | None = None,
     flower_run_id: int | None = None,
     created_at: str | None = None,
+    run_id: str | None = None,
 ) -> Path:
     """Create the immutable provenance manifest for one training run.
 
@@ -447,6 +428,8 @@ def write_run_provenance_manifest(
         Flower's infrastructure-level run identifier when available.
     created_at : str or None, optional
         UTC timestamp override used by deterministic tests.
+    run_id : str or None, optional
+        UUID override used to align a versioned directory with its manifest.
 
     Returns
     -------
@@ -469,9 +452,16 @@ def write_run_provenance_manifest(
         "+00:00", "Z"
     )
     seed_config = {key: value for key, value in config.items() if "seed" in key.lower()}
+    resolved_run_id = run_id or str(uuid.uuid4())
+    try:
+        parsed_run_id = uuid.UUID(resolved_run_id)
+    except ValueError as error:
+        raise ValueError("run ID must be a canonical UUID") from error
+    if parsed_run_id.version != 4 or str(parsed_run_id) != resolved_run_id:
+        raise ValueError("run ID must be a canonical UUID4")
     payload: dict[str, Any] = {
         "schema_version": ARTIFACT_SCHEMA_VERSION,
-        "run_id": str(uuid.uuid4()),
+        "run_id": resolved_run_id,
         "flower_run_id": flower_run_id,
         "created_at": timestamp,
         "run_config": config,

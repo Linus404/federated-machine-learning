@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import tempfile
@@ -21,6 +23,31 @@ SERVER_ARTIFACTS: dict[str, dict[str, Any]] = {
         "columns": ["round", "client_id", "loss", "accuracy", "samples"],
     },
 }
+REQUIRED_COMPLETED_ARTIFACTS = {
+    "global_model.keras",
+    "metrics.csv",
+    "run_manifest.json",
+}
+
+
+def sha256_file(path: Path) -> str:
+    """Return the algorithm-prefixed SHA-256 digest of one file.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        File to hash.
+
+    Returns
+    -------
+    str
+        Algorithm-prefixed hexadecimal digest.
+    """
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
 
 
 def write_json_atomically(
@@ -111,13 +138,17 @@ def validate_artifact_schema(payload: object, artifact_name: str) -> Mapping[str
     return payload
 
 
-def write_server_artifact_manifest(artifact_dir: Path) -> Path:
+def write_server_artifact_manifest(
+    artifact_dir: Path, *, finalized: bool = False
+) -> Path:
     """Write the compatibility contract for one server artifact directory.
 
     Parameters
     ----------
     artifact_dir : pathlib.Path
         Server output directory.
+    finalized : bool, optional
+        Require completed outputs and record their checksums.
 
     Returns
     -------
@@ -126,13 +157,28 @@ def write_server_artifact_manifest(artifact_dir: Path) -> Path:
     """
     artifact_dir.mkdir(parents=True, exist_ok=True)
     path = artifact_dir / SERVER_ARTIFACT_MANIFEST_FILENAME
-    return write_json_atomically(
-        path,
-        {
-            "schema_version": ARTIFACT_SCHEMA_VERSION,
-            "artifacts": SERVER_ARTIFACTS,
-        },
-    )
+    payload: dict[str, Any] = {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
+        "artifacts": SERVER_ARTIFACTS,
+    }
+    if finalized:
+        missing = [
+            name
+            for name in REQUIRED_COMPLETED_ARTIFACTS
+            if not (artifact_dir / name).is_file()
+        ]
+        if missing:
+            raise ValueError(
+                "cannot finalize run with missing artifacts: "
+                + ", ".join(sorted(missing))
+            )
+        payload["lifecycle"] = "complete"
+        payload["checksums"] = {
+            path.name: sha256_file(path)
+            for path in sorted(artifact_dir.iterdir())
+            if path.is_file() and path.name != SERVER_ARTIFACT_MANIFEST_FILENAME
+        }
+    return write_json_atomically(path, payload)
 
 
 def load_server_artifact_manifest(artifact_dir: Path) -> Mapping[str, Any]:
@@ -175,4 +221,28 @@ def load_server_artifact_manifest(artifact_dir: Path) -> Mapping[str, Any]:
             artifact.get(key) != value for key, value in layout.items()
         ):
             raise ValueError(mismatch_message)
+    lifecycle = payload.get("lifecycle")
+    checksums = payload.get("checksums")
+    if lifecycle is None and checksums is None:
+        return payload
+    if lifecycle != "complete" or not isinstance(checksums, Mapping):
+        raise ValueError("server artifact manifest has invalid completion metadata")
+    if not REQUIRED_COMPLETED_ARTIFACTS <= checksums.keys():
+        raise ValueError("server artifact manifest is missing required checksums")
+    for filename, expected in checksums.items():
+        if (
+            not isinstance(filename, str)
+            or Path(filename).name != filename
+            or not isinstance(expected, str)
+            or len(expected) != 71
+            or not expected.startswith("sha256:")
+        ):
+            raise ValueError("server artifact manifest has an invalid checksum")
+        artifact_path = artifact_dir / filename
+        try:
+            actual = sha256_file(artifact_path)
+        except OSError as error:
+            raise ValueError(f"server artifact is missing: {filename}") from error
+        if not hmac.compare_digest(actual, expected):
+            raise ValueError(f"server artifact checksum does not match: {filename}")
     return payload
