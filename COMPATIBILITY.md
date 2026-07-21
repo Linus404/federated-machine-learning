@@ -54,7 +54,9 @@ code.
 their UTC `created_at` value and then UUID, so pruning is deterministic. The
 currently selected run and the active writer are always protected, even when that
 temporarily exceeds the configured count. Directories with missing, malformed, or
-mismatched provenance are never deleted automatically.
+mismatched provenance are never deleted automatically. Pruning also stops without
+deleting anything when `current.json` is missing or does not select a fully
+checksum-valid completed run.
 
 For a schema change, update the producer, every shared loader, rejection and
 acceptance tests, this policy, and the schema constant in the same pull request.

@@ -38,11 +38,10 @@ class DashboardArtifactTests(unittest.TestCase):
                 write_server_manifest(path, version)
 
                 with (
-                    patch.object(dashboard, "MODEL_PATH", model_path),
                     patch.object(dashboard.keras.models, "load_model") as load_model,
                     self.assertRaisesRegex(ValueError, error),
                 ):
-                    dashboard.load_model()
+                    dashboard.load_model(model_path)
                 load_model.assert_not_called()
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -52,12 +51,11 @@ class DashboardArtifactTests(unittest.TestCase):
             write_server_manifest(path, ARTIFACT_SCHEMA_VERSION)
             sentinel = object()
             with (
-                patch.object(dashboard, "MODEL_PATH", model_path),
                 patch.object(
                     dashboard.keras.models, "load_model", return_value=sentinel
                 ),
             ):
-                self.assertIs(dashboard.load_model(), sentinel)
+                self.assertIs(dashboard.load_model(model_path), sentinel)
 
     def test_metrics_loader_checks_each_schema_version_state(self) -> None:
         for version, error in ((None, "no valid"), (0, "older"), (2, "newer")):
@@ -94,6 +92,23 @@ class DashboardArtifactTests(unittest.TestCase):
                     }
                 ],
             )
+
+    def test_model_loader_uses_verified_snapshot_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            model_path = path / "global_model.keras"
+            model_path.write_bytes(b"verified-model")
+            write_server_manifest(path, ARTIFACT_SCHEMA_VERSION)
+
+            def inspect_snapshot(loaded_path: Path) -> object:
+                model_path.write_bytes(b"attacker-controlled")
+                self.assertEqual(Path(loaded_path).read_bytes(), b"verified-model")
+                return object()
+
+            with patch.object(
+                dashboard.keras.models, "load_model", side_effect=inspect_snapshot
+            ):
+                dashboard.load_model(model_path)
 
 
 if __name__ == "__main__":

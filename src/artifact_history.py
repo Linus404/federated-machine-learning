@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hmac
 import shutil
 import uuid
 from datetime import datetime
@@ -12,8 +13,10 @@ from typing import Any, Mapping
 from src.artifact_compatibility import (
     ARTIFACT_SCHEMA_VERSION,
     SERVER_ARTIFACT_MANIFEST_FILENAME,
-    load_server_artifact_manifest,
-    sha256_file,
+    ServerArtifactSnapshot,
+    load_server_artifact_snapshot,
+    read_regular_file,
+    sha256_bytes,
     write_json_atomically,
     write_server_artifact_manifest,
 )
@@ -111,8 +114,8 @@ def _load_current_index(artifact_root: str | Path) -> Mapping[str, Any] | None:
     if not path.exists():
         return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as error:
+        payload = json.loads(read_regular_file(path, parent=root).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         raise ValueError(f"invalid current-run index: {path}") from error
     if not isinstance(payload, Mapping):
         raise ValueError("current-run index must be a JSON object")
@@ -153,24 +156,49 @@ def resolve_current_run_dir(artifact_root: str | Path) -> Path:
     pathlib.Path
         Current versioned run directory, or the root for legacy artifacts.
     """
+    root, _ = _history_paths(artifact_root)
+    if _load_current_index(root) is None:
+        return root
+    return load_current_run_snapshot(root).directory
+
+
+def load_current_run_snapshot(artifact_root: str | Path) -> ServerArtifactSnapshot:
+    """Read the selected run into a checksum-verified immutable snapshot.
+
+    Parameters
+    ----------
+    artifact_root : str or pathlib.Path
+        Root containing run history or legacy flat artifacts.
+
+    Returns
+    -------
+    ServerArtifactSnapshot
+        Exact artifact bytes validated against the selected manifest.
+    """
     root, runs_root = _history_paths(artifact_root)
     index = _load_current_index(root)
     if index is None:
-        return root
+        return load_server_artifact_snapshot(root)
     run_dir = runs_root / str(index["run_id"])
+    if run_dir.is_symlink() or not run_dir.is_dir():
+        raise ValueError(f"current run directory is missing or unsafe: {run_dir}")
+    canonical_run_dir = run_dir.resolve(strict=True)
+    if canonical_run_dir.parent != runs_root.resolve(strict=True):
+        raise ValueError("current run directory escapes the artifact runs root")
     manifest_path = run_dir / SERVER_ARTIFACT_MANIFEST_FILENAME
-    if not run_dir.is_dir():
-        raise ValueError(f"current run directory is missing: {run_dir}")
     try:
-        manifest_checksum = sha256_file(manifest_path)
-    except OSError as error:
+        manifest_bytes = read_regular_file(manifest_path, parent=canonical_run_dir)
+    except ValueError as error:
         raise ValueError(
-            f"current run artifact manifest is missing: {manifest_path}"
+            f"current run artifact manifest is missing or unsafe: {manifest_path}"
         ) from error
-    if manifest_checksum != index["artifact_manifest_checksum"]:
+    if not hmac.compare_digest(
+        sha256_bytes(manifest_bytes), index["artifact_manifest_checksum"]
+    ):
         raise ValueError("current-run artifact manifest checksum does not match")
-    load_server_artifact_manifest(run_dir)
-    return run_dir
+    return load_server_artifact_snapshot(
+        canonical_run_dir, manifest_bytes=manifest_bytes
+    )
 
 
 def publish_completed_run(artifact_root: str | Path, run_dir: str | Path) -> Path:
@@ -189,18 +217,25 @@ def publish_completed_run(artifact_root: str | Path, run_dir: str | Path) -> Pat
         Written ``current.json`` path.
     """
     root, runs_root = _history_paths(artifact_root)
-    resolved_run_dir = resolve_dir(run_dir)
-    expected_parent = runs_root.resolve()
-    if resolved_run_dir.is_symlink() or resolved_run_dir.parent != expected_parent:
+    candidate_run_dir = Path(run_dir)
+    if candidate_run_dir.is_symlink() or not candidate_run_dir.is_dir():
+        raise ValueError("run directory must be a regular directory")
+    resolved_run_dir = candidate_run_dir.resolve(strict=True)
+    expected_parent = runs_root.resolve(strict=True)
+    if resolved_run_dir.parent != expected_parent:
         raise ValueError("run directory must be directly below the artifact runs root")
-    provenance = load_run_provenance_manifest(run_manifest_path(resolved_run_dir))
+    provenance_path = run_manifest_path(resolved_run_dir)
+    read_regular_file(provenance_path, parent=resolved_run_dir)
+    provenance = load_run_provenance_manifest(provenance_path)
     if provenance["run_id"] != resolved_run_dir.name:
         raise ValueError("run directory does not match its provenance run_id")
     manifest_path = write_server_artifact_manifest(resolved_run_dir, finalized=True)
     index = {
         "schema_version": ARTIFACT_SCHEMA_VERSION,
         "run_id": resolved_run_dir.name,
-        "artifact_manifest_checksum": sha256_file(manifest_path),
+        "artifact_manifest_checksum": sha256_bytes(
+            read_regular_file(manifest_path, parent=resolved_run_dir)
+        ),
     }
     return write_json_atomically(root / CURRENT_RUN_FILENAME, index)
 
@@ -235,20 +270,31 @@ def prune_run_history(
 
     protected: set[Path] = set()
     index = _load_current_index(root)
-    if index is not None:
-        protected.add((runs_root / str(index["run_id"])).resolve())
+    if index is None:
+        return []
+    protected.add(load_current_run_snapshot(root).directory)
     if active_run_dir is not None:
-        active = resolve_dir(active_run_dir)
-        if active.parent != runs_root.resolve():
+        active_path = Path(active_run_dir)
+        if active_path.is_symlink():
+            raise ValueError("active run must be a regular directory")
+        if not active_path.exists():
+            active = None
+        else:
+            active = active_path.resolve(strict=True)
+        if active is not None and active.parent != runs_root.resolve(strict=True):
             raise ValueError("active run must be directly below the artifact runs root")
-        protected.add(active)
+        if active is not None:
+            protected.add(active)
 
     candidates: list[tuple[datetime, str, Path]] = []
     for path in runs_root.iterdir():
         if not path.is_dir() or path.is_symlink():
             continue
+        manifest_path = run_manifest_path(path)
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            continue
         try:
-            manifest = load_run_provenance_manifest(run_manifest_path(path))
+            manifest = load_run_provenance_manifest(manifest_path)
         except ValueError:
             continue
         if manifest["run_id"] != path.name:

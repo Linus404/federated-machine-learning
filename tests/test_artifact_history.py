@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.artifact_history import (
+    load_current_run_snapshot,
     prune_run_history,
     publish_completed_run,
     resolve_current_run_dir,
@@ -134,6 +135,82 @@ class ArtifactHistoryTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "must not be symlinks"):
                 prune_run_history(root, 1)
+
+    def test_retention_aborts_when_current_run_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            oldest = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            current = create_run(root, RUN_IDS[1], "2026-01-02T00:00:00Z")
+            publish_completed_run(root, current)
+            (current / "metrics.csv").write_text("tampered", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "checksum does not match"):
+                prune_run_history(root, 1)
+
+            self.assertTrue(oldest.is_dir())
+            self.assertTrue(current.is_dir())
+
+    def test_retention_aborts_when_current_index_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            oldest = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            newest = create_run(root, RUN_IDS[1], "2026-01-02T00:00:00Z")
+
+            self.assertEqual(prune_run_history(root, 1), [])
+            self.assertTrue(oldest.is_dir())
+            self.assertTrue(newest.is_dir())
+
+    def test_nonexistent_active_run_does_not_consume_retention_quota(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            current = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            newest = create_run(root, RUN_IDS[1], "2026-01-02T00:00:00Z")
+            publish_completed_run(root, current)
+
+            deleted = prune_run_history(
+                root, 2, active_run_dir=root / "runs" / RUN_IDS[2]
+            )
+
+            self.assertEqual(deleted, [])
+            self.assertTrue(newest.is_dir())
+
+    def test_current_snapshot_keeps_verified_bytes_after_source_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            current = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            publish_completed_run(root, current)
+
+            snapshot = load_current_run_snapshot(root)
+            (current / "metrics.csv").write_bytes(b"attacker-controlled")
+
+            self.assertEqual(
+                snapshot.files["metrics.csv"],
+                b"round,loss,accuracy\n1,0.5,0.75\n",
+            )
+
+    def test_finalization_rejects_artifact_symlink_outside_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            outside = root / "outside.keras"
+            outside.write_bytes(b"outside")
+            (run / "global_model.keras").unlink()
+            try:
+                (run / "global_model.keras").symlink_to(outside)
+            except OSError as error:
+                self.skipTest(f"file symlinks are unavailable: {error}")
+
+            with self.assertRaisesRegex(ValueError, "contained regular file"):
+                publish_completed_run(root, run)
+
+    def test_completed_run_cannot_be_finalized_twice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            publish_completed_run(root, run)
+
+            with self.assertRaisesRegex(ValueError, "cannot be finalized again"):
+                publish_completed_run(root, run)
 
 
 if __name__ == "__main__":

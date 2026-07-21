@@ -49,7 +49,8 @@ uv run python -m src.local_training --client-data-dir artifacts/clients/client-0
 ```
 
 The local command treats `--run-artifact-dir` as a reusable history root. Every
-training invocation writes to a new immutable `runs/<run_id>` directory.
+training invocation writes to a new `runs/<run_id>` directory; finalization binds
+its regular files into a checksum-verified artifact snapshot.
 
 ## Direct Flower simulation
 
@@ -106,9 +107,10 @@ Every server run and the documented local-training command create an immutable
 `run_manifest.json` before training. It
 contains a UUID, the Flower run ID, creation time, complete run configuration,
 Python/OS/package versions, Git revision and worktree state when available, known
-seeds, and SHA-256 checksums for the public manifest and vocabulary. Completed
-run manifests also bind the saved model, metrics, and provenance files to their
-SHA-256 checksums, which consumers validate before loading. Set
+seeds, and SHA-256 checksums for the public manifest and vocabulary. Each completed
+`artifact_manifest.json` binds the saved model, metrics, and provenance file bytes
+to their SHA-256 checksums, which consumers validate and snapshot before loading.
+Set
 `FML_CODE_REVISION` to the full Git object ID in images that do not contain `.git`.
 Private client datasets stay outside the server trust boundary, so their identity
 and checksums are not collected by the server manifest.

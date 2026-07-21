@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -125,6 +126,30 @@ class ArtifactCompatibilityTests(unittest.TestCase):
 
                 with self.assertRaisesRegex(ValueError, direction):
                     load_server_artifact_manifest(path)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO files require POSIX")
+    def test_finalization_rejects_non_regular_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            for name in ("global_model.keras", "metrics.csv", "run_manifest.json"):
+                (path / name).touch()
+            os.mkfifo(path / "unexpected.pipe")
+
+            with self.assertRaisesRegex(ValueError, "contained regular file"):
+                write_server_artifact_manifest(path, finalized=True)
+
+    def test_finalization_rejects_hard_linked_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "run"
+            path.mkdir()
+            outside = Path(tmpdir) / "outside.keras"
+            outside.touch()
+            os.link(outside, path / "global_model.keras")
+            for name in ("metrics.csv", "run_manifest.json"):
+                (path / name).touch()
+
+            with self.assertRaisesRegex(ValueError, "contained regular file"):
+                write_server_artifact_manifest(path, finalized=True)
 
 
 if __name__ == "__main__":
