@@ -55,23 +55,12 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         self.assertIn('"127.0.0.1:9093:9093"', service_block(self.compose, "superlink"))
         self.assertIn('"127.0.0.1:8501:8501"', service_block(self.compose, "dashboard"))
 
-        gce_server = Path("deploy/gce/server.compose.yaml").read_text(encoding="utf-8")
-        gce_superlink = service_block(gce_server, "superlink")
-        self.assertIn('"127.0.0.1:9093:9093"', gce_superlink)
-        self.assertIn('"9092:9092"', gce_superlink)
-
     def test_superlink_state_survives_container_restarts(self) -> None:
         superlink = service_block(self.compose, "superlink")
 
         self.assertIn("--database /app/state/state.db", superlink)
         self.assertIn("superlink-state:/app/state", superlink)
         self.assertIn("superlink-state:", self.compose)
-
-        gce_server = Path("deploy/gce/server.compose.yaml").read_text(encoding="utf-8")
-        gce_superlink = service_block(gce_server, "superlink")
-        self.assertIn("--database /app/state/state.db", gce_superlink)
-        self.assertIn("superlink-state:/app/state", gce_superlink)
-        self.assertIn("superlink-state:", gce_server)
 
     def test_flower_dependencies_wait_for_local_api_availability(self) -> None:
         superlink = service_block(self.compose, "superlink")
@@ -98,11 +87,8 @@ class DistributedDeploymentContractTests(unittest.TestCase):
 
     def test_run_submission_waits_for_registered_supernodes(self) -> None:
         flower_config = Path("src/flower_config.py").read_text(encoding="utf-8")
-        gce_run = Path("deploy/gce/gce-run.sh").read_text(encoding="utf-8")
 
         self.assertIn("wait_for_online_supernodes(", flower_config)
-        self.assertIn("python -m src.flower_readiness", gce_run)
-        self.assertIn("--expected-online 4", gce_run)
 
     def test_distributed_stack_uses_separate_flower_roles_with_one_image(self) -> None:
         expected_commands = {
@@ -132,16 +118,8 @@ class DistributedDeploymentContractTests(unittest.TestCase):
                 service_block(self.compose, f"clientapp-{index}"),
             )
 
-        gce_compose = "\n".join(
-            Path(path).read_text(encoding="utf-8")
-            for path in (
-                "deploy/gce/server.compose.yaml",
-                "deploy/gce/client.compose.yaml",
-            )
-        )
         for deprecated_entrypoint in ("flwr-serverapp", "flwr-clientapp"):
             self.assertNotIn(deprecated_entrypoint, self.compose)
-            self.assertNotIn(deprecated_entrypoint, gce_compose)
 
     def test_contract_helpers_follow_project_docstring_conventions(self) -> None:
         docstring = service_block.__doc__ or ""
@@ -214,87 +192,6 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         self.assertNotIn("[tool.flwr.federations.local-docker]", pyproject)
         self.assertIn("uv run python -m src.flower_config", readme)
         self.assertNotIn("grep -q", readme)
-
-    def test_gce_capability_is_retained_behind_deployment_boundary(self) -> None:
-        retained_files = {
-            Path("deploy/gce/README.md"),
-            Path("deploy/gce/gce-bootstrap.sh"),
-            Path("deploy/gce/gce-run.sh"),
-            Path("deploy/gce/server.compose.yaml"),
-            Path("deploy/gce/client.compose.yaml"),
-        }
-
-        self.assertTrue(all(path.is_file() for path in retained_files))
-        self.assertEqual(
-            {path.name for path in Path("deploy").iterdir()},
-            {"gce"},
-        )
-        self.assertFalse(
-            any("gce" in path.name.lower() for path in Path("src").glob("*.py"))
-        )
-        self.assertNotIn("gce", self.compose.lower())
-        self.assertNotIn("gcloud", self.compose.lower())
-
-        gce_readme = Path("deploy/gce/README.md").read_text(encoding="utf-8")
-        self.assertIn("cloud credits are unavailable", gce_readme)
-        self.assertIn("docker compose config", gce_readme)
-        self.assertIn("bash -n", gce_readme)
-
-    def test_gce_topology_is_fixed_to_the_server_four_client_contract(self) -> None:
-        bootstrap = Path("deploy/gce/gce-bootstrap.sh").read_text(encoding="utf-8")
-        readme = Path("deploy/gce/README.md").read_text(encoding="utf-8")
-
-        self.assertIn("CLIENT_COUNT=4", bootstrap)
-        self.assertNotIn('CLIENT_COUNT="${CLIENT_COUNT:-4}"', bootstrap)
-        self.assertNotIn("--clients", bootstrap)
-        self.assertNotIn("--clients", readme)
-
-    def test_gce_bootstrap_creates_remote_artifact_directory_before_copying(
-        self,
-    ) -> None:
-        bootstrap = Path("deploy/gce/gce-bootstrap.sh").read_text(encoding="utf-8")
-
-        create_artifacts = bootstrap.index("mkdir -p '$REMOTE_APP/artifacts'")
-        distribute_artifacts = bootstrap.index(
-            'echo "==> Distributing one private shard to each client"'
-        )
-        self.assertLess(create_artifacts, distribute_artifacts)
-
-    def test_gce_control_plane_has_no_artifact_access(self) -> None:
-        server_compose = Path("deploy/gce/server.compose.yaml").read_text(
-            encoding="utf-8"
-        )
-        client_compose = Path("deploy/gce/client.compose.yaml").read_text(
-            encoding="utf-8"
-        )
-
-        for compose, service in (
-            (server_compose, "superlink"),
-            (client_compose, "supernode"),
-        ):
-            with self.subTest(service=service):
-                block = service_block(compose, service)
-                self.assertNotIn("/app/artifacts", block)
-                self.assertNotIn("CLIENT_DATA_DIR", block)
-
-    def test_gce_app_roles_receive_only_required_artifacts(self) -> None:
-        server_compose = Path("deploy/gce/server.compose.yaml").read_text(
-            encoding="utf-8"
-        )
-        client_compose = Path("deploy/gce/client.compose.yaml").read_text(
-            encoding="utf-8"
-        )
-
-        clientapp = service_block(client_compose, "clientapp")
-        self.assertIn("source: ${CLIENT_SHARD_DIR:?set CLIENT_SHARD_DIR}", clientapp)
-        self.assertIn("target: /app/client-data", clientapp)
-        self.assertIn("read_only: true", clientapp)
-        self.assertIn("../../artifacts/public:/app/artifacts/public:ro", clientapp)
-
-        serverapp = service_block(server_compose, "serverapp")
-        dashboard = service_block(server_compose, "dashboard")
-        self.assertIn("../../artifacts/server:/app/artifacts/server\n", serverapp)
-        self.assertIn("../../artifacts/server:/app/artifacts/server:ro", dashboard)
 
 
 if __name__ == "__main__":
