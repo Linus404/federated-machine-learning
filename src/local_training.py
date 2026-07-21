@@ -24,7 +24,6 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"keras\..
 ArrayPair: TypeAlias = tuple[np.ndarray, np.ndarray]
 PartitionSplit: TypeAlias = tuple[ArrayPair, ArrayPair]
 DEFAULT_LOCAL_EPOCHS = 1
-DEFAULT_EMBEDDING_DIM = 100
 CLIENT_REVIEWS_FILENAME = "reviews.jsonl"
 DEFAULT_VALIDATION_SEED = 67
 
@@ -180,23 +179,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def build_model_from_manifest(
-    manifest=None,
-    *,
-    config_embedding_dim=None,
-    public_manifest_path=None,
-    public_artifact_dir=None,
-):
-    """Build the sentiment model from public manifest metadata."""
-    if isinstance(manifest, AppManifest):
-        app_manifest = manifest
-    else:
-        app_manifest = load_app_manifest(
-            public_manifest_path=manifest or public_manifest_path,
-            public_artifact_dir=public_artifact_dir,
-            config_embedding_dim=config_embedding_dim,
-        )
-    payload = app_manifest.payload
+def build_model_from_manifest(manifest: AppManifest) -> Any:
+    """Build the sentiment model from public manifest metadata.
+
+    Parameters
+    ----------
+    manifest : AppManifest
+        Manifest containing the model dimensions.
+
+    Returns
+    -------
+    Any
+        Compiled Keras model.
+    """
+    payload = manifest.payload
 
     return build_model(
         int(payload["vocabulary_size"]),

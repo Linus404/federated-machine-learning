@@ -2,10 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import tarfile
-from io import BytesIO
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -64,24 +60,3 @@ def client_shard_metadata(
     }
     metadata.update(extra_metadata or {})
     return metadata
-
-
-def create_client_shard_archive(
-    client_id: int,
-    source_dir: str | Path,
-    output_dir: str | Path,
-    manifest: dict[str, Any],
-) -> Path:
-    """Archive one client's raw reviews and metadata."""
-    source_dir, output_dir = Path(source_dir), Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    archive_path = output_dir / f"client-{client_id}.tar.gz"
-    metadata = json.dumps(manifest, indent=2).encode()
-
-    with tarfile.open(archive_path, "w:gz") as archive:
-        archive.add(source_dir / "reviews.jsonl", arcname="reviews.jsonl")
-        info = tarfile.TarInfo("client_metadata.json")
-        info.size = len(metadata)
-        archive.addfile(info, BytesIO(metadata))
-
-    return archive_path

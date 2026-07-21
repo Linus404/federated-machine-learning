@@ -1,5 +1,4 @@
 import json
-import tarfile
 import tempfile
 import unittest
 from collections import Counter
@@ -27,7 +26,7 @@ def write_public_artifacts(path: Path, sequence_length: int = 4) -> AppManifest:
     }
     manifest_path = path / "manifest.json"
     manifest_path.write_text(json.dumps(payload), encoding="utf-8")
-    return AppManifest(manifest_path, path, payload, path / "vocab.txt")
+    return AppManifest(payload, path / "vocab.txt")
 
 
 def check_public_manifest_loads_the_model_shape(tmp_path: Path) -> None:
@@ -43,30 +42,26 @@ def check_raw_client_packaging_keeps_every_sample_private(tmp_path: Path) -> Non
     texts = np.asarray([f"review {index}\nline" for index in range(12)])
     labels = np.asarray([0, 1] * 6)
 
-    archives = package_raw_client_shards(texts, labels, tmp_path, num_clients=4)
+    shards = package_raw_client_shards(texts, labels, tmp_path, num_clients=4)
 
     packaged = []
     sample_count = 0
-    for client_id, archive_path in enumerate(archives):
-        with tarfile.open(archive_path) as archive:
-            assert set(archive.getnames()) == {
-                "reviews.jsonl",
-                "client_metadata.json",
-            }
-            metadata = json.load(archive.extractfile("client_metadata.json"))
-            records = [
-                json.loads(line)
-                for line in archive.extractfile("reviews.jsonl")
-                .read()
-                .decode()
-                .splitlines()
-            ]
-            assert metadata["client_id"] == client_id
-            assert metadata["sample_count"] == len(records)
-            assert metadata["split_seed"] == 67
-            assert metadata["alpha"] == 0.5
-            sample_count += len(records)
-            packaged.extend((record["text"], record["label"]) for record in records)
+    for client_id, shard_path in enumerate(shards):
+        metadata = json.loads(
+            (shard_path / "client_metadata.json").read_text(encoding="utf-8")
+        )
+        records = [
+            json.loads(line)
+            for line in (shard_path / "reviews.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        assert metadata["client_id"] == client_id
+        assert metadata["sample_count"] == len(records)
+        assert metadata["split_seed"] == 67
+        assert metadata["alpha"] == 0.5
+        sample_count += len(records)
+        packaged.extend((record["text"], record["label"]) for record in records)
 
     assert sample_count == len(texts)
     assert Counter(packaged) == Counter(zip(texts.tolist(), labels.tolist()))
@@ -182,7 +177,7 @@ def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> No
     assert manifest["vocabulary_size"] == len(vocabulary)
     assert "glove" not in json.dumps(manifest).lower()
     assert "embedding_matrix" not in manifest
-    assert len(list(client_dir.glob("client-*.tar.gz"))) == 4
+    assert not list(client_dir.glob("client-*.tar.gz"))
     assert all(
         (client_dir / f"client-{index}" / "reviews.jsonl").exists()
         for index in range(4)
