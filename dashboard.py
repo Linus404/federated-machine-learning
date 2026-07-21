@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import time
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -17,27 +19,55 @@ from keras.layers import TextVectorization
 import tensorflow as tf
 
 from src.app_manifest import load_app_manifest
-from src.artifact_compatibility import load_server_artifact_manifest
-from src.paths import (
-    client_metrics_path,
-    default_public_artifact_dir,
-    default_server_artifact_dir,
-    global_model_path,
-    metrics_path,
+from src.artifact_history import CURRENT_RUN_FILENAME, load_current_run_snapshot
+from src.artifact_compatibility import (
+    SERVER_ARTIFACT_MANIFEST_FILENAME,
+    SERVER_ARTIFACTS,
+    load_server_artifact_snapshot,
 )
+from src.paths import default_public_artifact_dir, default_server_artifact_dir
 
 
 PUBLIC_ARTIFACT_DIR: Path = default_public_artifact_dir()
-ARTIFACT_DIR: Path = default_server_artifact_dir()
-MODEL_PATH: Path = global_model_path(ARTIFACT_DIR)
-METRICS_PATH: Path = metrics_path(ARTIFACT_DIR)
-CLIENT_METRICS_PATH: Path = client_metrics_path(ARTIFACT_DIR)
+ARTIFACT_ROOT: Path = default_server_artifact_dir()
 DEFAULT_REFRESH_SECONDS = 6
 IDLE_STOP_AFTER = 7
 
 
-def load_model() -> Any:
+def _is_fresh_artifact_root(root: Path) -> bool:
+    """Return whether no current or legacy server artifacts exist.
+
+    Parameters
+    ----------
+    root : pathlib.Path
+        Configured server artifact root.
+
+    Returns
+    -------
+    bool
+        ``True`` only for an absent or artifact-empty regular directory.
+    """
+    if root.is_symlink() or (root.exists() and not root.is_dir()):
+        return False
+    filenames = {
+        CURRENT_RUN_FILENAME,
+        SERVER_ARTIFACT_MANIFEST_FILENAME,
+        "run_manifest.json",
+        *(str(layout["filename"]) for layout in SERVER_ARTIFACTS.values()),
+    }
+    return not any(
+        (root / filename).exists() or (root / filename).is_symlink()
+        for filename in filenames
+    )
+
+
+def load_model(path: Path | None = None) -> Any:
     """Load the trained global sentiment model.
+
+    Parameters
+    ----------
+    path : pathlib.Path or None, optional
+        Explicit legacy model path, or ``None`` to load the current run snapshot.
 
     Returns
     -------
@@ -49,14 +79,22 @@ def load_model() -> Any:
     FileNotFoundError
         If no trained model artifact exists.
     """
-    if not MODEL_PATH.exists():
+    snapshot = (
+        load_current_run_snapshot(ARTIFACT_ROOT)
+        if path is None
+        else load_server_artifact_snapshot(path.parent)
+    )
+    model_bytes = snapshot.files.get("global_model.keras")
+    if model_bytes is None:
         raise FileNotFoundError(
-            f"Kein Modell gefunden unter {MODEL_PATH}. "
+            f"No model found in {snapshot.directory}. "
             "Bitte zuerst (federated) Training starten, damit der Server "
             "global_model.keras speichert."
         )
-    load_server_artifact_manifest(MODEL_PATH.parent)
-    return keras.models.load_model(MODEL_PATH)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = Path(tmpdir) / "global_model.keras"
+        model_path.write_bytes(model_bytes)
+        return keras.models.load_model(model_path)
 
 
 @st.cache_resource
@@ -81,13 +119,17 @@ def load_vectorizer():
     )
 
 
-def load_metrics(path: Path = METRICS_PATH) -> pd.DataFrame | None:
+def load_metrics(
+    path: Path | None = None, *, filename: str = "metrics.csv"
+) -> pd.DataFrame | None:
     """Load metrics from a compatible server artifact directory.
 
     Parameters
     ----------
     path : pathlib.Path, optional
         Metrics CSV path.
+    filename : str, optional
+        Current-run artifact filename used when ``path`` is ``None``.
 
     Returns
     -------
@@ -99,11 +141,18 @@ def load_metrics(path: Path = METRICS_PATH) -> pd.DataFrame | None:
     ValueError
         If the server artifact schema is unsupported.
     """
-    if not path.exists():
+    if path is None and _is_fresh_artifact_root(ARTIFACT_ROOT):
         return None
-    load_server_artifact_manifest(path.parent)
+    snapshot = (
+        load_current_run_snapshot(ARTIFACT_ROOT)
+        if path is None
+        else load_server_artifact_snapshot(path.parent)
+    )
+    content = snapshot.files.get(path.name if path is not None else filename)
+    if content is None:
+        return None
     try:
-        df = pd.read_csv(path)
+        df = pd.read_csv(BytesIO(content))
     except pd.errors.EmptyDataError:
         return None
     if df.empty:
@@ -147,7 +196,8 @@ def main() -> None:
     if "idle_cycles" not in st.session_state:
         st.session_state.idle_cycles = 0
 
-    current_signature = file_signature(METRICS_PATH)
+    current_path = ARTIFACT_ROOT / "current.json"
+    current_signature = file_signature(current_path)
     if current_signature == st.session_state.last_signature:
         st.session_state.idle_cycles += 1
     else:
@@ -174,8 +224,7 @@ def main() -> None:
             st.session_state.idle_cycles = 0
             st.rerun()
 
-        st.caption(f"Artifact dir: {ARTIFACT_DIR}")
-        st.caption(f"Metrics file: {METRICS_PATH}")
+        st.caption(f"Artifact root: {ARTIFACT_ROOT}")
         if st.session_state.auto_refresh:
             st.caption("Auto refresh aktiv")
         else:
@@ -215,7 +264,7 @@ def main() -> None:
                 "ist das am Anfang normal."
             )
         else:
-            st.caption(f"Loaded {len(df_metrics)} rows from {METRICS_PATH}")
+            st.caption(f"Loaded {len(df_metrics)} metric rows")
             st.dataframe(df_metrics, width="stretch", hide_index=True)
 
             expected_cols = {"round", "loss", "accuracy"}
@@ -230,7 +279,7 @@ def main() -> None:
                 )
 
             st.subheader("Client evaluation accuracy")
-            df_client_metrics = load_metrics(CLIENT_METRICS_PATH)
+            df_client_metrics = load_metrics(filename="client_metrics.csv")
             client_columns = {"round", "client_id", "accuracy"}
             if df_client_metrics is None:
                 st.info("Per-client metrics will appear during the next training run.")

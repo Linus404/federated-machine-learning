@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from src.artifact_compatibility import ARTIFACT_SCHEMA_VERSION
+from src.artifact_history import resolve_current_run_dir
 from src.local_training import DEFAULT_VALIDATION_SEED, train
 from src.run_provenance import (
     load_run_provenance_manifest,
@@ -55,6 +56,7 @@ class LocalTrainingTests(unittest.TestCase):
                 }
             )
             model = MagicMock()
+            model.save.side_effect = lambda path: Path(path).write_bytes(b"model")
             model.fit.return_value = history
             model.evaluate.return_value = (0.5, 0.75)
             training_data = ((MagicMock(), MagicMock()), (MagicMock(), MagicMock()))
@@ -66,7 +68,7 @@ class LocalTrainingTests(unittest.TestCase):
 
             with (
                 patch(
-                    "src.local_training.write_run_provenance_manifest",
+                    "src.artifact_history.write_run_provenance_manifest",
                     side_effect=write_manifest,
                 ),
                 patch(
@@ -84,11 +86,12 @@ class LocalTrainingTests(unittest.TestCase):
             self.assertEqual(events, ["manifest", "private-data"])
             load_shard.assert_called_once()
             payload = load_run_provenance_manifest(
-                args.run_artifact_dir / "run_manifest.json"
+                resolve_current_run_dir(args.run_artifact_dir) / "run_manifest.json"
             )
             self.assertEqual(
                 payload["run_config"],
                 {
+                    "artifact-retention-runs": 10,
                     "batch-size": 8,
                     "client-data-dir": str(args.client_data_dir),
                     "epochs": 2,

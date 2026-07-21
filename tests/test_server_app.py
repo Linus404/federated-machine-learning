@@ -12,8 +12,8 @@ import src.server_app as server_app
 from src.artifact_compatibility import load_server_artifact_manifest
 
 
-class ServerStartupArtifactCleanupTests(unittest.TestCase):
-    def test_server_fn_clears_artifacts_before_creating_strategy(self) -> None:
+class ServerStartupArtifactHistoryTests(unittest.TestCase):
+    def test_server_fn_creates_a_new_run_without_overwriting_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             public_dir = Path(tmpdir) / "public"
             artifact_dir = Path(tmpdir) / "artifacts"
@@ -37,12 +37,9 @@ class ServerStartupArtifactCleanupTests(unittest.TestCase):
                     }
                 ),
             )
-            cleanup_saw_stale_file = False
             captured_strategy_kwargs = {}
 
             def create_strategy_probe(**kwargs):
-                nonlocal cleanup_saw_stale_file
-                cleanup_saw_stale_file = not stale_file.exists()
                 captured_strategy_kwargs.update(kwargs)
                 return Mock(name="strategy")
 
@@ -58,23 +55,22 @@ class ServerStartupArtifactCleanupTests(unittest.TestCase):
             ):
                 components = cast(dict[str, Any], server_app.server_fn(context))
 
-            self.assertTrue(cleanup_saw_stale_file)
-            self.assertFalse(stale_file.exists())
-            self.assertEqual(
-                captured_strategy_kwargs["artifact_dir"], artifact_dir.resolve()
-            )
+            self.assertTrue(stale_file.exists())
+            run_dir = captured_strategy_kwargs["artifact_dir"]
+            self.assertEqual(run_dir.parent, artifact_dir.resolve() / "runs")
             self.assertEqual(captured_strategy_kwargs["proximal_mu"], 0.25)
             self.assertTrue(captured_strategy_kwargs["use_huber"])
             self.assertEqual(captured_strategy_kwargs["huber_threshold"], 3.5)
             self.assertEqual(components["config"].num_rounds, 1)
             provenance = json.loads(
-                (artifact_dir / "run_manifest.json").read_text(encoding="utf-8")
+                (run_dir / "run_manifest.json").read_text(encoding="utf-8")
             )
+            self.assertEqual(provenance["run_id"], run_dir.name)
             self.assertEqual(provenance["run_config"]["num-server-rounds"], 1)
             self.assertEqual(provenance["schema_version"], 1)
             captured_strategy_kwargs["artifact_lock"].release()
 
-    def test_server_fn_refuses_to_clear_public_artifacts(self) -> None:
+    def test_server_fn_refuses_overlapping_public_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             public_dir = Path(tmpdir) / "public"
             public_dir.mkdir()
@@ -210,6 +206,34 @@ class MetricAggregationTests(unittest.TestCase):
                     "1,2,0.4,0.75,12",
                 ],
             )
+
+    def test_final_evaluation_publishes_run_and_releases_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            run_dir = root / "runs" / "11111111-1111-4111-8111-111111111111"
+            run_dir.mkdir(parents=True)
+            (run_dir / "global_model.keras").write_bytes(b"model")
+            strategy = server_app.SentimentServer.__new__(server_app.SentimentServer)
+            strategy.artifact_dir = run_dir
+            strategy.artifact_root = root
+            strategy.artifact_retention_runs = 3
+            strategy.final_round = 2
+            strategy._artifact_lock = Mock()
+
+            with (
+                patch.object(
+                    server_app.FedProx,
+                    "aggregate_evaluate",
+                    return_value=(0.5, {"accuracy": 0.75}),
+                ),
+                patch.object(server_app, "publish_completed_run") as publish,
+                patch.object(server_app, "prune_run_history") as prune,
+            ):
+                strategy.aggregate_evaluate(2, [], [])
+
+            publish.assert_called_once_with(root, run_dir)
+            prune.assert_called_once_with(root, 3, active_run_dir=run_dir)
+            strategy._artifact_lock.release.assert_called_once_with()
 
 
 if __name__ == "__main__":

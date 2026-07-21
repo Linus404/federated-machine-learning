@@ -29,9 +29,9 @@ federated learning system.
 - [ ] Publish reproducible commands and a results table in the README.
 - [ ] Store the code version, run configuration, dataset version, seeds, and artifact checksums for every experiment.
   - Partial: each run now records code/configuration/environment metadata, known
-    seeds, and public-artifact checksums, including the documented local-training
-    path. Experiment-level dataset identities and complete artifact checksums remain
-    part of the fixed-test-set and published experiment work.
+    seeds, public-artifact checksums, and completed model/metrics/provenance
+    checksums for federated and local training. Experiment-level private dataset
+    identities remain part of the fixed-test-set and published experiment work.
 
 ## P0 — Privacy and security claims
 
@@ -65,8 +65,8 @@ federated learning system.
 - [ ] Add structured application logs with consistent levels and context.
 - [ ] Record client availability, failures, round duration, and communication metrics.
 - [ ] Add model checkpoints and documented resume behavior.
-- [ ] Introduce model and artifact versioning with retention rules.
-- [ ] Preserve experiment history instead of relying on manually selected artifact directories.
+- [x] Introduce model and artifact versioning with retention rules.
+- [x] Preserve experiment history instead of relying on manually selected artifact directories.
 - [ ] Add health checks for containers and deployed services.
 - [ ] Add monitoring dashboards and alerts for deployed runs.
 - [ ] Define backup, restore, rollback, and disaster-recovery procedures.

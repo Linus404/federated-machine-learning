@@ -84,6 +84,7 @@ class ScientificContractTests(unittest.TestCase):
                 "validation-split": 0.2,
                 "public-artifact-dir": "artifacts/public",
                 "server-artifact-dir": "artifacts/server",
+                "artifact-retention-runs": 10,
                 "client-data-dir": "artifacts/clients/client-{partition}",
                 "proximal-mu": 0.1,
                 "use-huber": False,
@@ -93,6 +94,16 @@ class ScientificContractTests(unittest.TestCase):
                 "update-noise-multiplier": 0.001,
             },
         )
+
+    def test_dashboard_documentation_uses_default_server_artifact_dir(self) -> None:
+        config = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))[
+            "tool"
+        ]["flwr"]["app"]["config"]
+        artifact_dir = config["server-artifact-dir"]
+        readme = Path("README.md").read_text(encoding="utf-8")
+
+        self.assertIn(f"FML_SERVER_ARTIFACT_DIR={artifact_dir} ", readme)
+        self.assertIn(f'$env:FML_SERVER_ARTIFACT_DIR = "{artifact_dir}"', readme)
 
     def test_huber_aggregation_result_is_stable(self) -> None:
         result = huber_aggregate(
