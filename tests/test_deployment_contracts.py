@@ -193,6 +193,18 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         self.assertIn("uv run python -m src.flower_config", readme)
         self.assertNotIn("grep -q", readme)
 
+    def test_regeneration_uses_matching_non_destructive_artifact_paths(self) -> None:
+        compatibility = Path("COMPATIBILITY.md").read_text(encoding="utf-8")
+        root = "artifacts/regenerated-schema-1"
+
+        self.assertIn(f"--client-shard-dir {root}/clients", compatibility)
+        self.assertIn(f"--public-artifact-dir {root}/public", compatibility)
+        self.assertIn(
+            f"client-data-dir='{root}/clients/client-{{partition}}'", compatibility
+        )
+        self.assertIn(f"public-artifact-dir='{root}/public'", compatibility)
+        self.assertIn(f"server-artifact-dir='{root}/server'", compatibility)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,7 +8,7 @@ from typing import Any, Mapping
 
 ARTIFACT_SCHEMA_VERSION = 1
 SERVER_ARTIFACT_MANIFEST_FILENAME = "artifact_manifest.json"
-SERVER_ARTIFACTS = {
+SERVER_ARTIFACTS: dict[str, dict[str, Any]] = {
     "model": {"filename": "global_model.keras", "format": "keras-v3"},
     "metrics": {
         "filename": "metrics.csv",
@@ -114,9 +114,17 @@ def load_server_artifact_manifest(artifact_dir: Path) -> Mapping[str, Any]:
     payload = validate_artifact_schema(
         json.loads(path.read_text(encoding="utf-8")), "server artifact manifest"
     )
-    if payload.get("artifacts") != SERVER_ARTIFACTS:
-        raise ValueError(
-            "server artifact manifest does not match schema_version "
-            f"{ARTIFACT_SCHEMA_VERSION}; regenerate its artifacts"
-        )
+    artifacts = payload.get("artifacts")
+    mismatch_message = (
+        "server artifact manifest does not match schema_version "
+        f"{ARTIFACT_SCHEMA_VERSION}; regenerate its artifacts"
+    )
+    if not isinstance(artifacts, Mapping):
+        raise ValueError(mismatch_message)
+    for name, layout in SERVER_ARTIFACTS.items():
+        artifact = artifacts.get(name)
+        if not isinstance(artifact, Mapping) or any(
+            artifact.get(key) != value for key, value in layout.items()
+        ):
+            raise ValueError(mismatch_message)
     return payload

@@ -9,6 +9,7 @@ import numpy as np
 
 from src.app_manifest import AppManifest, load_app_manifest
 from src.artifact_compatibility import ARTIFACT_SCHEMA_VERSION
+from src.contracts import client_shard_metadata
 from src.data_prep import main, package_raw_client_shards
 from src.local_training import (
     build_model_from_manifest,
@@ -210,6 +211,54 @@ class ArtifactFlowTests(unittest.TestCase):
                 tempfile.TemporaryDirectory() as tmpdir,
             ):
                 check(Path(tmpdir))
+
+    def test_client_shard_loader_checks_each_schema_version_state(self) -> None:
+        records = [
+            {"text": "good movie", "label": 1},
+            {"text": "bad movie", "label": 0},
+            {"text": "good", "label": 1},
+            {"text": "bad", "label": 0},
+        ]
+        for version, error in ((None, "no valid"), (0, "older"), (2, "newer")):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as tmpdir:
+                path = Path(tmpdir)
+                manifest = write_public_artifacts(path)
+                metadata = {} if version is None else {"schema_version": version}
+                (path / "client_metadata.json").write_text(
+                    json.dumps(metadata), encoding="utf-8"
+                )
+                (path / "reviews.jsonl").write_text(
+                    "\n".join(json.dumps(record) for record in records),
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(ValueError, error):
+                    load_client_shard(path, manifest)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            manifest = write_public_artifacts(path)
+            (path / "reviews.jsonl").write_text(
+                "\n".join(json.dumps(record) for record in records), encoding="utf-8"
+            )
+            train, validation = load_client_shard(path, manifest)
+            self.assertEqual(len(train[1]) + len(validation[1]), len(records))
+
+    def test_client_shard_metadata_preserves_additive_fields(self) -> None:
+        metadata = client_shard_metadata(
+            3, [0, 1], extra_metadata={"source": "research cohort"}
+        )
+
+        self.assertEqual(metadata["client_id"], 3)
+        self.assertEqual(metadata["source"], "research cohort")
+
+    def test_client_shard_metadata_rejects_reserved_field_collisions(self) -> None:
+        with self.assertRaisesRegex(ValueError, "schema_version"):
+            client_shard_metadata(
+                3,
+                [0, 1],
+                extra_metadata={"schema_version": ARTIFACT_SCHEMA_VERSION + 1},
+            )
 
 
 if __name__ == "__main__":

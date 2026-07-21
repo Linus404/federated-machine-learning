@@ -34,8 +34,8 @@ the supported migration is to keep any historical directory needed for compariso
 and regenerate a new directory with the target checkout:
 
 ```bash
-uv run python -m src.data_prep --partitions 4 --client-shard-dir artifacts/clients --public-artifact-dir artifacts/public
-uv run flwr run . --stream --federation-config "num-supernodes=4"
+uv run python -m src.data_prep --partitions 4 --client-shard-dir artifacts/regenerated-schema-1/clients --public-artifact-dir artifacts/regenerated-schema-1/public
+uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "client-data-dir='artifacts/regenerated-schema-1/clients/client-{partition}' public-artifact-dir='artifacts/regenerated-schema-1/public' server-artifact-dir='artifacts/regenerated-schema-1/server'"
 ```
 
 Do not edit a schema version by hand: that bypasses compatibility checks without
