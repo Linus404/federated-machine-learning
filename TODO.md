@@ -13,8 +13,8 @@ federated learning system.
 - [ ] Add dependency, secret, and container vulnerability scanning.
 - [ ] Choose an open-source license and add a `LICENSE` file.
 - [x] Add `CONTRIBUTING.md`, `SECURITY.md`, and pull-request/issue templates.
-- [ ] Move notebook-only dependencies such as `ipykernel` and `nbformat` out of runtime dependencies.
-- [ ] Align Ruff's target Python version with the supported Python versions.
+- [x] Move notebook-only dependencies such as `ipykernel` and `nbformat` out of runtime dependencies.
+- [x] Align Ruff's target Python version with the supported Python versions.
 
 ## P0 — Scientific validation
 
