@@ -30,7 +30,6 @@ Follow the existing module structure and add or update tests for behavior
 changes. Before committing, run:
 
 ```bash
-uv run python -m unittest discover -s tests -v
 uv run coverage run -m unittest discover -s tests -v
 uv run coverage report
 uv run ruff format --check .
