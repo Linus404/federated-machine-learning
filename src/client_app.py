@@ -14,7 +14,6 @@ from src import parse_run_config_bool
 from src.app_manifest import configured_value, load_app_manifest
 from src.local_training import (
     DEFAULT_LOCAL_EPOCHS,
-    DEFAULT_EMBEDDING_DIM,
     ArrayPair,
     build_model_from_manifest,
     load_client_shard,
@@ -47,9 +46,7 @@ class SentimentClient(NumPyClient):
         client_id: int = 0,
         epochs: int = DEFAULT_LOCAL_EPOCHS,
         batch_size: int = 64,
-        embedding_dim: int = DEFAULT_EMBEDDING_DIM,
         validation_split: float = 0.2,
-        public_manifest_path: str | Path | None = None,
         public_artifact_dir: str | Path | None = None,
         use_update_noise: bool = False,
         update_noise_l2_norm_clip: float = UPDATE_NOISE_L2_NORM_CLIP,
@@ -65,9 +62,7 @@ class SentimentClient(NumPyClient):
         self.train_data: ArrayPair
         self.val_data: ArrayPair
         manifest = load_app_manifest(
-            public_manifest_path=public_manifest_path,
             public_artifact_dir=public_artifact_dir,
-            config_embedding_dim=embedding_dim,
         )
         self.train_data, self.val_data = load_client_shard(
             self.client_data_dir, manifest, validation_split
@@ -167,31 +162,23 @@ def client_fn(context: Any) -> Any:
     partition = int(context.node_config.get("partition-id", 0))
     client_data_dir = _configured_client_data_dir(run_config, partition)
 
-    client_kwargs: dict[str, Any] = {
-        "client_data_dir": client_data_dir,
-        "client_id": partition,
-        "epochs": int(run_config.get("local-epochs", DEFAULT_LOCAL_EPOCHS)),
-        "batch_size": int(run_config.get("batch-size", 64)),
-        "embedding_dim": int(run_config["embedding-dim"]),
-        "validation_split": float(run_config.get("validation-split", 0.2)),
-        "use_update_noise": parse_run_config_bool(
+    return SentimentClient(
+        client_data_dir=client_data_dir,
+        client_id=partition,
+        epochs=int(run_config.get("local-epochs", DEFAULT_LOCAL_EPOCHS)),
+        batch_size=int(run_config.get("batch-size", 64)),
+        validation_split=float(run_config.get("validation-split", 0.2)),
+        public_artifact_dir=configured_value(run_config, "public-artifact-dir"),
+        use_update_noise=parse_run_config_bool(
             run_config.get("use-update-noise"), default=False
         ),
-        "update_noise_l2_norm_clip": float(
+        update_noise_l2_norm_clip=float(
             run_config.get("update-noise-l2-norm-clip", UPDATE_NOISE_L2_NORM_CLIP)
         ),
-        "update_noise_multiplier": float(
+        update_noise_multiplier=float(
             run_config.get("update-noise-multiplier", UPDATE_NOISE_MULTIPLIER)
         ),
-    }
-    public_manifest_path = configured_value(run_config, "public-manifest-path")
-    public_artifact_dir = configured_value(run_config, "public-artifact-dir")
-    if public_manifest_path is not None:
-        client_kwargs["public_manifest_path"] = public_manifest_path
-    if public_artifact_dir is not None:
-        client_kwargs["public_artifact_dir"] = public_artifact_dir
-
-    return SentimentClient(**client_kwargs).to_client()
+    ).to_client()
 
 
 def _configured_client_data_dir(run_config: dict[str, Any], partition: int) -> Path:

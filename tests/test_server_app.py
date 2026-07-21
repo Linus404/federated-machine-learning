@@ -29,7 +29,6 @@ class ServerStartupArtifactCleanupTests(unittest.TestCase):
                         "public-artifact-dir": public_dir,
                         "server-artifact-dir": artifact_dir,
                         "num-server-rounds": 1,
-                        "embedding-dim": 100,
                         "proximal-mu": 0.25,
                         "use-huber": "true",
                         "huber-threshold": 3.5,
@@ -81,7 +80,6 @@ class ServerStartupArtifactCleanupTests(unittest.TestCase):
                         "public-artifact-dir": public_dir,
                         "server-artifact-dir": public_dir,
                         "num-server-rounds": 1,
-                        "embedding-dim": 100,
                     }
                 ),
             )
@@ -105,7 +103,6 @@ class ServerStartupArtifactCleanupTests(unittest.TestCase):
                         "public-artifact-dir": public_dir,
                         "server-artifact-dir": artifact_dir,
                         "num-server-rounds": 1,
-                        "embedding-dim": 100,
                     }
                 ),
             )
@@ -148,7 +145,6 @@ class ServerStartupArtifactCleanupTests(unittest.TestCase):
                         "public-artifact-dir": public_dir,
                         "server-artifact-dir": artifact_dir,
                         "num-server-rounds": 1,
-                        "embedding-dim": 100,
                     }
                 ),
             )

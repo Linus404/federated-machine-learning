@@ -19,7 +19,6 @@ from src.contracts import (
     DEFAULT_DIRICHLET_ALPHA,
     DEFAULT_SPLIT_SEED,
     client_shard_metadata,
-    create_client_shard_archive,
     dirichlet_split,
     label_histogram,
 )
@@ -76,7 +75,34 @@ def package_raw_client_shards(
     manifest_checksum: str | None = None,
     metadata: Mapping[str, Any] | None = None,
 ) -> list[Path]:
-    """Package raw review text and labels into one archive per client."""
+    """Write raw review text and labels into one directory per client.
+
+    Parameters
+    ----------
+    texts : Any
+        Review texts to partition.
+    labels : Any
+        Labels corresponding to ``texts``.
+    output_dir : str or pathlib.Path
+        Parent directory for client shards.
+    num_clients : int
+        Number of client shards to create.
+    alpha : float, optional
+        Dirichlet concentration parameter.
+    seed : int, optional
+        Random seed for deterministic partitioning.
+    manifest : mapping, optional
+        Public manifest used to derive the shard checksum.
+    manifest_checksum : str, optional
+        Precomputed public manifest checksum.
+    metadata : mapping, optional
+        Additional metadata copied into every shard.
+
+    Returns
+    -------
+    list of pathlib.Path
+        Created client shard directories.
+    """
     text_array = np.asarray(texts)
     label_array = np.asarray(labels)
     if len(text_array) != len(label_array):
@@ -103,7 +129,7 @@ def package_raw_client_shards(
         seed=seed,
     )
 
-    archive_paths: list[Path] = []
+    shard_paths: list[Path] = []
     for client_id in range(num_clients):
         indices = split[client_id]
         client_texts = text_array[indices]
@@ -131,16 +157,9 @@ def package_raw_client_shards(
         (shard_dir / "client_metadata.json").write_text(
             json.dumps(shard_metadata, indent=2), encoding="utf-8"
         )
-        archive_paths.append(
-            create_client_shard_archive(
-                client_id=client_id,
-                source_dir=shard_dir,
-                output_dir=output_path,
-                manifest=shard_metadata,
-            )
-        )
+        shard_paths.append(shard_dir)
 
-    return archive_paths
+    return shard_paths
 
 
 def publish_public_artifacts(vectorizer: Any, output_dir: str | Path) -> dict[str, Any]:

@@ -40,7 +40,6 @@ class ClientConfigTests(unittest.TestCase):
                 "client-data-dir": "data/client-{partition}",
                 "local-epochs": 2,
                 "batch-size": 8,
-                "embedding-dim": 16,
                 "validation-split": 0.25,
                 "use-update-noise": "true",
                 "update-noise-l2-norm-clip": 2.0,
@@ -59,8 +58,8 @@ class ClientConfigTests(unittest.TestCase):
             client_id=3,
             epochs=2,
             batch_size=8,
-            embedding_dim=16,
             validation_split=0.25,
+            public_artifact_dir=None,
             use_update_noise=True,
             update_noise_l2_norm_clip=2.0,
             update_noise_multiplier=0.5,
@@ -69,9 +68,7 @@ class ClientConfigTests(unittest.TestCase):
 
     def test_client_fn_requires_private_raw_data(self) -> None:
         context = SimpleNamespace(
-            run_config={
-                "embedding-dim": 16,
-            },
+            run_config={},
             node_config={"partition-id": "0"},
         )
 
@@ -110,7 +107,6 @@ class ClientConfigTests(unittest.TestCase):
             client = client_app.SentimentClient(
                 client_data_dir="client-0",
                 public_artifact_dir="public",
-                embedding_dim=100,
             )
 
         load_shard.assert_called_once_with(

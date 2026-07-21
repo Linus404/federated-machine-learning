@@ -37,7 +37,7 @@ uv run python -m src.data_prep --partitions 4 --client-shard-dir artifacts/clien
 ```
 
 This command loads IMDB once for the demo setup, creates one raw review/label
-directory and archive per client, and publishes the shared vocabulary. Clients
+directory per client, and publishes the shared vocabulary. Clients
 always tokenize their own reviews; no centrally tokenized partitions are generated.
 The server sees only model updates. The model uses a normal trainable embedding,
 not pretrained GloVe vectors or an embedding matrix.

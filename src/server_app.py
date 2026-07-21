@@ -18,7 +18,7 @@ from src.huber_strategy import (
     _unflatten,
     huber_aggregate,
 )
-from src.local_training import DEFAULT_EMBEDDING_DIM, build_model_from_manifest
+from src.local_training import build_model_from_manifest
 from src.paths import (
     RunArtifactLock,
     acquire_run_artifact_lock,
@@ -158,11 +158,9 @@ class SentimentServer(FedProx):
 
 
 def create_strategy(
-    embedding_dim: int = DEFAULT_EMBEDDING_DIM,
     min_clients: int = 4,
     artifact_dir: str | Path | None = None,
     artifact_lock: RunArtifactLock | None = None,
-    public_manifest_path: str | Path | None = None,
     public_artifact_dir: str | Path | None = None,
     proximal_mu: float = 0.1,
     use_huber: bool = False,
@@ -171,9 +169,7 @@ def create_strategy(
     resolved_artifact_dir = resolve_dir(artifact_dir or default_server_artifact_dir())
 
     app_manifest = load_app_manifest(
-        public_manifest_path=public_manifest_path,
         public_artifact_dir=public_artifact_dir,
-        config_embedding_dim=embedding_dim,
     )
     initial_model = build_model_from_manifest(app_manifest)
 
@@ -207,11 +203,9 @@ def server_fn(context: Context) -> ServerAppComponents:
             artifact_dir, protected_paths=protected_paths
         )
         strategy = create_strategy(
-            embedding_dim=int(run_config["embedding-dim"]),
             min_clients=4,
             artifact_dir=resolved_artifact_dir,
             artifact_lock=artifact_lock,
-            public_manifest_path=run_config.get("public-manifest-path"),
             public_artifact_dir=run_config.get("public-artifact-dir"),
             proximal_mu=float(run_config.get("proximal-mu", 0.1)),
             use_huber=parse_run_config_bool(run_config.get("use-huber"), default=False),

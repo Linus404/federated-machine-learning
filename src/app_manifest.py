@@ -12,8 +12,6 @@ from src.paths import default_public_artifact_dir, resolve_dir
 
 @dataclass(frozen=True)
 class AppManifest:
-    path: Path
-    public_artifact_dir: Path
     payload: dict[str, Any]
     vocabulary_path: Path
 
@@ -35,18 +33,12 @@ def resolve_public_artifact_dir(config=None, *, public_artifact_dir=None) -> Pat
 def load_app_manifest(
     config=None,
     *,
-    public_manifest_path=None,
     public_artifact_dir=None,
-    config_embedding_dim=None,
 ) -> AppManifest:
     public_dir = resolve_public_artifact_dir(
         config, public_artifact_dir=public_artifact_dir
     )
-    path = resolve_dir(
-        public_manifest_path
-        or configured_value(config, "public-manifest-path")
-        or public_dir / "manifest.json"
-    )
+    path = public_dir / "manifest.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
 
     # These are the only manifest values the product consumes.
@@ -54,10 +46,5 @@ def load_app_manifest(
     missing = required - payload.keys()
     if missing:
         raise ValueError(f"Manifest missing: {', '.join(sorted(missing))}")
-    if config_embedding_dim is not None and int(payload["embedding_dim"]) != int(
-        config_embedding_dim
-    ):
-        raise ValueError("Manifest and run config use different embedding dimensions")
-
     vocabulary_path = public_dir / payload["vocabulary"]["filename"]
-    return AppManifest(path, public_dir, payload, vocabulary_path)
+    return AppManifest(payload, vocabulary_path)
