@@ -132,6 +132,13 @@ artifacts are read-only in every consuming service; only ServerApp can write
 `artifacts/server`, which the dashboard mounts read-only. Stop the runtime with
 `docker compose down`.
 
+### Deployment scope
+
+The previous multi-host Google Cloud deployment was removed because the project
+currently has no cloud access for live validation. The supported deployment path
+is the local Docker runtime above. Reintroduce a cloud deployment only when it can
+be tested end to end against real infrastructure.
+
 ## Development
 
 Add dependencies with:
