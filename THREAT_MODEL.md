@@ -118,8 +118,14 @@ plaintext traffic.
 
 ### Availability
 
-- The server currently requires exactly four clients with full fit and evaluation
-  participation. A missing, slow, or failed client can prevent progress.
+- The supported Compose topology provides four SuperNode/ClientApp pairs. The
+  server waits for at least four available clients and, with both participation
+  fractions set to `1.0`, selects every available client for fit and evaluation;
+  with the four-service topology, that means all four. FedProx retains its
+  `accept_failures=True` default, so it can aggregate the successful results from
+  a round with selected-client failures. A missing or slow client can delay
+  selection when fewer than four are available, and a round with no successful
+  results cannot be aggregated.
 - There are no production retry, timeout, disaster-recovery, rate-limit, or
   denial-of-service controls.
 - Model and artifact history improve recovery from completed local runs, but do
@@ -129,8 +135,9 @@ plaintext traffic.
 
 - Each Compose ClientApp receives one client shard through a read-only mount;
   ServerApp receives no client-shard mount.
-- Public artifacts are mounted read-only for consumers, and dashboard server
-  artifacts are read-only.
+- In Compose, public artifacts are mounted read-only into ServerApp, all four
+  ClientApp services, and the dashboard. The dashboard's server-artifact mount
+  is also read-only.
 - Host-facing SuperLink and dashboard ports bind to loopback in the supported
   local Compose topology.
 - Artifact schema validation, path containment checks, regular-file checks,
@@ -152,4 +159,3 @@ definition, sampling model, accountant, and published epsilon/delta when DP is
 claimed; update validation and poisoning defenses; authenticated dashboard
 access; encrypted storage; audit logs; incident response; backup and recovery;
 and leakage, membership-inference, malicious-client, and network-adversary tests.
-
