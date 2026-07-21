@@ -12,7 +12,7 @@ federated learning system.
 - [ ] Add Docker build and Compose validation smoke tests to CI.
 - [ ] Add dependency, secret, and container vulnerability scanning.
 - [ ] Choose an open-source license and add a `LICENSE` file.
-- [ ] Add `CONTRIBUTING.md`, `SECURITY.md`, and pull-request/issue templates.
+- [x] Add `CONTRIBUTING.md`, `SECURITY.md`, and pull-request/issue templates.
 - [ ] Move notebook-only dependencies such as `ipykernel` and `nbformat` out of runtime dependencies.
 - [ ] Align Ruff's target Python version with the supported Python versions.
 
