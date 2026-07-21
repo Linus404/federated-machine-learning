@@ -178,3 +178,19 @@ def metrics_path(artifact_dir: str | Path) -> Path:
 
 def client_metrics_path(artifact_dir: str | Path) -> Path:
     return resolve_dir(artifact_dir) / "client_metrics.csv"
+
+
+def run_manifest_path(artifact_dir: str | Path) -> Path:
+    """Return the immutable run provenance path for an artifact directory.
+
+    Parameters
+    ----------
+    artifact_dir : str or pathlib.Path
+        Server artifact directory.
+
+    Returns
+    -------
+    pathlib.Path
+        Run manifest path.
+    """
+    return resolve_dir(artifact_dir) / "run_manifest.json"

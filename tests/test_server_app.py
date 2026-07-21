@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -66,6 +67,11 @@ class ServerStartupArtifactCleanupTests(unittest.TestCase):
             self.assertTrue(captured_strategy_kwargs["use_huber"])
             self.assertEqual(captured_strategy_kwargs["huber_threshold"], 3.5)
             self.assertEqual(components["config"].num_rounds, 1)
+            provenance = json.loads(
+                (artifact_dir / "run_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(provenance["run_config"]["num-server-rounds"], 1)
+            self.assertEqual(provenance["schema_version"], 1)
             captured_strategy_kwargs["artifact_lock"].release()
 
     def test_server_fn_refuses_to_clear_public_artifacts(self) -> None:

@@ -95,6 +95,14 @@ uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "
 
 `use-huber` enables the robust aggregation path for outlier-resistant experiments. `use-update-noise` enables a small illustrative client update-noise ablation; it is not a production differential-privacy guarantee.
 
+Every server run creates an immutable `run_manifest.json` before training. It
+contains a UUID, the Flower run ID, creation time, complete run configuration,
+Python/OS/package versions, Git revision and worktree state when available, known
+seeds, and SHA-256 checksums for the public manifest and vocabulary. Set
+`FML_CODE_REVISION` to the full Git object ID in images that do not contain `.git`.
+Private client datasets stay outside the server trust boundary, so their identity
+and checksums are not collected by the server manifest.
+
 ## Local distributed Docker runtime
 
 Prepare the four client shards and public artifacts on the host before starting

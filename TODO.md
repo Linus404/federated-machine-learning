@@ -28,6 +28,10 @@ federated learning system.
 - [ ] Evaluate robustness with controlled outlier and malicious-client scenarios.
 - [ ] Publish reproducible commands and a results table in the README.
 - [ ] Store the code version, run configuration, dataset version, seeds, and artifact checksums for every experiment.
+  - Partial: each run now records code/configuration/environment metadata, known
+    seeds, and public-artifact checksums. Experiment-level dataset identities and
+    complete artifact checksums remain part of the fixed-test-set and published
+    experiment work.
 
 ## P0 — Privacy and security claims
 
@@ -56,8 +60,8 @@ federated learning system.
 
 ## P1 — Observability and experiment lifecycle
 
-- [ ] Assign a unique ID to every training run.
-- [ ] Persist the complete run configuration and environment metadata with each run.
+- [x] Assign a unique ID to every training run.
+- [x] Persist the complete run configuration and environment metadata with each run.
 - [ ] Add structured application logs with consistent levels and context.
 - [ ] Record client availability, failures, round duration, and communication metrics.
 - [ ] Add model checkpoints and documented resume behavior.

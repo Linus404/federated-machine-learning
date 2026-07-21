@@ -15,6 +15,7 @@ from src.paths import (
     default_server_artifact_dir,
     global_model_path,
     metrics_path,
+    run_manifest_path,
 )
 
 
@@ -190,6 +191,10 @@ class ArtifactPathContractTests(unittest.TestCase):
             self.assertEqual(
                 client_metrics_path(resolved_artifact_dir),
                 artifact_dir.resolve() / "client_metrics.csv",
+            )
+            self.assertEqual(
+                run_manifest_path(resolved_artifact_dir),
+                artifact_dir.resolve() / "run_manifest.json",
             )
 
     def test_default_server_artifact_dir_prefers_server_env(self) -> None:
