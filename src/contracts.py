@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 
@@ -23,11 +23,13 @@ def dirichlet_split(
 ) -> dict[int, list[int]]:
     """Return deterministic, non-IID sample indices for each client."""
     rng = np.random.default_rng(seed)
-    labels = np.asarray(labels)
-    partitions = {client_id: [] for client_id in range(num_clients)}
+    label_array = np.asarray(labels)
+    partitions: dict[int, list[int]] = {
+        client_id: [] for client_id in range(num_clients)
+    }
 
-    for label in np.unique(labels):
-        indices = np.flatnonzero(labels == label)
+    for label in np.unique(label_array):
+        indices = np.flatnonzero(label_array == label)
         probabilities = rng.dirichlet(np.full(num_clients, alpha))
         clients = rng.choice(num_clients, len(indices), p=probabilities)
         for index, client_id in zip(indices, clients):
@@ -35,8 +37,8 @@ def dirichlet_split(
 
     # Do not leak the label-loop ordering into packaged shard order. Client-side
     # splitting is stratified as a second line of defense.
-    for indices in partitions.values():
-        rng.shuffle(indices)
+    for shard_indices in partitions.values():
+        rng.shuffle(shard_indices)
 
     return partitions
 
@@ -48,7 +50,7 @@ def client_shard_metadata(
     split_seed: int = DEFAULT_SPLIT_SEED,
     alpha: float = DEFAULT_DIRICHLET_ALPHA,
     manifest_checksum: str | None = None,
-    extra_metadata: dict[str, Any] | None = None,
+    extra_metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     metadata = {
         "client_id": client_id,

@@ -5,7 +5,12 @@ import warnings
 from pathlib import Path
 from typing import Any
 
-from flwr.common import Context, ndarrays_to_parameters, parameters_to_ndarrays
+from flwr.common import (
+    Context,
+    Parameters,
+    ndarrays_to_parameters,
+    parameters_to_ndarrays,
+)
 from flwr.server import ServerAppComponents, ServerConfig
 from flwr.server.strategy import FedProx
 from flwr.serverapp import ServerApp
@@ -105,6 +110,7 @@ class SentimentServer(FedProx):
                 )
 
     def aggregate_fit(self, server_round, results, failures):
+        parameters: Parameters | None
         if self.use_huber and results:
             # Robust Huber aggregation instead of plain FedProx averaging
             reference = parameters_to_ndarrays(results[0][1].parameters)

@@ -6,9 +6,9 @@ federated learning system.
 
 ## P0 — Portfolio and engineering foundation
 
-- [ ] Add a GitHub Actions CI workflow for unit tests, Ruff linting, and formatting.
-- [ ] Add type checking and enforce it in CI.
-- [ ] Measure test coverage and define a meaningful minimum coverage threshold.
+- [x] Add a GitHub Actions CI workflow for unit tests, Ruff linting, and formatting.
+- [x] Add type checking and enforce it in CI.
+- [x] Measure test coverage and define a meaningful minimum coverage threshold.
 - [ ] Add Docker build and Compose validation smoke tests to CI.
 - [ ] Add dependency, secret, and container vulnerability scanning.
 - [ ] Choose an open-source license and add a `LICENSE` file.
