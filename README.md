@@ -45,11 +45,11 @@ not pretrained GloVe vectors or an embedding matrix.
 Train one client locally from its raw shard:
 
 ```bash
-uv run python -m src.local_training --client-data-dir artifacts/clients/client-0 --public-artifact-dir artifacts/public --run-artifact-dir artifacts/local-run
+uv run python -m src.local_training --client-data-dir artifacts/clients/client-0 --public-artifact-dir artifacts/public --run-artifact-dir artifacts/local-runs
 ```
 
-The local command requires a new run-artifact directory and writes its immutable
-`run_manifest.json` before training. Choose another empty directory for each run.
+The local command treats `--run-artifact-dir` as a reusable history root. Every
+training invocation writes to a new immutable `runs/<run_id>` directory.
 
 ## Direct Flower simulation
 
@@ -84,16 +84,20 @@ config, for example:
 uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "client-data-dir='artifacts/clients/client-{partition}' server-artifact-dir='artifacts/server' public-artifact-dir='artifacts/public'"
 ```
 
-The dashboard reads server artifacts from `FML_SERVER_ARTIFACT_DIR` and public
-artifacts from `FML_PUBLIC_ARTIFACT_DIR`. Deployed clients use `CLIENT_DATA_DIR`
-for their one mounted private shard.
+The dashboard reads the completed run selected by the atomic `current.json` index
+under `FML_SERVER_ARTIFACT_DIR` and reads public artifacts from
+`FML_PUBLIC_ARTIFACT_DIR`. Deployed clients use `CLIENT_DATA_DIR` for their one
+mounted private shard.
 
-The server clears its configured artifact directory at the start of each run so stale metrics or models cannot bleed into fresh experiments. Use a distinct `server-artifact-dir` for each experiment you want to compare:
+The server never clears its configured artifact root. It writes each experiment to
+`runs/<run_id>` and advances `current.json` only after the run has a model,
+metrics, provenance, and verified SHA-256 checksums. Existing completed runs remain
+available for comparison:
 
 ```powershell
-uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "server-artifact-dir='artifacts/baseline' use-update-noise=false use-huber=false"
-uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "server-artifact-dir='artifacts/huber' use-update-noise=false use-huber=true huber-threshold=10.0"
-uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "server-artifact-dir='artifacts/update-noise' use-update-noise=true use-huber=false"
+uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "use-update-noise=false use-huber=false"
+uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "use-update-noise=false use-huber=true huber-threshold=10.0"
+uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "use-update-noise=true use-huber=false"
 ```
 
 `use-huber` enables the robust aggregation path for outlier-resistant experiments. `use-update-noise` enables a small illustrative client update-noise ablation; it is not a production differential-privacy guarantee.
@@ -102,10 +106,17 @@ Every server run and the documented local-training command create an immutable
 `run_manifest.json` before training. It
 contains a UUID, the Flower run ID, creation time, complete run configuration,
 Python/OS/package versions, Git revision and worktree state when available, known
-seeds, and SHA-256 checksums for the public manifest and vocabulary. Set
+seeds, and SHA-256 checksums for the public manifest and vocabulary. Completed
+run manifests also bind the saved model, metrics, and provenance files to their
+SHA-256 checksums, which consumers validate before loading. Set
 `FML_CODE_REVISION` to the full Git object ID in images that do not contain `.git`.
 Private client datasets stay outside the server trust boundary, so their identity
 and checksums are not collected by the server manifest.
+
+`artifact-retention-runs` defaults to `10`. Retention orders validated run
+manifests by `(created_at, run_id)`, keeps the newest configured count, and never
+deletes the active or currently selected run. Malformed or unrecognized run
+directories are left untouched for manual recovery.
 
 ## Local distributed Docker runtime
 
