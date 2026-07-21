@@ -277,6 +277,10 @@ def publish_completed_run(artifact_root: str | Path, run_dir: str | Path) -> Pat
     if resolved_run_dir.parent != expected_parent:
         raise ValueError("run directory must be directly below the artifact runs root")
     with _finalization_lock(root, resolved_run_dir.name):
+        current = _load_current_index(root)
+        if current is not None and current["run_id"] == resolved_run_dir.name:
+            raise ValueError("completed run cannot be finalized again")
+
         provenance_path = run_manifest_path(resolved_run_dir)
         provenance_bytes = read_regular_file(provenance_path, parent=resolved_run_dir)
         provenance = load_run_provenance_manifest(
@@ -284,13 +288,28 @@ def publish_completed_run(artifact_root: str | Path, run_dir: str | Path) -> Pat
         )
         if provenance["run_id"] != resolved_run_dir.name:
             raise ValueError("run directory does not match its provenance run_id")
-        manifest_path = write_server_artifact_manifest(resolved_run_dir, finalized=True)
+        manifest_path = resolved_run_dir / SERVER_ARTIFACT_MANIFEST_FILENAME
+        if manifest_path.exists():
+            manifest_bytes = read_regular_file(manifest_path, parent=resolved_run_dir)
+            snapshot = load_server_artifact_snapshot(
+                resolved_run_dir, manifest_bytes=manifest_bytes
+            )
+            if snapshot.manifest.get("lifecycle") != "complete":
+                manifest_path = write_server_artifact_manifest(
+                    resolved_run_dir, finalized=True
+                )
+                manifest_bytes = read_regular_file(
+                    manifest_path, parent=resolved_run_dir
+                )
+        else:
+            manifest_path = write_server_artifact_manifest(
+                resolved_run_dir, finalized=True
+            )
+            manifest_bytes = read_regular_file(manifest_path, parent=resolved_run_dir)
         index = {
             "schema_version": ARTIFACT_SCHEMA_VERSION,
             "run_id": resolved_run_dir.name,
-            "artifact_manifest_checksum": sha256_bytes(
-                read_regular_file(manifest_path, parent=resolved_run_dir)
-            ),
+            "artifact_manifest_checksum": sha256_bytes(manifest_bytes),
         }
         return write_json_atomically(root / CURRENT_RUN_FILENAME, index)
 

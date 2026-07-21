@@ -19,8 +19,12 @@ from keras.layers import TextVectorization
 import tensorflow as tf
 
 from src.app_manifest import load_app_manifest
-from src.artifact_history import load_current_run_snapshot
-from src.artifact_compatibility import load_server_artifact_snapshot
+from src.artifact_history import CURRENT_RUN_FILENAME, load_current_run_snapshot
+from src.artifact_compatibility import (
+    SERVER_ARTIFACT_MANIFEST_FILENAME,
+    SERVER_ARTIFACTS,
+    load_server_artifact_snapshot,
+)
 from src.paths import default_public_artifact_dir, default_server_artifact_dir
 
 
@@ -28,6 +32,33 @@ PUBLIC_ARTIFACT_DIR: Path = default_public_artifact_dir()
 ARTIFACT_ROOT: Path = default_server_artifact_dir()
 DEFAULT_REFRESH_SECONDS = 6
 IDLE_STOP_AFTER = 7
+
+
+def _is_fresh_artifact_root(root: Path) -> bool:
+    """Return whether no current or legacy server artifacts exist.
+
+    Parameters
+    ----------
+    root : pathlib.Path
+        Configured server artifact root.
+
+    Returns
+    -------
+    bool
+        ``True`` only for an absent or artifact-empty regular directory.
+    """
+    if root.is_symlink() or (root.exists() and not root.is_dir()):
+        return False
+    filenames = {
+        CURRENT_RUN_FILENAME,
+        SERVER_ARTIFACT_MANIFEST_FILENAME,
+        "run_manifest.json",
+        *(str(layout["filename"]) for layout in SERVER_ARTIFACTS.values()),
+    }
+    return not any(
+        (root / filename).exists() or (root / filename).is_symlink()
+        for filename in filenames
+    )
 
 
 def load_model(path: Path | None = None) -> Any:
@@ -110,6 +141,8 @@ def load_metrics(
     ValueError
         If the server artifact schema is unsupported.
     """
+    if path is None and _is_fresh_artifact_root(ARTIFACT_ROOT):
+        return None
     snapshot = (
         load_current_run_snapshot(ARTIFACT_ROOT)
         if path is None

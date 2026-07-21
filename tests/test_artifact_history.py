@@ -216,6 +216,37 @@ class ArtifactHistoryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cannot be finalized again"):
                 publish_completed_run(root, run)
 
+    def test_finalization_recovers_after_current_index_write_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+
+            with (
+                patch(
+                    "src.artifact_history.write_json_atomically",
+                    side_effect=OSError("simulated current-index write failure"),
+                ),
+                self.assertRaisesRegex(OSError, "current-index write failure"),
+            ):
+                publish_completed_run(root, run)
+
+            manifest_path = run / "artifact_manifest.json"
+            manifest_bytes = manifest_path.read_bytes()
+            metrics_path = run / "metrics.csv"
+            metrics_bytes = metrics_path.read_bytes()
+            self.assertFalse((root / "current.json").exists())
+
+            metrics_path.write_bytes(b"corrupt")
+            with self.assertRaisesRegex(ValueError, "checksum does not match"):
+                publish_completed_run(root, run)
+            metrics_path.write_bytes(metrics_bytes)
+            publish_completed_run(root, run)
+
+            self.assertEqual(manifest_path.read_bytes(), manifest_bytes)
+            self.assertEqual(resolve_current_run_dir(root), run.resolve())
+            with self.assertRaisesRegex(ValueError, "cannot be finalized again"):
+                publish_completed_run(root, run)
+
     def test_concurrent_finalization_has_exactly_one_publisher(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

@@ -29,6 +29,29 @@ def write_server_manifest(path: Path, version: int | None) -> None:
 
 
 class DashboardArtifactTests(unittest.TestCase):
+    def test_metrics_loader_treats_only_a_fresh_root_as_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with patch.object(dashboard, "ARTIFACT_ROOT", root):
+                self.assertIsNone(dashboard.load_metrics())
+
+            (root / "metrics.csv").write_text(
+                "malformed legacy state", encoding="utf-8"
+            )
+            with (
+                patch.object(dashboard, "ARTIFACT_ROOT", root),
+                self.assertRaisesRegex(ValueError, "no valid schema_version"),
+            ):
+                dashboard.load_metrics()
+
+            (root / "metrics.csv").unlink()
+            (root / "current.json").write_text("not-json", encoding="utf-8")
+            with (
+                patch.object(dashboard, "ARTIFACT_ROOT", root),
+                self.assertRaisesRegex(ValueError, "invalid current-run index"),
+            ):
+                dashboard.load_metrics()
+
     def test_model_loader_checks_each_schema_version_state(self) -> None:
         for version, error in ((None, "no valid"), (0, "older"), (2, "newer")):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as tmpdir:
