@@ -37,6 +37,50 @@ jobs:
       - run: uv run coverage run -m unittest discover -s tests -v
       - run: uv run coverage report
 
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Scan commits for secrets
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+          GITLEAKS_VERSION: 8.30.1
+      - name: Report dependency vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_SHOW_SUPPRESSED: "true"
+        with:
+          version: v0.72.0
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          vuln-type: library
+          skip-dirs: .venv
+          trivyignores: .trivyignore.yaml
+          format: table
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          exit-code: "0"
+      - name: Enforce dependency vulnerability threshold
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_SHOW_SUPPRESSED: "true"
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          vuln-type: library
+          skip-dirs: .venv
+          trivyignores: .trivyignore.yaml
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          skip-setup-trivy: true
+
   containers:
     runs-on: ubuntu-latest
     steps:
@@ -52,3 +96,29 @@ jobs:
           'from src.client_app import app as client_app;
           from src.server_app import app as server_app;
           assert client_app is not None and server_app is not None'
+      - name: Report container vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_SHOW_SUPPRESSED: "true"
+        with:
+          version: v0.72.0
+          image-ref: federated-machine-learning:latest
+          scanners: vuln
+          vuln-type: os,library
+          trivyignores: .trivyignore.yaml
+          format: table
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          exit-code: "0"
+      - name: Enforce container vulnerability threshold
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_SHOW_SUPPRESSED: "true"
+        with:
+          image-ref: federated-machine-learning:latest
+          scanners: vuln
+          vuln-type: os,library
+          trivyignores: .trivyignore.yaml
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          skip-setup-trivy: true

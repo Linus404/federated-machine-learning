@@ -1,0 +1,22 @@
+vulnerabilities:
+  - id: GHSA-537c-gmf6-5ccf
+    purls:
+      - pkg:pypi/cryptography@46.0.7
+    expired_at: 2026-08-21
+    statement: >-
+      Flower 1.32.1 requires cryptography below 47.0.0, while the first fixed
+      release is 48.0.1. Re-evaluate when Flower permits cryptography 48.
+  - id: CVE-2026-54512
+    purls:
+      - pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.18.6
+    expired_at: 2026-08-21
+    statement: >-
+      Flower 1.32.1 pins Ray 2.55.1, whose ray_dist.jar bundles this Jackson
+      release. Re-evaluate when Flower permits a Ray release with the fix.
+  - id: CVE-2026-54513
+    purls:
+      - pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.18.6
+    expired_at: 2026-08-21
+    statement: >-
+      Flower 1.32.1 pins Ray 2.55.1, whose ray_dist.jar bundles this Jackson
+      release. Re-evaluate when Flower permits a Ray release with the fix.
