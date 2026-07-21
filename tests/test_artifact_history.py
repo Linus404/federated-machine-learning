@@ -1,6 +1,10 @@
 import json
+import os
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -211,6 +215,74 @@ class ArtifactHistoryTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "cannot be finalized again"):
                 publish_completed_run(root, run)
+
+    def test_concurrent_finalization_has_exactly_one_publisher(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            start = threading.Barrier(2)
+            first_write = threading.Event()
+            release_write = threading.Event()
+            errors: list[BaseException] = []
+
+            from src import artifact_compatibility
+
+            write_json_atomically = artifact_compatibility.write_json_atomically
+
+            def delayed_write(path, payload, *, overwrite=True):
+                if (
+                    path.name == "artifact_manifest.json"
+                    and payload.get("lifecycle") == "complete"
+                    and not first_write.is_set()
+                ):
+                    first_write.set()
+                    release_write.wait(timeout=2)
+                return write_json_atomically(path, payload, overwrite=overwrite)
+
+            def publish() -> Path | None:
+                start.wait()
+                try:
+                    return publish_completed_run(root, run)
+                except BaseException as error:
+                    errors.append(error)
+                    return None
+
+            with (
+                patch(
+                    "src.artifact_compatibility.write_json_atomically",
+                    side_effect=delayed_write,
+                ),
+                ThreadPoolExecutor(max_workers=2) as executor,
+            ):
+                futures = [executor.submit(publish) for _ in range(2)]
+                self.assertTrue(first_write.wait(timeout=2))
+                time.sleep(0.05)
+                release_write.set()
+                results = [future.result(timeout=2) for future in futures]
+
+            self.assertEqual(sum(result is not None for result in results), 1)
+            self.assertEqual(len(errors), 1)
+            self.assertRegex(str(errors[0]), "cannot be finalized again")
+            manifest = json.loads(
+                (run / "artifact_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["lifecycle"], "complete")
+            self.assertEqual(resolve_current_run_dir(root), run.resolve())
+
+    def test_retention_refuses_hardlinked_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            candidate = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            current = create_run(root, RUN_IDS[1], "2026-01-02T00:00:00Z")
+            publish_completed_run(root, current)
+            try:
+                os.link(candidate / "run_manifest.json", root / "provenance-copy.json")
+            except OSError as error:
+                self.skipTest(f"hard links are unavailable: {error}")
+
+            self.assertEqual(prune_run_history(root, 1), [])
+            self.assertTrue(candidate.is_dir())
+            self.assertTrue(current.is_dir())
 
 
 if __name__ == "__main__":

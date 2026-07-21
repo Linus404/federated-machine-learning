@@ -487,13 +487,17 @@ def write_run_provenance_manifest(
     )
 
 
-def load_run_provenance_manifest(path: str | Path) -> Mapping[str, Any]:
+def load_run_provenance_manifest(
+    path: str | Path, *, manifest_bytes: bytes | None = None
+) -> Mapping[str, Any]:
     """Load and validate one training-run provenance manifest.
 
     Parameters
     ----------
     path : str or pathlib.Path
         Manifest path.
+    manifest_bytes : bytes or None, optional
+        Exact manifest bytes already read through a secure snapshot boundary.
 
     Returns
     -------
@@ -508,10 +512,14 @@ def load_run_provenance_manifest(path: str | Path) -> Mapping[str, Any]:
     manifest_path = Path(path)
     try:
         payload = validate_artifact_schema(
-            json.loads(manifest_path.read_text(encoding="utf-8")),
+            json.loads(
+                manifest_path.read_text(encoding="utf-8")
+                if manifest_bytes is None
+                else manifest_bytes.decode("utf-8")
+            ),
             "run provenance manifest",
         )
-    except (json.JSONDecodeError, OSError) as error:
+    except (UnicodeDecodeError, json.JSONDecodeError, OSError) as error:
         raise ValueError(f"invalid run provenance manifest: {manifest_path}") from error
     missing = REQUIRED_FIELDS - payload.keys()
     if missing:

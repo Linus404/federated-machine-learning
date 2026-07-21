@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-import json
 import hmac
+import json
+import os
 import shutil
+import stat
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 from src.artifact_compatibility import (
     ARTIFACT_SCHEMA_VERSION,
@@ -29,6 +32,55 @@ from src.run_provenance import (
 RUNS_DIRECTORY = "runs"
 CURRENT_RUN_FILENAME = "current.json"
 DEFAULT_ARTIFACT_RETENTION_RUNS = 10
+
+
+@contextmanager
+def _finalization_lock(artifact_root: Path, run_id: str) -> Iterator[None]:
+    """Serialize finalization attempts for one run across threads and processes.
+
+    Parameters
+    ----------
+    artifact_root : pathlib.Path
+        Canonical history root that owns the lock file.
+    run_id : str
+        Run identity used to isolate unrelated finalizations.
+
+    Yields
+    ------
+    None
+        Control while the exclusive finalization lock is held.
+
+    Raises
+    ------
+    ValueError
+        If the lock path is not a contained single-link regular file.
+    """
+    path = artifact_root / f".{run_id}.finalize.lock"
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise ValueError("run finalization lock is unsafe") from error
+    try:
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
+            raise ValueError("run finalization lock is unsafe")
+        if os.name == "nt":
+            import msvcrt
+
+            if os.lseek(descriptor, 0, os.SEEK_END) == 0:
+                os.write(descriptor, b"\0")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            locking = msvcrt.locking  # type: ignore[attr-defined]
+            lock_mode = msvcrt.LK_LOCK  # type: ignore[attr-defined]
+            locking(descriptor, lock_mode, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
 
 
 def _history_paths(artifact_root: str | Path) -> tuple[Path, Path]:
@@ -224,20 +276,23 @@ def publish_completed_run(artifact_root: str | Path, run_dir: str | Path) -> Pat
     expected_parent = runs_root.resolve(strict=True)
     if resolved_run_dir.parent != expected_parent:
         raise ValueError("run directory must be directly below the artifact runs root")
-    provenance_path = run_manifest_path(resolved_run_dir)
-    read_regular_file(provenance_path, parent=resolved_run_dir)
-    provenance = load_run_provenance_manifest(provenance_path)
-    if provenance["run_id"] != resolved_run_dir.name:
-        raise ValueError("run directory does not match its provenance run_id")
-    manifest_path = write_server_artifact_manifest(resolved_run_dir, finalized=True)
-    index = {
-        "schema_version": ARTIFACT_SCHEMA_VERSION,
-        "run_id": resolved_run_dir.name,
-        "artifact_manifest_checksum": sha256_bytes(
-            read_regular_file(manifest_path, parent=resolved_run_dir)
-        ),
-    }
-    return write_json_atomically(root / CURRENT_RUN_FILENAME, index)
+    with _finalization_lock(root, resolved_run_dir.name):
+        provenance_path = run_manifest_path(resolved_run_dir)
+        provenance_bytes = read_regular_file(provenance_path, parent=resolved_run_dir)
+        provenance = load_run_provenance_manifest(
+            provenance_path, manifest_bytes=provenance_bytes
+        )
+        if provenance["run_id"] != resolved_run_dir.name:
+            raise ValueError("run directory does not match its provenance run_id")
+        manifest_path = write_server_artifact_manifest(resolved_run_dir, finalized=True)
+        index = {
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "run_id": resolved_run_dir.name,
+            "artifact_manifest_checksum": sha256_bytes(
+                read_regular_file(manifest_path, parent=resolved_run_dir)
+            ),
+        }
+        return write_json_atomically(root / CURRENT_RUN_FILENAME, index)
 
 
 def prune_run_history(
@@ -290,11 +345,13 @@ def prune_run_history(
     for path in runs_root.iterdir():
         if not path.is_dir() or path.is_symlink():
             continue
-        manifest_path = run_manifest_path(path)
-        if manifest_path.is_symlink() or not manifest_path.is_file():
-            continue
         try:
-            manifest = load_run_provenance_manifest(manifest_path)
+            canonical_path = path.resolve(strict=True)
+            manifest_path = run_manifest_path(canonical_path)
+            manifest_bytes = read_regular_file(manifest_path, parent=canonical_path)
+            manifest = load_run_provenance_manifest(
+                manifest_path, manifest_bytes=manifest_bytes
+            )
         except ValueError:
             continue
         if manifest["run_id"] != path.name:
