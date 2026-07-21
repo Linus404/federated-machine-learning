@@ -96,6 +96,11 @@ def load_client_shard(
     """
     resolved_client_dir = resolve_dir(client_data_dir)
     metadata_path = resolved_client_dir / "client_metadata.json"
+    if not metadata_path.exists():
+        raise ValueError(
+            "client shard metadata has no valid schema_version; regenerate its "
+            "artifacts"
+        )
     validate_artifact_schema(
         json.loads(metadata_path.read_text(encoding="utf-8")), "client shard metadata"
     )
