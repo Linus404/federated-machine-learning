@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any
 
 import pandas as pd
 import streamlit as st
@@ -35,18 +35,26 @@ DEFAULT_REFRESH_SECONDS = 6
 IDLE_STOP_AFTER = 7
 
 
-class _PredictiveModel(Protocol):
-    def predict(self, x: Any, verbose: int = 0) -> Any: ...
+def load_model() -> Any:
+    """Load the trained global sentiment model.
 
+    Returns
+    -------
+    Any
+        Loaded Keras model.
 
-def load_model() -> _PredictiveModel:
+    Raises
+    ------
+    FileNotFoundError
+        If no trained model artifact exists.
+    """
     if not MODEL_PATH.exists():
         raise FileNotFoundError(
             f"Kein Modell gefunden unter {MODEL_PATH}. "
             "Bitte zuerst (federated) Training starten, damit der Server "
             "global_model.keras speichert."
         )
-    return cast(_PredictiveModel, keras.models.load_model(MODEL_PATH))
+    return keras.models.load_model(MODEL_PATH)
 
 
 @st.cache_resource

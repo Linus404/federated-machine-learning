@@ -187,33 +187,21 @@ def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> No
 
 
 class ArtifactFlowTests(unittest.TestCase):
-    def run_with_temp_dir(self, check) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            check(Path(tmpdir))
-
-    def test_public_manifest_loads_the_model_shape(self) -> None:
-        self.run_with_temp_dir(check_public_manifest_loads_the_model_shape)
-
-    def test_raw_client_packaging_keeps_every_sample_private(self) -> None:
-        self.run_with_temp_dir(check_raw_client_packaging_keeps_every_sample_private)
-
-    def test_client_tokenizes_its_raw_reviews_with_public_vocabulary(self) -> None:
-        self.run_with_temp_dir(
-            check_client_tokenizes_its_raw_reviews_with_public_vocabulary
+    def test_artifact_flow(self) -> None:
+        checks = (
+            check_public_manifest_loads_the_model_shape,
+            check_raw_client_packaging_keeps_every_sample_private,
+            check_client_tokenizes_its_raw_reviews_with_public_vocabulary,
+            check_client_loader_preserves_unicode_line_separator_in_review,
+            check_client_loader_preserves_control_character_in_vocabulary,
+            check_cli_prepares_all_artifacts_with_one_dataset_load,
         )
-
-    def test_client_loader_preserves_unicode_line_separator_in_review(self) -> None:
-        self.run_with_temp_dir(
-            check_client_loader_preserves_unicode_line_separator_in_review
-        )
-
-    def test_client_loader_preserves_control_character_in_vocabulary(self) -> None:
-        self.run_with_temp_dir(
-            check_client_loader_preserves_control_character_in_vocabulary
-        )
-
-    def test_cli_prepares_all_artifacts_with_one_dataset_load(self) -> None:
-        self.run_with_temp_dir(check_cli_prepares_all_artifacts_with_one_dataset_load)
+        for check in checks:
+            with (
+                self.subTest(check=check.__name__),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                check(Path(tmpdir))
 
 
 if __name__ == "__main__":
