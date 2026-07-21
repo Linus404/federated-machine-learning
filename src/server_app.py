@@ -17,6 +17,7 @@ from flwr.serverapp import ServerApp
 
 from src import parse_run_config_bool
 from src.app_manifest import load_app_manifest, resolve_public_artifact_dir
+from src.artifact_compatibility import write_server_artifact_manifest
 from src.huber_strategy import (
     DEFAULT_HUBER_THRESHOLD,
     _flatten,
@@ -70,6 +71,7 @@ class SentimentServer(FedProx):
         self.app_manifest = app_manifest
         self.huber_threshold = huber_threshold
         self.use_huber = use_huber
+        write_server_artifact_manifest(self.artifact_dir)
 
     @property
     def model_path(self) -> Path:

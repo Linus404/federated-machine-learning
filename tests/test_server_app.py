@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 from flwr.common import Context
 
 import src.server_app as server_app
+from src.artifact_compatibility import load_server_artifact_manifest
 
 
 class ServerStartupArtifactCleanupTests(unittest.TestCase):
@@ -160,6 +161,17 @@ class ServerStartupArtifactCleanupTests(unittest.TestCase):
 
 
 class MetricAggregationTests(unittest.TestCase):
+    def test_strategy_publishes_server_artifact_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(server_app.FedProx, "__init__", return_value=None):
+                server_app.SentimentServer(
+                    app_manifest=object(), artifact_dir=Path(tmpdir)
+                )
+
+            self.assertEqual(
+                load_server_artifact_manifest(Path(tmpdir))["schema_version"], 1
+            )
+
     def test_weighted_average_uses_num_examples(self) -> None:
         metrics = [
             (2, {"accuracy": 0.5}),

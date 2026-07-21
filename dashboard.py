@@ -17,6 +17,7 @@ from keras.layers import TextVectorization
 import tensorflow as tf
 
 from src.app_manifest import load_app_manifest
+from src.artifact_compatibility import load_server_artifact_manifest
 from src.paths import (
     client_metrics_path,
     default_public_artifact_dir,
@@ -54,6 +55,7 @@ def load_model() -> Any:
             "Bitte zuerst (federated) Training starten, damit der Server "
             "global_model.keras speichert."
         )
+    load_server_artifact_manifest(MODEL_PATH.parent)
     return keras.models.load_model(MODEL_PATH)
 
 
@@ -80,8 +82,26 @@ def load_vectorizer():
 
 
 def load_metrics(path: Path = METRICS_PATH) -> pd.DataFrame | None:
+    """Load metrics from a compatible server artifact directory.
+
+    Parameters
+    ----------
+    path : pathlib.Path, optional
+        Metrics CSV path.
+
+    Returns
+    -------
+    pandas.DataFrame or None
+        Non-empty metrics, or ``None`` when the CSV is absent or empty.
+
+    Raises
+    ------
+    ValueError
+        If the server artifact schema is unsupported.
+    """
     if not path.exists():
         return None
+    load_server_artifact_manifest(path.parent)
     try:
         df = pd.read_csv(path)
     except pd.errors.EmptyDataError:
