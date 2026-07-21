@@ -1,6 +1,8 @@
 # Federated Machine Learning
 
-Competing streaming platforms collect customer reviews. Each client represents one platform; clients jointly train a sentiment classifier while each platform's feedback data stays in-house.
+This research demo simulates competing streaming platforms that jointly train a
+sentiment classifier. The local data-preparation command centrally creates all
+demo shards; it does not demonstrate ingestion from independent data owners.
 
 ## Project setup
 
@@ -36,11 +38,19 @@ Prepare the raw client shards and shared public vocabulary:
 uv run python -m src.data_prep --partitions 4 --client-shard-dir artifacts/clients --public-artifact-dir artifacts/public
 ```
 
-This command loads IMDB once for the demo setup, creates one raw review/label
-directory per client, and publishes the shared vocabulary. Clients
-always tokenize their own reviews; no centrally tokenized partitions are generated.
-The server sees only model updates. The model uses a normal trainable embedding,
-not pretrained GloVe vectors or an embedding matrix.
+This command loads IMDB once on the operator's machine, reads the complete
+training split, creates every raw review/label shard, and publishes a vocabulary
+adapted on the complete split. The generated directories simulate client-scoped
+storage only after this centralized preparation; they are not evidence that data
+originated at or remained hidden within independent organizations. Clients
+tokenize their own mounted reviews, and no centrally tokenized partitions are
+generated.
+
+The server does not read raw shard files during training, but it receives each
+client's resulting model parameters, sample counts, training metrics, and
+per-client evaluation loss, accuracy, and client ID before or during aggregation.
+Those values can leak information about client data. The model uses a normal
+trainable embedding, not pretrained GloVe vectors or an embedding matrix.
 
 Train one client locally from its raw shard:
 
@@ -87,8 +97,8 @@ uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "
 
 The dashboard reads the completed run selected by the atomic `current.json` index
 under `FML_SERVER_ARTIFACT_DIR` and reads public artifacts from
-`FML_PUBLIC_ARTIFACT_DIR`. Deployed clients use `CLIENT_DATA_DIR` for their one
-mounted private shard.
+`FML_PUBLIC_ARTIFACT_DIR`. Each ClientApp uses `CLIENT_DATA_DIR` for its one
+mounted client-scoped shard.
 
 The server never clears its configured artifact root. It writes each experiment to
 `runs/<run_id>` and advances `current.json` only after the run has a model,
@@ -101,7 +111,11 @@ uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "
 uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "use-update-noise=true use-huber=false"
 ```
 
-`use-huber` enables the robust aggregation path for outlier-resistant experiments. `use-update-noise` enables a small illustrative client update-noise ablation; it is not a production differential-privacy guarantee.
+`use-huber` enables an experimental robust aggregation path for outlier-resistance
+experiments; it is not a Byzantine-security guarantee. `use-update-noise` is an
+illustrative ablation, not formal differential privacy: it has no privacy
+accountant or published epsilon/delta and must not be presented as a privacy
+guarantee.
 
 Every server run and the documented local-training command create an immutable
 `run_manifest.json` before training. It
@@ -112,8 +126,9 @@ seeds, and SHA-256 checksums for the public manifest and vocabulary. Each comple
 to their SHA-256 checksums, which consumers validate and snapshot before loading.
 Set
 `FML_CODE_REVISION` to the full Git object ID in images that do not contain `.git`.
-Private client datasets stay outside the server trust boundary, so their identity
-and checksums are not collected by the server manifest.
+Client shard identities and checksums are not collected by the server manifest.
+In this demo the operator still created all shards centrally; the boundary only
+describes what ServerApp reads at runtime.
 
 `artifact-retention-runs` defaults to `10`. Retention orders validated run
 manifests by `(created_at, run_id)`, keeps the newest configured count, and never
@@ -159,6 +174,16 @@ only its matching `artifacts/clients/client-N` shard as a read-only mount. Publi
 artifacts are read-only in every consuming service; only ServerApp can write
 `artifacts/server`, which the dashboard mounts read-only. Stop the runtime with
 `docker compose down`.
+
+### Security and privacy scope
+
+This repository does not implement TLS, client or SuperNode authentication,
+secure aggregation, or formal differential privacy. The dashboard has no
+application authentication. Model parameters, metrics, sample counts, and
+artifacts can leak information even though ServerApp does not read raw shard
+files. See the explicit [threat model](THREAT_MODEL.md) for assets, trust
+boundaries, attack surfaces, and requirements that must be met before production
+or privacy claims.
 
 ### Deployment scope
 

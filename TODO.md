@@ -35,15 +35,15 @@ federated learning system.
 
 ## P0 — Privacy and security claims
 
-- [ ] Write an explicit threat model covering trusted and untrusted components.
-- [ ] Clearly distinguish the synthetic demo's centralized shard preparation from real client-owned data.
-- [ ] Document what information model updates can leak.
+- [x] Write an explicit threat model covering trusted and untrusted components.
+- [x] Clearly distinguish the simulated demo's centralized shard preparation from real client-owned data.
+- [x] Document what information model updates can leak.
 - [ ] Add TLS for Flower communication.
 - [ ] Add SuperNode/client authentication and certificate lifecycle documentation.
 - [ ] Evaluate secure aggregation.
 - [ ] If differential privacy is claimed, implement formal privacy accounting and publish epsilon/delta values.
 - [ ] Add membership-inference and model-update leakage experiments.
-- [ ] Keep the current update-noise feature labeled as an illustrative ablation, not production differential privacy.
+- [x] Keep the current update-noise feature labeled as an illustrative ablation, not production differential privacy.
 
 ## P1 — Reliability and testing
 

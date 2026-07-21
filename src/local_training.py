@@ -87,7 +87,7 @@ def load_client_shard(
     manifest: AppManifest,
     validation_split: float = 0.2,
 ) -> PartitionSplit:
-    """Load raw private reviews and tokenize them inside the client process.
+    """Load client-scoped raw reviews and tokenize them in the client process.
 
     Parameters
     ----------
@@ -177,7 +177,7 @@ def build_model(
 
 
 def train(args: argparse.Namespace) -> tuple[Any, Any]:
-    """Train one model from a client's raw private shard.
+    """Train one model from a client-scoped raw shard.
 
     Parameters
     ----------

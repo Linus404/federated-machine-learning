@@ -379,7 +379,7 @@ def _dataset_metadata(public_artifact_dir: str | Path | None) -> dict[str, Any]:
     public_dir = resolve_dir(public_artifact_dir) if public_artifact_dir else None
     private_status = {
         "status": "not_collected",
-        "reason": "private client data is outside the server trust boundary",
+        "reason": "client shard identity is not collected by the server application",
     }
     if public_dir is None or not (public_dir / "manifest.json").exists():
         return {
