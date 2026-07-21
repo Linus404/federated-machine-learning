@@ -64,13 +64,13 @@ uv run flwr run . --stream --federation-config "num-supernodes=4"
 Run the dashboard against the selected server artifact directory:
 
 ```bash
-FML_SERVER_ARTIFACT_DIR=artifacts/baseline uv run streamlit run dashboard.py
+FML_SERVER_ARTIFACT_DIR=artifacts/server uv run streamlit run dashboard.py
 ```
 
 On PowerShell:
 
 ```powershell
-$env:FML_SERVER_ARTIFACT_DIR = "artifacts/baseline"
+$env:FML_SERVER_ARTIFACT_DIR = "artifacts/server"
 uv run streamlit run dashboard.py
 ```
 

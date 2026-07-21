@@ -95,6 +95,16 @@ class ScientificContractTests(unittest.TestCase):
             },
         )
 
+    def test_dashboard_documentation_uses_default_server_artifact_dir(self) -> None:
+        config = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))[
+            "tool"
+        ]["flwr"]["app"]["config"]
+        artifact_dir = config["server-artifact-dir"]
+        readme = Path("README.md").read_text(encoding="utf-8")
+
+        self.assertIn(f"FML_SERVER_ARTIFACT_DIR={artifact_dir} ", readme)
+        self.assertIn(f'$env:FML_SERVER_ARTIFACT_DIR = "{artifact_dir}"', readme)
+
     def test_huber_aggregation_result_is_stable(self) -> None:
         result = huber_aggregate(
             [np.asarray([0.0]), np.asarray([1.0]), np.asarray([100.0])],
