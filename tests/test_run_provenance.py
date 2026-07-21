@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from src.artifact_compatibility import ARTIFACT_SCHEMA_VERSION
 from src.run_provenance import (
+    _code_revision,
     load_run_provenance_manifest,
     write_run_provenance_manifest,
 )
@@ -28,6 +29,30 @@ def write_public_dataset_contract(path: Path) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def runtime_environment() -> dict[str, object]:
+    """Return complete deterministic runtime metadata.
+
+    Returns
+    -------
+    dict of str to object
+        Valid environment metadata for provenance tests.
+    """
+    return {
+        "python_version": "3.12.1",
+        "python_implementation": "CPython",
+        "operating_system": "Linux",
+        "operating_system_release": "6.1",
+        "machine": "x86_64",
+        "packages": {
+            "datasets": "4.8.5",
+            "flwr": "1.29.0",
+            "keras": "3.14.0",
+            "numpy": "2.2.0",
+            "tensorflow": "2.20.0",
+        },
+    }
 
 
 class RunProvenanceTests(unittest.TestCase):
@@ -52,11 +77,15 @@ class RunProvenanceTests(unittest.TestCase):
                 ),
                 patch(
                     "src.run_provenance._code_revision",
-                    return_value={"commit": "a" * 40, "dirty": False},
+                    return_value={
+                        "commit": "a" * 40,
+                        "dirty": False,
+                        "source": "git",
+                    },
                 ),
                 patch(
                     "src.run_provenance._environment_metadata",
-                    return_value={"python": "3.12.1"},
+                    return_value=runtime_environment(),
                 ),
             ):
                 manifest_path = write_run_provenance_manifest(
@@ -81,7 +110,7 @@ class RunProvenanceTests(unittest.TestCase):
                     "use-huber": True,
                 },
             )
-            self.assertEqual(payload["environment"], {"python": "3.12.1"})
+            self.assertEqual(payload["environment"], runtime_environment())
             self.assertEqual(payload["code_revision"]["commit"], "a" * 40)
             self.assertEqual(payload["seeds"]["run_config"], {"random-seed": 19})
             self.assertEqual(
@@ -111,9 +140,16 @@ class RunProvenanceTests(unittest.TestCase):
                 ),
                 patch(
                     "src.run_provenance._code_revision",
-                    return_value={"commit": None, "dirty": None},
+                    return_value={
+                        "commit": None,
+                        "dirty": None,
+                        "source": "unavailable",
+                    },
                 ),
-                patch("src.run_provenance._environment_metadata", return_value={}),
+                patch(
+                    "src.run_provenance._environment_metadata",
+                    return_value=runtime_environment(),
+                ),
             ):
                 manifest_path = write_run_provenance_manifest(path, {})
                 with self.assertRaises(FileExistsError):
@@ -130,9 +166,16 @@ class RunProvenanceTests(unittest.TestCase):
             with (
                 patch(
                     "src.run_provenance._code_revision",
-                    return_value={"commit": None, "dirty": None, "source": "test"},
+                    return_value={
+                        "commit": None,
+                        "dirty": None,
+                        "source": "unavailable",
+                    },
                 ),
-                patch("src.run_provenance._environment_metadata", return_value={}),
+                patch(
+                    "src.run_provenance._environment_metadata",
+                    return_value=runtime_environment(),
+                ),
             ):
                 first = load_run_provenance_manifest(
                     write_run_provenance_manifest(root / "first", {})
@@ -162,6 +205,63 @@ class RunProvenanceTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "missing"):
                 load_run_provenance_manifest(path)
+
+    def test_loader_rejects_missing_and_invalid_nested_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with (
+                patch(
+                    "src.run_provenance._code_revision",
+                    return_value={
+                        "commit": "a" * 40,
+                        "dirty": False,
+                        "source": "git",
+                    },
+                ),
+                patch(
+                    "src.run_provenance._environment_metadata",
+                    return_value=runtime_environment(),
+                ),
+            ):
+                payload = dict(
+                    load_run_provenance_manifest(
+                        write_run_provenance_manifest(root / "valid", {})
+                    )
+                )
+
+            invalid_values = {
+                "environment": {**payload["environment"], "packages": []},
+                "code_revision": {**payload["code_revision"], "dirty": "false"},
+                "seeds": {**payload["seeds"], "code_defaults": {}},
+                "dataset": {
+                    **payload["dataset"],
+                    "private_client_shards": {"status": "not_collected"},
+                },
+            }
+            for field, invalid_value in invalid_values.items():
+                with self.subTest(field=field):
+                    manifest_path = root / f"invalid-{field}.json"
+                    manifest_path.write_text(
+                        json.dumps({**payload, field: invalid_value}), encoding="utf-8"
+                    )
+                    with self.assertRaisesRegex(ValueError, field):
+                        load_run_provenance_manifest(manifest_path)
+
+    def test_git_revision_marks_untracked_files_dirty(self) -> None:
+        completed = [
+            type("Result", (), {"stdout": "a" * 40 + "\n"})(),
+            type("Result", (), {"stdout": "?? untracked.txt\n"})(),
+        ]
+        with (
+            patch.dict("src.run_provenance.os.environ", {}, clear=True),
+            patch("src.run_provenance.subprocess.run", side_effect=completed) as run,
+        ):
+            revision = _code_revision()
+
+        self.assertTrue(revision["dirty"])
+        self.assertEqual(
+            run.call_args_list[1].args[0], ["git", "status", "--porcelain"]
+        )
 
 
 if __name__ == "__main__":

@@ -29,9 +29,9 @@ federated learning system.
 - [ ] Publish reproducible commands and a results table in the README.
 - [ ] Store the code version, run configuration, dataset version, seeds, and artifact checksums for every experiment.
   - Partial: each run now records code/configuration/environment metadata, known
-    seeds, and public-artifact checksums. Experiment-level dataset identities and
-    complete artifact checksums remain part of the fixed-test-set and published
-    experiment work.
+    seeds, and public-artifact checksums, including the documented local-training
+    path. Experiment-level dataset identities and complete artifact checksums remain
+    part of the fixed-test-set and published experiment work.
 
 ## P0 — Privacy and security claims
 

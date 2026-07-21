@@ -20,8 +20,7 @@ from src.artifact_compatibility import (
     validate_artifact_schema,
     write_json_atomically,
 )
-from src.contracts import DEFAULT_SPLIT_SEED
-from src.local_training import DEFAULT_VALIDATION_SEED
+from src.contracts import DEFAULT_SPLIT_SEED, DEFAULT_VALIDATION_SEED
 from src.paths import resolve_dir, run_manifest_path
 
 CODE_REVISION_ENV = "FML_CODE_REVISION"
@@ -36,6 +35,218 @@ REQUIRED_FIELDS = {
     "seeds",
     "dataset",
 }
+ENVIRONMENT_FIELDS = {
+    "python_version",
+    "python_implementation",
+    "operating_system",
+    "operating_system_release",
+    "machine",
+    "packages",
+}
+
+
+def _required_nested_fields(
+    value: Mapping[str, Any], required: set[str], field: str
+) -> None:
+    """Require nested manifest fields.
+
+    Parameters
+    ----------
+    value : mapping of str to Any
+        Nested manifest object.
+    required : set of str
+        Required keys.
+    field : str
+        Dotted field name used in validation errors.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If a required key is absent.
+    """
+    missing = required - value.keys()
+    if missing:
+        raise ValueError(
+            f"run provenance manifest is missing {field}: " + ", ".join(sorted(missing))
+        )
+
+
+def _validate_environment(environment: Mapping[str, Any]) -> None:
+    """Validate recorded runtime metadata.
+
+    Parameters
+    ----------
+    environment : mapping of str to Any
+        Runtime metadata from the manifest.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If required runtime metadata is missing or malformed.
+    """
+    _required_nested_fields(environment, ENVIRONMENT_FIELDS, "environment")
+    for field in ENVIRONMENT_FIELDS - {"packages"}:
+        if not isinstance(environment[field], str):
+            raise ValueError(
+                f"run provenance manifest has an invalid environment.{field}"
+            )
+    packages = environment["packages"]
+    if not isinstance(packages, Mapping):
+        raise ValueError("run provenance manifest has an invalid environment.packages")
+    _required_nested_fields(packages, set(RUNTIME_PACKAGES), "environment.packages")
+    if any(
+        not isinstance(name, str)
+        or not name
+        or (version is not None and not isinstance(version, str))
+        for name, version in packages.items()
+    ):
+        raise ValueError("run provenance manifest has an invalid environment.packages")
+
+
+def _validate_code_revision(code_revision: Mapping[str, Any]) -> None:
+    """Validate source-revision evidence.
+
+    Parameters
+    ----------
+    code_revision : mapping of str to Any
+        Source revision object from the manifest.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If revision evidence is missing, malformed, or inconsistent.
+    """
+    _required_nested_fields(
+        code_revision, {"commit", "dirty", "source"}, "code_revision"
+    )
+    commit = code_revision["commit"]
+    dirty = code_revision["dirty"]
+    source = code_revision["source"]
+    if commit is not None and (
+        not isinstance(commit, str)
+        or len(commit) not in (40, 64)
+        or any(character not in "0123456789abcdef" for character in commit)
+    ):
+        raise ValueError("run provenance manifest has an invalid code_revision.commit")
+    if dirty is not None and type(dirty) is not bool:
+        raise ValueError("run provenance manifest has an invalid code_revision.dirty")
+    if source not in {"git", CODE_REVISION_ENV, "unavailable"}:
+        raise ValueError("run provenance manifest has an invalid code_revision.source")
+    if source == "git" and (commit is None or dirty is None):
+        raise ValueError("run provenance manifest has inconsistent code_revision")
+    if source == CODE_REVISION_ENV and (commit is None or dirty is not None):
+        raise ValueError("run provenance manifest has inconsistent code_revision")
+    if source == "unavailable" and (commit is not None or dirty is not None):
+        raise ValueError("run provenance manifest has inconsistent code_revision")
+
+
+def _validate_seeds(seeds: Mapping[str, Any]) -> None:
+    """Validate recorded run and code-default seeds.
+
+    Parameters
+    ----------
+    seeds : mapping of str to Any
+        Seed metadata from the manifest.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If seed metadata is missing or malformed.
+    """
+    _required_nested_fields(seeds, {"run_config", "code_defaults"}, "seeds")
+    run_config = seeds["run_config"]
+    code_defaults = seeds["code_defaults"]
+    if not isinstance(run_config, Mapping):
+        raise ValueError("run provenance manifest has an invalid seeds.run_config")
+    _canonical_run_config(run_config)
+    if any("seed" not in key.lower() for key in run_config):
+        raise ValueError("run provenance manifest has an invalid seeds.run_config")
+    if not isinstance(code_defaults, Mapping):
+        raise ValueError("run provenance manifest has an invalid seeds.code_defaults")
+    _required_nested_fields(
+        code_defaults,
+        {"client_validation_split", "data_partition"},
+        "seeds.code_defaults",
+    )
+    if any(type(code_defaults[key]) is not int for key in code_defaults):
+        raise ValueError("run provenance manifest has an invalid seeds.code_defaults")
+
+
+def _validate_dataset(dataset: Mapping[str, Any]) -> None:
+    """Validate public-dataset provenance and the private-data boundary.
+
+    Parameters
+    ----------
+    dataset : mapping of str to Any
+        Dataset metadata from the manifest.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If dataset provenance is missing or malformed.
+    """
+    _required_nested_fields(
+        dataset,
+        {"identity", "checksums", "status", "private_client_shards"},
+        "dataset",
+    )
+    identity = dataset["identity"]
+    checksums = dataset["checksums"]
+    status = dataset["status"]
+    private_shards = dataset["private_client_shards"]
+    if identity is not None and (not isinstance(identity, str) or not identity):
+        raise ValueError("run provenance manifest has an invalid dataset.identity")
+    if not isinstance(checksums, Mapping) or any(
+        not isinstance(name, str)
+        or not name
+        or not isinstance(checksum, str)
+        or not checksum.startswith("sha256:")
+        or len(checksum) != 71
+        or any(character not in "0123456789abcdef" for character in checksum[7:])
+        for name, checksum in checksums.items()
+    ):
+        raise ValueError("run provenance manifest has an invalid dataset.checksums")
+    if status not in {"available", "unavailable"}:
+        raise ValueError("run provenance manifest has an invalid dataset.status")
+    if status == "available" and (identity is None or not checksums):
+        raise ValueError("run provenance manifest has inconsistent dataset metadata")
+    if status == "unavailable" and (identity is not None or checksums):
+        raise ValueError("run provenance manifest has inconsistent dataset metadata")
+    if not isinstance(private_shards, Mapping):
+        raise ValueError(
+            "run provenance manifest has an invalid dataset.private_client_shards"
+        )
+    _required_nested_fields(
+        private_shards, {"status", "reason"}, "dataset.private_client_shards"
+    )
+    if (
+        private_shards["status"] != "not_collected"
+        or not isinstance(private_shards["reason"], str)
+        or not private_shards["reason"]
+    ):
+        raise ValueError(
+            "run provenance manifest has an invalid dataset.private_client_shards"
+        )
 
 
 def _sha256(path: Path) -> str:
@@ -148,7 +359,7 @@ def _code_revision() -> dict[str, Any]:
             text=True,
         ).stdout.strip()
         status = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=no"],
+            ["git", "status", "--porcelain"],
             check=True,
             capture_output=True,
             text=True,
@@ -249,7 +460,7 @@ def write_run_provenance_manifest(
         "+00:00", "Z"
     )
     seed_config = {key: value for key, value in config.items() if "seed" in key.lower()}
-    payload = {
+    payload: dict[str, Any] = {
         "schema_version": ARTIFACT_SCHEMA_VERSION,
         "run_id": str(uuid.uuid4()),
         "flower_run_id": flower_run_id,
@@ -266,6 +477,10 @@ def write_run_provenance_manifest(
         },
         "dataset": _dataset_metadata(public_artifact_dir),
     }
+    _validate_environment(payload["environment"])
+    _validate_code_revision(payload["code_revision"])
+    _validate_seeds(payload["seeds"])
+    _validate_dataset(payload["dataset"])
     return write_json_atomically(
         run_manifest_path(artifact_dir),
         payload,
@@ -330,4 +545,8 @@ def load_run_provenance_manifest(path: str | Path) -> Mapping[str, Any]:
         if not isinstance(payload[field], Mapping):
             raise ValueError(f"run provenance manifest has an invalid {field}")
     _canonical_run_config(payload["run_config"])
+    _validate_environment(payload["environment"])
+    _validate_code_revision(payload["code_revision"])
+    _validate_seeds(payload["seeds"])
+    _validate_dataset(payload["dataset"])
     return payload

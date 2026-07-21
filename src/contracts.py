@@ -9,6 +9,7 @@ import numpy as np
 from src.artifact_compatibility import ARTIFACT_SCHEMA_VERSION
 
 DEFAULT_SPLIT_SEED = 67
+DEFAULT_VALIDATION_SEED = 67
 DEFAULT_DIRICHLET_ALPHA = 0.5
 
 

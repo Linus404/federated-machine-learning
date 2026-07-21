@@ -45,8 +45,11 @@ not pretrained GloVe vectors or an embedding matrix.
 Train one client locally from its raw shard:
 
 ```bash
-uv run python -m src.local_training --client-data-dir artifacts/clients/client-0 --public-artifact-dir artifacts/public
+uv run python -m src.local_training --client-data-dir artifacts/clients/client-0 --public-artifact-dir artifacts/public --run-artifact-dir artifacts/local-run
 ```
+
+The local command requires a new run-artifact directory and writes its immutable
+`run_manifest.json` before training. Choose another empty directory for each run.
 
 ## Direct Flower simulation
 
@@ -95,7 +98,8 @@ uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "
 
 `use-huber` enables the robust aggregation path for outlier-resistant experiments. `use-update-noise` enables a small illustrative client update-noise ablation; it is not a production differential-privacy guarantee.
 
-Every server run creates an immutable `run_manifest.json` before training. It
+Every server run and the documented local-training command create an immutable
+`run_manifest.json` before training. It
 contains a UUID, the Flower run ID, creation time, complete run configuration,
 Python/OS/package versions, Git revision and worktree state when available, known
 seeds, and SHA-256 checksums for the public manifest and vocabulary. Set
