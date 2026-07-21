@@ -10,7 +10,7 @@ federated learning system.
 - [x] Add type checking and enforce it in CI.
 - [x] Measure test coverage and define a meaningful minimum coverage threshold.
 - [x] Add Docker build and Compose validation smoke tests to CI.
-- [ ] Add dependency, secret, and container vulnerability scanning.
+- [x] Add dependency, secret, and container vulnerability scanning.
 - [ ] Choose an open-source license and add a `LICENSE` file.
 - [x] Add `CONTRIBUTING.md`, `SECURITY.md`, and pull-request/issue templates.
 - [x] Move notebook-only dependencies such as `ipykernel` and `nbformat` out of runtime dependencies.

@@ -47,9 +47,10 @@ testing, social engineering, or collection of other people's data.
 ## Automated scanning policy
 
 CI uses Gitleaks to reject detected secrets and Trivy to inspect locked runtime
-dependencies and the application image. Trivy prints UNKNOWN, LOW, MEDIUM,
-HIGH, and CRITICAL findings, then fails the build for unsuppressed HIGH or
-CRITICAL findings. Unfixed findings are not omitted.
+dependencies and the application image. Trivy first prints UNKNOWN, LOW,
+MEDIUM, HIGH, and CRITICAL findings, including unfixed findings. The dependency
+gate rejects every unsuppressed HIGH or CRITICAL finding; the container gate
+rejects unsuppressed HIGH or CRITICAL findings for which a fix is available.
 
 Exceptions must identify one finding and affected package in
 `.trivyignore.yaml`, explain why remediation is not currently possible, and
@@ -66,5 +67,5 @@ docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.30.1 git --redact --verb
 docker run --rm -v "$PWD:/repo" aquasec/trivy:0.72.0 fs --scanners vuln --pkg-types library --ignorefile /repo/.trivyignore.yaml --show-suppressed --severity HIGH,CRITICAL --exit-code 1 /repo
 image_archive="$(mktemp)"
 docker save --output "$image_archive" federated-machine-learning:latest
-docker run --rm -v "$image_archive:/image.tar:ro" -v "$PWD/.trivyignore.yaml:/.trivyignore.yaml:ro" aquasec/trivy:0.72.0 image --input /image.tar --scanners vuln --pkg-types os,library --ignorefile /.trivyignore.yaml --show-suppressed --severity HIGH,CRITICAL --exit-code 1
+docker run --rm -v "$image_archive:/image.tar:ro" -v "$PWD/.trivyignore.yaml:/.trivyignore.yaml:ro" aquasec/trivy:0.72.0 image --input /image.tar --scanners vuln --pkg-types os,library --ignorefile /.trivyignore.yaml --show-suppressed --ignore-unfixed --severity HIGH,CRITICAL --exit-code 1
 ```

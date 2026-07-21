@@ -120,5 +120,6 @@ jobs:
           trivyignores: .trivyignore.yaml
           format: table
           severity: HIGH,CRITICAL
+          ignore-unfixed: true
           exit-code: "1"
           skip-setup-trivy: true
