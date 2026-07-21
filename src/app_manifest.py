@@ -30,14 +30,20 @@ def resolve_public_artifact_dir(config=None, *, public_artifact_dir=None) -> Pat
     return resolve_dir(value) if value else default_public_artifact_dir()
 
 
-def load_app_manifest(
-    config=None,
-    *,
-    public_artifact_dir=None,
-) -> AppManifest:
-    public_dir = resolve_public_artifact_dir(
-        config, public_artifact_dir=public_artifact_dir
-    )
+def load_app_manifest(*, public_artifact_dir=None) -> AppManifest:
+    """Load the public model and vocabulary manifest.
+
+    Parameters
+    ----------
+    public_artifact_dir : str or pathlib.Path, optional
+        Directory containing ``manifest.json`` and the shared vocabulary.
+
+    Returns
+    -------
+    AppManifest
+        Validated manifest payload and vocabulary path.
+    """
+    public_dir = resolve_public_artifact_dir(public_artifact_dir=public_artifact_dir)
     path = public_dir / "manifest.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
 
