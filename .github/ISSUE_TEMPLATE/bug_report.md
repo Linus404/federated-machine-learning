@@ -32,4 +32,4 @@ Paste the complete error and relevant logs inside a code block.
 Include configuration or artifact details needed to reproduce the problem.
 
 > Suspected vulnerability? Stop and follow the private reporting process in
-> [`SECURITY.md`](../../SECURITY.md) instead.
+> [`SECURITY.md`](../security/policy) instead.
