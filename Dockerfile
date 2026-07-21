@@ -14,6 +14,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get upgrade --yes \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY pyproject.toml uv.lock dashboard.py ./
 RUN uv sync --frozen --no-dev
 
