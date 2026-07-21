@@ -153,6 +153,7 @@ def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> No
     client_dir.mkdir()
     (public_dir / "keep.txt").write_text("keep", encoding="utf-8")
     (client_dir / "keep.txt").write_text("keep", encoding="utf-8")
+    (client_dir / "client-0.tar.gz").write_bytes(b"legacy private shard")
     texts = np.asarray([f"Review {index} good movie" for index in range(12)])
     labels = np.asarray([index % 2 for index in range(12)], dtype="int32")
 

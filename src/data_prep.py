@@ -113,6 +113,8 @@ def package_raw_client_shards(
 
     output_path = resolve_dir(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+    for legacy_archive in output_path.glob("client-*.tar.gz"):
+        legacy_archive.unlink()
     checksum = manifest_checksum or _checksum(
         manifest
         or {
