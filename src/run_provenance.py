@@ -311,16 +311,25 @@ def _environment_metadata() -> dict[str, Any]:
     dict of str to Any
         Python, operating-system, architecture, and package versions.
     """
+    operating_system = platform.system()
     packages: dict[str, str | None] = {}
     for package in RUNTIME_PACKAGES:
-        try:
-            packages[package] = importlib.metadata.version(package)
-        except importlib.metadata.PackageNotFoundError:
-            packages[package] = None
+        distributions = (
+            ("tensorflow", "tensorflow-cpu")
+            if package == "tensorflow" and operating_system == "Linux"
+            else (package,)
+        )
+        packages[package] = None
+        for distribution in distributions:
+            try:
+                packages[package] = importlib.metadata.version(distribution)
+                break
+            except importlib.metadata.PackageNotFoundError:
+                continue
     return {
         "python_version": platform.python_version(),
         "python_implementation": platform.python_implementation(),
-        "operating_system": platform.system(),
+        "operating_system": operating_system,
         "operating_system_release": platform.release(),
         "machine": platform.machine(),
         "packages": packages,

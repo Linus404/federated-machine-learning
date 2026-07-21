@@ -1,4 +1,5 @@
 import hashlib
+import importlib.metadata
 import json
 import tempfile
 import unittest
@@ -8,6 +9,7 @@ from unittest.mock import patch
 from src.artifact_compatibility import ARTIFACT_SCHEMA_VERSION
 from src.run_provenance import (
     _code_revision,
+    _environment_metadata,
     load_run_provenance_manifest,
     write_run_provenance_manifest,
 )
@@ -56,6 +58,52 @@ def runtime_environment() -> dict[str, object]:
 
 
 class RunProvenanceTests(unittest.TestCase):
+    def test_linux_environment_uses_tensorflow_cpu_distribution_version(self) -> None:
+        versions = {
+            "datasets": "4.8.5",
+            "flwr": "1.29.0",
+            "keras": "3.14.0",
+            "numpy": "2.2.0",
+            "tensorflow-cpu": "2.20.0",
+        }
+
+        def distribution_version(name: str) -> str:
+            if name not in versions:
+                raise importlib.metadata.PackageNotFoundError(name)
+            return versions[name]
+
+        with (
+            patch("src.run_provenance.platform.system", return_value="Linux"),
+            patch(
+                "src.run_provenance.importlib.metadata.version",
+                side_effect=distribution_version,
+            ) as version,
+        ):
+            environment = _environment_metadata()
+
+        self.assertEqual(environment["packages"]["tensorflow"], "2.20.0")
+        self.assertIn(unittest.mock.call("tensorflow-cpu"), version.call_args_list)
+
+    def test_non_linux_environment_does_not_use_tensorflow_cpu_distribution(
+        self,
+    ) -> None:
+        def distribution_version(name: str) -> str:
+            if name == "tensorflow":
+                raise importlib.metadata.PackageNotFoundError(name)
+            return "1.0"
+
+        with (
+            patch("src.run_provenance.platform.system", return_value="Darwin"),
+            patch(
+                "src.run_provenance.importlib.metadata.version",
+                side_effect=distribution_version,
+            ) as version,
+        ):
+            environment = _environment_metadata()
+
+        self.assertIsNone(environment["packages"]["tensorflow"])
+        self.assertNotIn(unittest.mock.call("tensorflow-cpu"), version.call_args_list)
+
     def test_manifest_records_run_inputs_and_public_dataset_checksums(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
