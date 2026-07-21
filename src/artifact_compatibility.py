@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -19,6 +21,56 @@ SERVER_ARTIFACTS: dict[str, dict[str, Any]] = {
         "columns": ["round", "client_id", "loss", "accuracy", "samples"],
     },
 }
+
+
+def write_json_atomically(
+    path: Path, payload: Mapping[str, Any], *, overwrite: bool = True
+) -> Path:
+    """Persist a JSON object atomically.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Destination path.
+    payload : mapping of str to Any
+        JSON-compatible object to persist.
+    overwrite : bool, optional
+        Replace an existing destination when ``True``. When ``False``, publish by
+        an atomic hard link so an existing immutable file cannot be replaced.
+
+    Returns
+    -------
+    pathlib.Path
+        Destination path.
+
+    Raises
+    ------
+    FileExistsError
+        If ``overwrite`` is ``False`` and the destination already exists.
+    ValueError
+        If the payload contains values outside the JSON data model.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = json.dumps(payload, indent=2, allow_nan=False) + "\n"
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as file:
+            file.write(content)
+            file.flush()
+            os.fsync(file.fileno())
+        temporary_path.chmod(0o644)
+        if overwrite:
+            os.replace(temporary_path, path)
+        else:
+            os.link(temporary_path, path)
+            temporary_path.unlink()
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+    return path
 
 
 def validate_artifact_schema(payload: object, artifact_name: str) -> Mapping[str, Any]:
@@ -74,17 +126,13 @@ def write_server_artifact_manifest(artifact_dir: Path) -> Path:
     """
     artifact_dir.mkdir(parents=True, exist_ok=True)
     path = artifact_dir / SERVER_ARTIFACT_MANIFEST_FILENAME
-    path.write_text(
-        json.dumps(
-            {
-                "schema_version": ARTIFACT_SCHEMA_VERSION,
-                "artifacts": SERVER_ARTIFACTS,
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
+    return write_json_atomically(
+        path,
+        {
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "artifacts": SERVER_ARTIFACTS,
+        },
     )
-    return path
 
 
 def load_server_artifact_manifest(artifact_dir: Path) -> Mapping[str, Any]:

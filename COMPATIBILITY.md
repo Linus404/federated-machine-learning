@@ -21,6 +21,9 @@ The current artifact schema is `1`. Every persisted contract carries
 - Each `client-N/client_metadata.json` describes its private raw-review shard.
 - Each server output directory has `artifact_manifest.json`, which versions the
   Keras model and both metrics CSV layouts as one consistent artifact set.
+- Each server output directory has an immutable `run_manifest.json`, which versions
+  run identity, configuration, environment, code, seed, and public-dataset
+  provenance as one schema-checked record.
 
 Consumers accept schema `1` only. Missing, non-integer, older, and newer versions
 are rejected before the artifact is used. Extra metadata fields are compatible,

@@ -35,6 +35,7 @@ from src.paths import (
     metrics_path,
     resolve_dir,
 )
+from src.run_provenance import write_run_provenance_manifest
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"keras\..*")
 
@@ -209,6 +210,12 @@ def server_fn(context: Context) -> ServerAppComponents:
     try:
         resolved_artifact_dir = clear_artifact_dir(
             artifact_dir, protected_paths=protected_paths
+        )
+        write_run_provenance_manifest(
+            resolved_artifact_dir,
+            run_config,
+            public_artifact_dir=public_artifact_dir,
+            flower_run_id=getattr(context, "run_id", None),
         )
         strategy = create_strategy(
             min_clients=4,

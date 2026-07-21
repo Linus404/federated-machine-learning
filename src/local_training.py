@@ -17,7 +17,9 @@ import numpy as np
 
 from src.app_manifest import AppManifest, load_app_manifest
 from src.artifact_compatibility import validate_artifact_schema
+from src.contracts import DEFAULT_VALIDATION_SEED
 from src.paths import default_public_artifact_dir, resolve_dir
+from src.run_provenance import write_run_provenance_manifest
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"keras\..*")
 
@@ -25,7 +27,6 @@ ArrayPair: TypeAlias = tuple[np.ndarray, np.ndarray]
 PartitionSplit: TypeAlias = tuple[ArrayPair, ArrayPair]
 DEFAULT_LOCAL_EPOCHS = 1
 CLIENT_REVIEWS_FILENAME = "reviews.jsonl"
-DEFAULT_VALIDATION_SEED = 67
 
 
 def _stratified_split_indices(
@@ -163,8 +164,33 @@ def build_model(
 
 
 def train(args: argparse.Namespace) -> tuple[Any, Any]:
-    """Train one model from a client's raw private shard."""
+    """Train one model from a client's raw private shard.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Validated local-training command arguments.
+
+    Returns
+    -------
+    tuple of Any
+        Trained model and its Keras training history.
+    """
     manifest = load_app_manifest(public_artifact_dir=args.public_artifact_dir)
+    write_run_provenance_manifest(
+        args.run_artifact_dir,
+        {
+            "batch-size": args.batch_size,
+            "client-data-dir": args.client_data_dir,
+            "epochs": args.epochs,
+            "public-artifact-dir": args.public_artifact_dir,
+            "quiet": args.quiet,
+            "run-artifact-dir": args.run_artifact_dir,
+            "validation-seed": DEFAULT_VALIDATION_SEED,
+            "validation-split": args.validation_split,
+        },
+        public_artifact_dir=args.public_artifact_dir,
+    )
     train_data, val_data = load_client_shard(
         args.client_data_dir,
         manifest,
@@ -201,6 +227,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--public-artifact-dir", type=Path, default=default_public_artifact_dir()
     )
+    parser.add_argument("--run-artifact-dir", type=Path, required=True)
     parser.add_argument("--epochs", type=int, default=DEFAULT_LOCAL_EPOCHS)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--validation-split", type=float, default=0.2)

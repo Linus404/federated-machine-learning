@@ -45,8 +45,11 @@ not pretrained GloVe vectors or an embedding matrix.
 Train one client locally from its raw shard:
 
 ```bash
-uv run python -m src.local_training --client-data-dir artifacts/clients/client-0 --public-artifact-dir artifacts/public
+uv run python -m src.local_training --client-data-dir artifacts/clients/client-0 --public-artifact-dir artifacts/public --run-artifact-dir artifacts/local-run
 ```
+
+The local command requires a new run-artifact directory and writes its immutable
+`run_manifest.json` before training. Choose another empty directory for each run.
 
 ## Direct Flower simulation
 
@@ -95,6 +98,15 @@ uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "
 
 `use-huber` enables the robust aggregation path for outlier-resistant experiments. `use-update-noise` enables a small illustrative client update-noise ablation; it is not a production differential-privacy guarantee.
 
+Every server run and the documented local-training command create an immutable
+`run_manifest.json` before training. It
+contains a UUID, the Flower run ID, creation time, complete run configuration,
+Python/OS/package versions, Git revision and worktree state when available, known
+seeds, and SHA-256 checksums for the public manifest and vocabulary. Set
+`FML_CODE_REVISION` to the full Git object ID in images that do not contain `.git`.
+Private client datasets stay outside the server trust boundary, so their identity
+and checksums are not collected by the server manifest.
+
 ## Local distributed Docker runtime
 
 Prepare the four client shards and public artifacts on the host before starting
@@ -108,8 +120,11 @@ Build the single application image and start the separate SuperLink, ServerApp,
 four SuperNode/ClientApp pairs, and dashboard services:
 
 ```bash
-docker compose up --build -d
+FML_CODE_REVISION="$(git rev-parse HEAD)" docker compose up --build -d
 ```
+
+The launch command passes the exact host Git revision to ServerApp and every
+ClientApp without adding repository metadata to the image.
 
 Submit the Flower app to the running local federation:
 
