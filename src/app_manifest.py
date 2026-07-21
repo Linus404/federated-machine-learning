@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from src.artifact_compatibility import validate_artifact_schema
 from src.paths import default_public_artifact_dir, resolve_dir
 
 
@@ -45,7 +46,11 @@ def load_app_manifest(*, public_artifact_dir=None) -> AppManifest:
     """
     public_dir = resolve_public_artifact_dir(public_artifact_dir=public_artifact_dir)
     path = public_dir / "manifest.json"
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = dict(
+        validate_artifact_schema(
+            json.loads(path.read_text(encoding="utf-8")), "public manifest"
+        )
+    )
 
     # These are the only manifest values the product consumes.
     required = {"embedding_dim", "sequence_length", "vocabulary_size", "vocabulary"}

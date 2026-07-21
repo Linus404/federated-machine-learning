@@ -16,7 +16,7 @@ import keras
 import numpy as np
 
 from src.app_manifest import AppManifest, load_app_manifest
-
+from src.artifact_compatibility import validate_artifact_schema
 from src.paths import default_public_artifact_dir, resolve_dir
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"keras\..*")
@@ -73,8 +73,37 @@ def load_client_shard(
     manifest: AppManifest,
     validation_split: float = 0.2,
 ) -> PartitionSplit:
-    """Load raw private reviews and tokenize them inside the client process."""
+    """Load raw private reviews and tokenize them inside the client process.
+
+    Parameters
+    ----------
+    client_data_dir : str or pathlib.Path
+        Directory containing one versioned client shard.
+    manifest : AppManifest
+        Public vocabulary and model manifest.
+    validation_split : float, optional
+        Fraction of each label assigned to validation.
+
+    Returns
+    -------
+    PartitionSplit
+        Tokenized training and validation arrays.
+
+    Raises
+    ------
+    ValueError
+        If the shard metadata schema is unsupported.
+    """
     resolved_client_dir = resolve_dir(client_data_dir)
+    metadata_path = resolved_client_dir / "client_metadata.json"
+    if not metadata_path.exists():
+        raise ValueError(
+            "client shard metadata has no valid schema_version; regenerate its "
+            "artifacts"
+        )
+    validate_artifact_schema(
+        json.loads(metadata_path.read_text(encoding="utf-8")), "client shard metadata"
+    )
     with (resolved_client_dir / CLIENT_REVIEWS_FILENAME).open(
         encoding="utf-8"
     ) as review_file:

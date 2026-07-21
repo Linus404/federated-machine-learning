@@ -8,6 +8,8 @@ from unittest.mock import patch
 import numpy as np
 
 from src.app_manifest import AppManifest, load_app_manifest
+from src.artifact_compatibility import ARTIFACT_SCHEMA_VERSION
+from src.contracts import client_shard_metadata
 from src.data_prep import main, package_raw_client_shards
 from src.local_training import (
     build_model_from_manifest,
@@ -19,6 +21,7 @@ def write_public_artifacts(path: Path, sequence_length: int = 4) -> AppManifest:
     vocabulary = "\n[UNK]\ngood\nbad\nmovie"
     (path / "vocab.txt").write_text(vocabulary, encoding="utf-8")
     payload = {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
         "embedding_dim": 100,
         "sequence_length": sequence_length,
         "vocabulary_size": 5,
@@ -26,6 +29,9 @@ def write_public_artifacts(path: Path, sequence_length: int = 4) -> AppManifest:
     }
     manifest_path = path / "manifest.json"
     manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    (path / "client_metadata.json").write_text(
+        json.dumps({"schema_version": ARTIFACT_SCHEMA_VERSION}), encoding="utf-8"
+    )
     return AppManifest(payload, path / "vocab.txt")
 
 
@@ -57,6 +63,7 @@ def check_raw_client_packaging_keeps_every_sample_private(tmp_path: Path) -> Non
             .splitlines()
         ]
         assert metadata["client_id"] == client_id
+        assert metadata["schema_version"] == ARTIFACT_SCHEMA_VERSION
         assert metadata["sample_count"] == len(records)
         assert metadata["split_seed"] == 67
         assert metadata["alpha"] == 0.5
@@ -176,6 +183,7 @@ def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> No
     manifest = json.loads((public_dir / "manifest.json").read_text(encoding="utf-8"))
     vocabulary = (public_dir / "vocab.txt").read_text(encoding="utf-8").splitlines()
     assert manifest["vocabulary_size"] == len(vocabulary)
+    assert manifest["schema_version"] == ARTIFACT_SCHEMA_VERSION
     assert "glove" not in json.dumps(manifest).lower()
     assert "embedding_matrix" not in manifest
     assert not list(client_dir.glob("client-*.tar.gz"))
@@ -203,6 +211,54 @@ class ArtifactFlowTests(unittest.TestCase):
                 tempfile.TemporaryDirectory() as tmpdir,
             ):
                 check(Path(tmpdir))
+
+    def test_client_shard_loader_checks_each_schema_version_state(self) -> None:
+        records = [
+            {"text": "good movie", "label": 1},
+            {"text": "bad movie", "label": 0},
+            {"text": "good", "label": 1},
+            {"text": "bad", "label": 0},
+        ]
+        for version, error in ((None, "no valid"), (0, "older"), (2, "newer")):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as tmpdir:
+                path = Path(tmpdir)
+                manifest = write_public_artifacts(path)
+                metadata = {} if version is None else {"schema_version": version}
+                (path / "client_metadata.json").write_text(
+                    json.dumps(metadata), encoding="utf-8"
+                )
+                (path / "reviews.jsonl").write_text(
+                    "\n".join(json.dumps(record) for record in records),
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(ValueError, error):
+                    load_client_shard(path, manifest)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            manifest = write_public_artifacts(path)
+            (path / "reviews.jsonl").write_text(
+                "\n".join(json.dumps(record) for record in records), encoding="utf-8"
+            )
+            train, validation = load_client_shard(path, manifest)
+            self.assertEqual(len(train[1]) + len(validation[1]), len(records))
+
+    def test_client_shard_metadata_preserves_additive_fields(self) -> None:
+        metadata = client_shard_metadata(
+            3, [0, 1], extra_metadata={"source": "research cohort"}
+        )
+
+        self.assertEqual(metadata["client_id"], 3)
+        self.assertEqual(metadata["source"], "research cohort")
+
+    def test_client_shard_metadata_rejects_reserved_field_collisions(self) -> None:
+        with self.assertRaisesRegex(ValueError, "schema_version"):
+            client_shard_metadata(
+                3,
+                [0, 1],
+                extra_metadata={"schema_version": ARTIFACT_SCHEMA_VERSION + 1},
+            )
 
 
 if __name__ == "__main__":

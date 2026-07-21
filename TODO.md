@@ -102,7 +102,7 @@ federated learning system.
 - [ ] Benchmark behavior with substantially more simulated clients.
 - [ ] Add robust aggregation alternatives and document their assumptions.
 - [ ] Add model-update validation and anomaly detection.
-- [ ] Define API and artifact compatibility/versioning policies.
+- [x] Define API and artifact compatibility/versioning policies.
 - [ ] Add canary deployment and model rollback support.
 - [ ] Add performance profiling and optimize serialization and communication overhead.
 - [ ] Conduct a documented security and privacy review before making production claims.

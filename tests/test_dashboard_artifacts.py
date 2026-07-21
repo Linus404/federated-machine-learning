@@ -1,0 +1,100 @@
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import dashboard
+from src.artifact_compatibility import ARTIFACT_SCHEMA_VERSION, SERVER_ARTIFACTS
+
+
+def write_server_manifest(path: Path, version: int | None) -> None:
+    """Write a server manifest for one compatibility test.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Server artifact directory.
+    version : int or None
+        Schema version, or ``None`` to omit it.
+
+    Returns
+    -------
+    None
+    """
+    payload = {"artifacts": SERVER_ARTIFACTS}
+    if version is not None:
+        payload["schema_version"] = version
+    (path / "artifact_manifest.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+class DashboardArtifactTests(unittest.TestCase):
+    def test_model_loader_checks_each_schema_version_state(self) -> None:
+        for version, error in ((None, "no valid"), (0, "older"), (2, "newer")):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as tmpdir:
+                path = Path(tmpdir)
+                model_path = path / "global_model.keras"
+                model_path.touch()
+                write_server_manifest(path, version)
+
+                with (
+                    patch.object(dashboard, "MODEL_PATH", model_path),
+                    patch.object(dashboard.keras.models, "load_model") as load_model,
+                    self.assertRaisesRegex(ValueError, error),
+                ):
+                    dashboard.load_model()
+                load_model.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            model_path = path / "global_model.keras"
+            model_path.touch()
+            write_server_manifest(path, ARTIFACT_SCHEMA_VERSION)
+            sentinel = object()
+            with (
+                patch.object(dashboard, "MODEL_PATH", model_path),
+                patch.object(
+                    dashboard.keras.models, "load_model", return_value=sentinel
+                ),
+            ):
+                self.assertIs(dashboard.load_model(), sentinel)
+
+    def test_metrics_loader_checks_each_schema_version_state(self) -> None:
+        for version, error in ((None, "no valid"), (0, "older"), (2, "newer")):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as tmpdir:
+                path = Path(tmpdir)
+                metrics_path = path / "metrics.csv"
+                metrics_path.write_text(
+                    "round,loss,accuracy\n1,0.5,0.75\n", encoding="utf-8"
+                )
+                write_server_manifest(path, version)
+
+                with self.assertRaisesRegex(ValueError, error):
+                    dashboard.load_metrics(metrics_path)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            metrics_path = path / "metrics.csv"
+            metrics_path.write_text(
+                "round,loss,accuracy\n1,0.5,0.75\n", encoding="utf-8"
+            )
+            write_server_manifest(path, ARTIFACT_SCHEMA_VERSION)
+
+            metrics = dashboard.load_metrics(metrics_path)
+
+            self.assertIsNotNone(metrics)
+            assert metrics is not None
+            self.assertEqual(
+                metrics.to_dict("records"),
+                [
+                    {
+                        "round": 1,
+                        "loss": 0.5,
+                        "accuracy": 0.75,
+                    }
+                ],
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

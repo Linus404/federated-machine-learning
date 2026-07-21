@@ -6,6 +6,8 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from src.artifact_compatibility import ARTIFACT_SCHEMA_VERSION
+
 DEFAULT_SPLIT_SEED = 67
 DEFAULT_DIRICHLET_ALPHA = 0.5
 
@@ -52,7 +54,35 @@ def client_shard_metadata(
     manifest_checksum: str | None = None,
     extra_metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Build authoritative metadata for one private client shard.
+
+    Parameters
+    ----------
+    client_id : int
+        Client partition identifier.
+    labels : Any
+        Labels stored in the shard.
+    split_seed : int, optional
+        Random seed used to produce the partition.
+    alpha : float, optional
+        Dirichlet concentration used to produce the partition.
+    manifest_checksum : str or None, optional
+        Checksum tying the shard to its public manifest.
+    extra_metadata : mapping or None, optional
+        Additional fields that do not replace schema-owned fields.
+
+    Returns
+    -------
+    dict of str to Any
+        Complete client shard metadata.
+
+    Raises
+    ------
+    ValueError
+        If additional metadata tries to replace a schema-owned field.
+    """
     metadata = {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
         "client_id": client_id,
         "split_seed": split_seed,
         "alpha": alpha,
@@ -60,5 +90,11 @@ def client_shard_metadata(
         "label_histogram": label_histogram(labels),
         "manifest_checksum": manifest_checksum,
     }
+    collisions = metadata.keys() & (extra_metadata or {}).keys()
+    if collisions:
+        raise ValueError(
+            "extra client shard metadata cannot replace reserved fields: "
+            + ", ".join(sorted(collisions))
+        )
     metadata.update(extra_metadata or {})
     return metadata
