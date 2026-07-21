@@ -160,6 +160,9 @@ uv run ruff format .
 uv run ruff check .
 ```
 
+See [COMPATIBILITY.md](COMPATIBILITY.md) for the application and artifact
+versioning policy and supported regeneration path.
+
 Open a new branch for each feature and use pull requests for review.
 
 ## Tech stack
