@@ -4,16 +4,13 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any
 from unittest.mock import patch
 
-from src.app_manifest import expected_train_dataset
 from src.artifact_compatibility import (
     ARTIFACT_SCHEMA_VERSION,
     PUBLIC_ARTIFACT_SCHEMA_VERSION,
     canonical_json_bytes,
 )
-from src.contracts import DEFAULT_SPLIT_SEED, DEFAULT_VALIDATION_SEED
 from src.run_provenance import (
     _code_revision,
     _dataset_metadata,
@@ -21,7 +18,6 @@ from src.run_provenance import (
     load_run_provenance_manifest,
     write_run_provenance_manifest,
 )
-from src.reproducibility import SEED_DERIVATION, SEED_NAMESPACES
 
 
 def write_public_dataset_contract(path: Path) -> dict[str, object]:
@@ -40,7 +36,16 @@ def write_public_dataset_contract(path: Path) -> dict[str, object]:
     vocabulary = b"\n[UNK]\ngood\nbad\n"
     vocabulary_sha256 = hashlib.sha256(vocabulary).hexdigest()
     (path / "vocab.txt").write_bytes(vocabulary)
-    dataset = expected_train_dataset()
+    dataset = {
+        "id": "stanfordnlp/imdb",
+        "config": "plain_text",
+        "revision": "e6281661ce1c48d982bc483cf8a173c1bbeb5d31",
+        "datasets_version": "4.8.5",
+        "split": "train",
+        "rows": 25000,
+        "raw_parquet_sha256": "db47d16b" + "0" * 56,
+        "content_sha256": "4639bf10" + "0" * 56,
+    }
     (path / "manifest.json").write_bytes(
         canonical_json_bytes(
             {
@@ -117,229 +122,7 @@ def runtime_environment() -> dict[str, object]:
     }
 
 
-def private_shard_provenance(manifest_bytes: bytes) -> dict[str, Any]:
-    """Return valid private-shard evidence bound to one public snapshot.
-
-    Parameters
-    ----------
-    manifest_bytes : bytes
-        Exact authoritative public manifest bytes.
-
-    Returns
-    -------
-    dict of str to object
-        Private shard identity and checksums accepted by run provenance.
-    """
-    return {
-        "identity": {
-            "client_id": 0,
-            "dataset": expected_train_dataset(),
-            "source_split": "train",
-            "row_identity": "train:{zero_based_official_split_row_index}",
-            "sample_count": 2,
-            "label_histogram": {"0": 1, "1": 1},
-            "public_manifest": {
-                "filename": "manifest.json",
-                "size_bytes": len(manifest_bytes),
-                "checksum": "sha256:" + hashlib.sha256(manifest_bytes).hexdigest(),
-            },
-        },
-        "checksums": {
-            "client_metadata.json": "sha256:" + "1" * 64,
-            "reviews.jsonl": "sha256:" + "2" * 64,
-        },
-    }
-
-
 class RunProvenanceTests(unittest.TestCase):
-    def test_available_private_shard_requires_exact_checksum_inventory(self) -> None:
-        """Reject missing, extra, empty, and malformed private checksum bindings."""
-        mutations = {
-            "empty": {},
-            "missing metadata": {"reviews.jsonl": "sha256:" + "2" * 64},
-            "missing reviews": {"client_metadata.json": "sha256:" + "1" * 64},
-            "extra": {
-                "client_metadata.json": "sha256:" + "1" * 64,
-                "reviews.jsonl": "sha256:" + "2" * 64,
-                "extra.json": "sha256:" + "3" * 64,
-            },
-            "malformed": {
-                "client_metadata.json": "sha256:" + "1" * 64,
-                "reviews.jsonl": "sha256:not-a-digest",
-            },
-        }
-        for name, checksums in mutations.items():
-            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmpdir:
-                public_dir = Path(tmpdir) / "public"
-                public_dir.mkdir()
-                protocol = write_public_dataset_contract(public_dir)
-                from src.app_manifest import load_app_manifest
-
-                snapshot = load_app_manifest(
-                    public_artifact_dir=public_dir, protocol=protocol
-                )
-                shard = private_shard_provenance(snapshot.manifest_bytes)
-                shard["checksums"] = checksums
-                with self.assertRaisesRegex(ValueError, "private_client_shards"):
-                    write_run_provenance_manifest(
-                        Path(tmpdir) / "run",
-                        {},
-                        app_manifest=snapshot,
-                        client_shard=shard,
-                    )
-
-    def test_private_shard_requires_exact_dataset_and_public_binding(self) -> None:
-        mutations = {
-            field: value
-            for field, value in (
-                ("id", "attacker/imdb"),
-                ("config", "attacker"),
-                ("revision", "0" * 40),
-                ("datasets_version", "0.0.0"),
-                ("split", "test"),
-                ("rows", 1),
-                ("raw_parquet_sha256", "0" * 64),
-                ("content_sha256", "0" * 64),
-            )
-        }
-        for field, value in mutations.items():
-            with (
-                self.subTest(field=field),
-                tempfile.TemporaryDirectory() as tmpdir,
-            ):
-                public_dir = Path(tmpdir) / "public"
-                public_dir.mkdir()
-                protocol = write_public_dataset_contract(public_dir)
-                from src.app_manifest import load_app_manifest
-
-                snapshot = load_app_manifest(
-                    public_artifact_dir=public_dir, protocol=protocol
-                )
-                shard = private_shard_provenance(snapshot.manifest_bytes)
-                shard["identity"]["dataset"][field] = value
-                with self.assertRaisesRegex(ValueError, "private_client_shards"):
-                    write_run_provenance_manifest(
-                        Path(tmpdir) / "run",
-                        {},
-                        app_manifest=snapshot,
-                        client_shard=shard,
-                    )
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            public_dir = Path(tmpdir) / "public"
-            public_dir.mkdir()
-            protocol = write_public_dataset_contract(public_dir)
-            from src.app_manifest import load_app_manifest
-
-            snapshot = load_app_manifest(
-                public_artifact_dir=public_dir, protocol=protocol
-            )
-            shard = private_shard_provenance(snapshot.manifest_bytes)
-            shard["identity"]["public_manifest"]["size_bytes"] += 1
-            with self.assertRaisesRegex(ValueError, "authoritative public manifest"):
-                write_run_provenance_manifest(
-                    Path(tmpdir) / "run",
-                    {},
-                    app_manifest=snapshot,
-                    client_shard=shard,
-                )
-
-    def test_supplied_snapshot_records_valid_private_binding_without_reopen(
-        self,
-    ) -> None:
-        from src.app_manifest import load_app_manifest
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            public_dir = Path(tmpdir) / "public"
-            public_dir.mkdir()
-            protocol = write_public_dataset_contract(public_dir)
-            snapshot = load_app_manifest(
-                public_artifact_dir=public_dir, protocol=protocol
-            )
-            shard = private_shard_provenance(snapshot.manifest_bytes)
-            with (
-                patch(
-                    "src.run_provenance.load_app_manifest",
-                    side_effect=AssertionError("public pointer reopened"),
-                ),
-                patch(
-                    "src.run_provenance.resolve_public_artifact_dir",
-                    side_effect=AssertionError("public pointer resolved"),
-                ),
-            ):
-                path = write_run_provenance_manifest(
-                    Path(tmpdir) / "run",
-                    {},
-                    public_artifact_dir=public_dir,
-                    app_manifest=snapshot,
-                    client_shard=shard,
-                )
-            payload = load_run_provenance_manifest(path)
-
-        self.assertEqual(
-            payload["dataset"]["private_client_shards"]["status"], "available"
-        )
-        self.assertEqual(
-            payload["dataset"]["private_client_shards"]["identity"]["public_manifest"],
-            payload["dataset"]["public_manifest"],
-        )
-
-    def test_supplied_public_snapshot_is_not_reopened_for_provenance(self) -> None:
-        from src.app_manifest import load_app_manifest
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            public_dir = Path(tmpdir) / "public"
-            public_dir.mkdir()
-            protocol = write_public_dataset_contract(public_dir)
-            snapshot = load_app_manifest(
-                public_artifact_dir=public_dir, protocol=protocol
-            )
-            with (
-                patch(
-                    "src.run_provenance.load_app_manifest",
-                    side_effect=AssertionError("public pointer reopened"),
-                ),
-                patch(
-                    "src.run_provenance.resolve_public_artifact_dir",
-                    side_effect=AssertionError("public pointer resolved"),
-                ),
-                patch(
-                    "src.run_provenance._code_revision",
-                    return_value={
-                        "commit": None,
-                        "dirty": None,
-                        "source": "unavailable",
-                    },
-                ),
-                patch(
-                    "src.run_provenance._environment_metadata",
-                    return_value=runtime_environment(),
-                ),
-            ):
-                manifest_path = write_run_provenance_manifest(
-                    Path(tmpdir) / "run",
-                    {},
-                    public_artifact_dir=public_dir,
-                    app_manifest=snapshot,
-                )
-                payload = load_run_provenance_manifest(manifest_path)
-
-        self.assertEqual(payload["dataset"]["status"], "available")
-        self.assertEqual(
-            payload["dataset"]["checksums"]["manifest.json"],
-            "sha256:" + hashlib.sha256(snapshot.manifest_bytes).hexdigest(),
-        )
-        self.assertEqual(
-            payload["dataset"]["identity"],
-            json.dumps(
-                expected_train_dataset(),
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ),
-        )
-
     def test_public_checksums_use_the_same_snapshot_as_validation(self) -> None:
         from src.app_manifest import load_app_manifest
 
@@ -355,7 +138,7 @@ class RunProvenanceTests(unittest.TestCase):
             def load_then_mutate(**kwargs):
                 snapshot = load_app_manifest(protocol=protocol, **kwargs)
                 mutated_manifest = manifest_path.read_bytes().replace(
-                    b'"rows":25000', b'"rows":35000'
+                    b'"rows": 25000', b'"rows": 35000'
                 )
                 self.assertEqual(len(mutated_manifest), len(manifest_bytes))
                 manifest_path.write_bytes(mutated_manifest)
@@ -379,50 +162,6 @@ class RunProvenanceTests(unittest.TestCase):
             "sha256:" + hashlib.sha256(vocabulary_bytes).hexdigest(),
         )
         self.assertEqual(json.loads(metadata["identity"])["rows"], 25000)
-
-    def test_loader_requires_exact_public_checksum_inventory(self) -> None:
-        from src.app_manifest import load_app_manifest
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            public_dir = root / "public"
-            public_dir.mkdir()
-            protocol = write_public_dataset_contract(public_dir)
-            snapshot = load_app_manifest(
-                public_artifact_dir=public_dir, protocol=protocol
-            )
-            with (
-                patch(
-                    "src.run_provenance._code_revision",
-                    return_value={
-                        "commit": None,
-                        "dirty": None,
-                        "source": "unavailable",
-                    },
-                ),
-                patch(
-                    "src.run_provenance._environment_metadata",
-                    return_value=runtime_environment(),
-                ),
-            ):
-                valid_path = write_run_provenance_manifest(
-                    root / "run", {}, app_manifest=snapshot
-                )
-            valid = json.loads(valid_path.read_bytes())
-
-            for mutation in ("missing", "extra"):
-                with self.subTest(mutation=mutation):
-                    payload = json.loads(json.dumps(valid))
-                    if mutation == "missing":
-                        del payload["dataset"]["checksums"]["vocab.txt"]
-                    else:
-                        payload["dataset"]["checksums"]["extra.txt"] = (
-                            "sha256:" + "0" * 64
-                        )
-                    path = root / f"{mutation}.json"
-                    path.write_bytes(canonical_json_bytes(payload))
-                    with self.assertRaisesRegex(ValueError, "dataset.checksums"):
-                        load_run_provenance_manifest(path)
 
     def test_linux_environment_uses_tensorflow_cpu_distribution_version(self) -> None:
         versions = {
@@ -522,7 +261,6 @@ class RunProvenanceTests(unittest.TestCase):
             self.assertEqual(
                 payload["run_config"],
                 {
-                    "master-seed": 67,
                     "num-server-rounds": 3,
                     "public-artifact-dir": str(public_dir),
                     "random-seed": 19,
@@ -531,17 +269,20 @@ class RunProvenanceTests(unittest.TestCase):
             )
             self.assertEqual(payload["environment"], runtime_environment())
             self.assertEqual(payload["code_revision"]["commit"], "a" * 40)
-            self.assertEqual(
-                payload["seeds"]["run_config"],
-                {"master-seed": 67, "random-seed": 19},
-            )
-            self.assertEqual(payload["seeds"]["effective_master_seed"], 67)
-            self.assertEqual(payload["seeds"]["derivation"], SEED_DERIVATION)
-            self.assertEqual(payload["seeds"]["namespaces"], SEED_NAMESPACES)
+            self.assertEqual(payload["seeds"]["run_config"], {"random-seed": 19})
             self.assertEqual(
                 payload["dataset"]["identity"],
                 json.dumps(
-                    expected_train_dataset(),
+                    {
+                        "id": "stanfordnlp/imdb",
+                        "config": "plain_text",
+                        "revision": "e6281661ce1c48d982bc483cf8a173c1bbeb5d31",
+                        "datasets_version": "4.8.5",
+                        "split": "train",
+                        "rows": 25000,
+                        "raw_parquet_sha256": "db47d16b" + "0" * 56,
+                        "content_sha256": "4639bf10" + "0" * 56,
+                    },
                     ensure_ascii=False,
                     sort_keys=True,
                     separators=(",", ":"),
@@ -697,42 +438,6 @@ class RunProvenanceTests(unittest.TestCase):
 
             self.assertFalse((path / "run_manifest.json").exists())
 
-    def test_master_seed_is_effective_default_and_tamper_evident(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            with (
-                patch(
-                    "src.run_provenance._code_revision",
-                    return_value={
-                        "commit": None,
-                        "dirty": None,
-                        "source": "unavailable",
-                    },
-                ),
-                patch(
-                    "src.run_provenance._environment_metadata",
-                    return_value=runtime_environment(),
-                ),
-            ):
-                path = write_run_provenance_manifest(root / "run", {})
-            payload = json.loads(path.read_bytes())
-
-            self.assertEqual(payload["run_config"]["master-seed"], 67)
-            self.assertEqual(payload["seeds"]["effective_master_seed"], 67)
-            for mutation in ("master", "derivation", "run config"):
-                with self.subTest(mutation=mutation):
-                    hostile = json.loads(json.dumps(payload))
-                    if mutation == "master":
-                        hostile["seeds"]["effective_master_seed"] = 68
-                    elif mutation == "derivation":
-                        hostile["seeds"]["derivation"]["domain"] = "attacker"
-                    else:
-                        hostile["run_config"]["master-seed"] = 68
-                    hostile_path = root / f"{mutation}.json"
-                    hostile_path.write_bytes(canonical_json_bytes(hostile))
-                    with self.assertRaisesRegex(ValueError, "seed"):
-                        load_run_provenance_manifest(hostile_path)
-
     def test_loader_rejects_incomplete_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "run_manifest.json"
@@ -743,187 +448,6 @@ class RunProvenanceTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "missing"):
                 load_run_provenance_manifest(path)
-
-    def test_loader_rejects_hostile_json_and_accepts_finite_additions(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            with (
-                patch(
-                    "src.run_provenance._code_revision",
-                    return_value={
-                        "commit": None,
-                        "dirty": None,
-                        "source": "unavailable",
-                    },
-                ),
-                patch(
-                    "src.run_provenance._environment_metadata",
-                    return_value=runtime_environment(),
-                ),
-            ):
-                manifest_path = write_run_provenance_manifest(
-                    root,
-                    {},
-                    run_id="12345678-1234-4234-9234-123456789abc",
-                )
-            valid = manifest_path.read_text(encoding="utf-8")
-            hostile_documents = (
-                valid.replace(
-                    '"schema_version": 1,',
-                    '"schema_version": 0,\n  "schema_version": 1,',
-                    1,
-                ),
-                valid.replace(
-                    '"run_id": "12345678-1234-4234-9234-123456789abc",',
-                    '"run_id": "attacker",\n  '
-                    '"run_id": "12345678-1234-4234-9234-123456789abc",',
-                    1,
-                ),
-                valid.replace(
-                    '"identity": null,',
-                    '"identity": "attacker",\n    "identity": null,',
-                    1,
-                ),
-                *(
-                    valid[:-2] + f',\n  "producer": {constant}\n}}\n'
-                    for constant in (
-                        "NaN",
-                        "Infinity",
-                        "-Infinity",
-                        "1e999",
-                        "-1e999",
-                    )
-                ),
-            )
-            for document in hostile_documents:
-                with self.subTest(document=document):
-                    manifest_path.write_text(document, encoding="utf-8")
-                    with self.assertRaisesRegex(
-                        ValueError, "invalid run provenance manifest"
-                    ):
-                        load_run_provenance_manifest(manifest_path)
-
-            finite = (
-                valid[:-2] + ',\n  "producer": {"upper": 1e308, "lower": -1e308}\n}\n'
-            )
-            manifest_path.write_text(finite, encoding="utf-8")
-            self.assertEqual(
-                load_run_provenance_manifest(manifest_path)["producer"],
-                {"upper": 1e308, "lower": -1e308},
-            )
-
-    def test_embedded_dataset_identity_is_strict_canonical_and_schema_valid(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            with (
-                patch(
-                    "src.run_provenance._code_revision",
-                    return_value={
-                        "commit": None,
-                        "dirty": None,
-                        "source": "unavailable",
-                    },
-                ),
-                patch(
-                    "src.run_provenance._environment_metadata",
-                    return_value=runtime_environment(),
-                ),
-            ):
-                base = json.loads(
-                    write_run_provenance_manifest(root / "base", {}).read_text(
-                        encoding="utf-8"
-                    )
-                )
-
-            identity = expected_train_dataset()
-            canonical_identity = json.dumps(
-                identity,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            )
-            base["dataset"] = {
-                **base["dataset"],
-                "identity": canonical_identity,
-                "checksums": {
-                    "manifest.json": "sha256:" + "3" * 64,
-                    "vocab.txt": "sha256:" + "4" * 64,
-                },
-                "public_manifest": {
-                    "filename": "manifest.json",
-                    "size_bytes": 1,
-                    "checksum": "sha256:" + "3" * 64,
-                },
-                "status": "available",
-            }
-            valid_path = root / "valid.json"
-            valid_path.write_bytes(canonical_json_bytes(base))
-            self.assertEqual(
-                load_run_provenance_manifest(valid_path)["dataset"]["identity"],
-                canonical_identity,
-            )
-
-            hostile_values = {
-                "id": "attacker/imdb",
-                "config": "attacker_config",
-                "revision": "0" * 40,
-                "datasets_version": "0.0.0",
-                "split": "test",
-                "rows": 24999,
-                "raw_parquet_sha256": "0" * 64,
-                "content_sha256": "0" * 64,
-            }
-            for field, hostile_value in hostile_values.items():
-                with self.subTest(field=field):
-                    hostile = json.loads(json.dumps(base))
-                    hostile["dataset"]["identity"] = json.dumps(
-                        {**identity, field: hostile_value},
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                        allow_nan=False,
-                    )
-                    hostile_path = root / f"hostile-value-{field}.json"
-                    hostile_path.write_bytes(canonical_json_bytes(hostile))
-                    with self.assertRaisesRegex(ValueError, "dataset.identity"):
-                        load_run_provenance_manifest(hostile_path)
-
-            hostile_identities = {
-                "nested duplicate": canonical_identity.replace(
-                    '"id":"stanfordnlp/imdb"',
-                    '"extra":{"value":1,"value":2},"id":"stanfordnlp/imdb"',
-                ),
-                "overflow": canonical_identity.replace('"rows":25000', '"rows":1e999'),
-                "nonfinite": canonical_identity.replace('"rows":25000', '"rows":NaN'),
-                "noncanonical": json.dumps(identity, ensure_ascii=False),
-                "malformed": canonical_identity[:-1],
-                "missing field": json.dumps(
-                    {key: value for key, value in identity.items() if key != "split"},
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-                "extra field": json.dumps(
-                    {**identity, "source": "test"},
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-                "wrong field type": json.dumps(
-                    {**identity, "rows": "25000"},
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-            }
-            for name, hostile_identity in hostile_identities.items():
-                with self.subTest(name=name):
-                    hostile = json.loads(json.dumps(base))
-                    hostile["dataset"]["identity"] = hostile_identity
-                    hostile_path = root / f"hostile-{name.replace(' ', '-')}.json"
-                    hostile_path.write_bytes(canonical_json_bytes(hostile))
-                    with self.assertRaisesRegex(ValueError, "dataset.identity"):
-                        load_run_provenance_manifest(hostile_path)
 
     def test_loader_rejects_missing_and_invalid_nested_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -965,72 +489,6 @@ class RunProvenanceTests(unittest.TestCase):
                     )
                     with self.assertRaisesRegex(ValueError, field):
                         load_run_provenance_manifest(manifest_path)
-
-    def test_loader_requires_canonical_code_defaults(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            with (
-                patch(
-                    "src.run_provenance._code_revision",
-                    return_value={
-                        "commit": "a" * 40,
-                        "dirty": False,
-                        "source": "git",
-                    },
-                ),
-                patch(
-                    "src.run_provenance._environment_metadata",
-                    return_value=runtime_environment(),
-                ),
-            ):
-                payload = json.loads(
-                    write_run_provenance_manifest(root / "valid", {}).read_bytes()
-                )
-
-            canonical = {
-                "client_validation_split": DEFAULT_VALIDATION_SEED,
-                "data_partition": DEFAULT_SPLIT_SEED,
-            }
-            self.assertEqual(payload["seeds"]["code_defaults"], canonical)
-            valid_path = root / "canonical.json"
-            valid_path.write_bytes(canonical_json_bytes(payload))
-            self.assertEqual(
-                load_run_provenance_manifest(valid_path)["seeds"]["code_defaults"],
-                canonical,
-            )
-
-            invalid_code_defaults = {
-                "changed-value": {
-                    **canonical,
-                    "client_validation_split": DEFAULT_VALIDATION_SEED + 1,
-                },
-                "missing-key": {"data_partition": DEFAULT_SPLIT_SEED},
-                "extra-key": {**canonical, "unexpected": 1},
-                "boolean-substitution": {
-                    **canonical,
-                    "client_validation_split": True,
-                },
-                "type-substitution": {
-                    **canonical,
-                    "client_validation_split": str(DEFAULT_VALIDATION_SEED),
-                },
-            }
-            for mutation, code_defaults in invalid_code_defaults.items():
-                with self.subTest(mutation=mutation):
-                    invalid_path = root / f"{mutation}.json"
-                    invalid_path.write_bytes(
-                        canonical_json_bytes(
-                            {
-                                **payload,
-                                "seeds": {
-                                    **payload["seeds"],
-                                    "code_defaults": code_defaults,
-                                },
-                            }
-                        )
-                    )
-                    with self.assertRaisesRegex(ValueError, "seeds.code_defaults"):
-                        load_run_provenance_manifest(invalid_path)
 
     def test_git_revision_marks_untracked_files_dirty(self) -> None:
         completed = [

@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 from src.artifact_compatibility import (
     PUBLIC_ARTIFACT_SCHEMA_VERSION,
-    RetainedDirectoryChain,
     canonical_json_bytes,
     deep_freeze,
-    read_regular_file_snapshot_at,
+    read_regular_file,
     sha256_bytes,
     validate_artifact_schema,
 )
@@ -23,8 +21,6 @@ from src.paths import (
     resolve_dir,
     resolve_prepared_artifact_dir,
 )
-
-PUBLIC_ARTIFACT_FILENAMES = frozenset({"manifest.json", "vocab.txt"})
 
 
 @dataclass(frozen=True)
@@ -86,23 +82,20 @@ def resolve_public_artifact_dir(config=None, *, public_artifact_dir=None) -> Pat
     return resolve_prepared_artifact_dir(logical_dir, "public")
 
 
-def expected_train_dataset(
-    protocol: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
+def _expected_train_dataset(protocol: Mapping[str, Any]) -> dict[str, Any]:
     """Return the exact public train-dataset identity from the frozen protocol.
 
     Parameters
     ----------
-    protocol : mapping of str to Any or None, optional
-        Parsed frozen scientific protocol, primarily for deterministic tests.
+    protocol : mapping of str to Any
+        Parsed frozen scientific protocol.
 
     Returns
     -------
     dict of str to Any
         Exact dataset identity permitted at the public artifact boundary.
     """
-    frozen = protocol or load_scientific_protocol()
-    dataset = frozen["dataset"]
+    dataset = protocol["dataset"]
     train = dataset["splits"]["train"]
     return {
         "id": dataset["id"],
@@ -176,96 +169,12 @@ def load_app_manifest(
         If the public artifact path, schema, dataset, or vocabulary is invalid.
     """
     public_dir = resolve_public_artifact_dir(public_artifact_dir=public_artifact_dir)
-    chain = RetainedDirectoryChain.open(
-        public_dir,
-        error_message="public artifact directory chain changed while loading",
-    )
-    with chain:
-        canonical_dir = chain.path
-        descriptor = chain.directory.descriptor
-        retained_manifest = read_regular_file_snapshot_at(
-            descriptor,
-            "manifest.json",
-            retain=True,
-        )
-        with retained_manifest:
-            manifest_bytes = retained_manifest.snapshot.content
-            chain.verify()
-            try:
-                validate_artifact_schema(
-                    json.loads(manifest_bytes.decode("utf-8")),
-                    "public manifest",
-                    supported_version=PUBLIC_ARTIFACT_SCHEMA_VERSION,
-                )
-            except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                raise ValueError("invalid public manifest") from error
-            chain.verify()
-            if set(os.listdir(descriptor)) != PUBLIC_ARTIFACT_FILENAMES:
-                raise ValueError("public artifact contains unexpected files")
-            chain.verify()
-            vocabulary_path = canonical_dir / "vocab.txt"
-            retained_vocabulary = read_regular_file_snapshot_at(
-                descriptor,
-                "vocab.txt",
-                retain=True,
-            )
-            with retained_vocabulary:
-                vocabulary_bytes = retained_vocabulary.snapshot.content
-                chain.verify()
-                snapshot = validate_app_manifest_bytes(
-                    manifest_bytes,
-                    vocabulary_bytes,
-                    vocabulary_path=vocabulary_path,
-                    protocol=protocol,
-                )
-                chain.verify()
-                if set(os.listdir(descriptor)) != PUBLIC_ARTIFACT_FILENAMES:
-                    raise ValueError("public artifact inventory changed while loading")
-                retained_manifest.verify(
-                    descriptor,
-                    "manifest.json",
-                    expected_content=manifest_bytes,
-                )
-                retained_vocabulary.verify(
-                    descriptor,
-                    "vocab.txt",
-                    expected_content=vocabulary_bytes,
-                )
-                chain.verify()
-                return snapshot
-
-
-def validate_app_manifest_bytes(
-    manifest_bytes: bytes,
-    vocabulary_bytes: bytes,
-    *,
-    vocabulary_path: Path,
-    protocol: Mapping[str, Any] | None = None,
-) -> AppManifest:
-    """Validate retained public manifest and vocabulary bytes.
-
-    Parameters
-    ----------
-    manifest_bytes : bytes
-        Exact canonical ``manifest.json`` bytes.
-    vocabulary_bytes : bytes
-        Exact ``vocab.txt`` bytes bound by the manifest.
-    vocabulary_path : pathlib.Path
-        Original vocabulary path retained for diagnostics only.
-    protocol : mapping of str to Any or None, optional
-        Parsed frozen protocol, primarily for deterministic tests.
-
-    Returns
-    -------
-    AppManifest
-        Validated immutable public artifact snapshot.
-
-    Raises
-    ------
-    ValueError
-        If the manifest, frozen protocol binding, or vocabulary is invalid.
-    """
+    if public_dir.is_symlink() or not public_dir.is_dir():
+        raise ValueError("public artifact directory must be a regular directory")
+    canonical_dir = public_dir.resolve(strict=True)
+    path = public_dir / "manifest.json"
     try:
+        manifest_bytes = read_regular_file(path, parent=canonical_dir)
         payload = dict(
             validate_artifact_schema(
                 json.loads(manifest_bytes.decode("utf-8")),
@@ -292,7 +201,7 @@ def validate_app_manifest_bytes(
         raise ValueError(f"Manifest missing: {', '.join(sorted(missing))}")
 
     frozen = protocol or load_scientific_protocol()
-    if payload["dataset"] != expected_train_dataset(frozen):
+    if payload["dataset"] != _expected_train_dataset(frozen):
         raise ValueError("public dataset identity differs from the frozen protocol")
 
     preprocessing = frozen["preprocessing"]
@@ -311,12 +220,18 @@ def validate_app_manifest_bytes(
     }:
         raise ValueError("public vocabulary contract is invalid")
     filename = vocabulary["filename"]
-    if not isinstance(filename, str) or filename != "vocab.txt":
-        raise ValueError("public vocabulary filename must be vocab.txt")
-    if vocabulary_path.name != filename:
-        raise ValueError("public vocabulary path must end with vocab.txt")
+    if (
+        not isinstance(filename, str)
+        or not filename
+        or Path(filename).is_absolute()
+        or Path(filename).name != filename
+        or filename in {".", ".."}
+    ):
+        raise ValueError("public vocabulary path must be a safe relative filename")
     if vocabulary["sha256"] != preprocessing["vocabulary_sha256"]:
         raise ValueError("public vocabulary SHA-256 differs from the frozen protocol")
+    vocabulary_path = public_dir / filename
+    vocabulary_bytes = read_regular_file(vocabulary_path, parent=canonical_dir)
     if type(vocabulary["size_bytes"]) is not int or vocabulary["size_bytes"] != len(
         vocabulary_bytes
     ):

@@ -35,19 +35,10 @@ frozen hash seed, Keras backend, and TensorFlow determinism settings exist befor
 the interpreter starts. Missing or conflicting startup values are rejected; do
 not set them later from Python code.
 
-Artifact publication and validation are supported directly on Linux only. They
-depend on Linux descriptor-relative and no-follow filesystem primitives; native
-Windows and macOS execution fails before creating files instead of using weaker
-fallback checks. On Windows, use Docker Desktop from a WSL2 Linux-filesystem
-checkout as documented below; do not prepare through an NTFS bind mount whose
-link semantics cannot satisfy this contract. macOS operators likewise use the
-Linux-container workflow. Other dependency-management commands remain usable on
-their documented platforms.
-
 ## Artifact preparation
 
-On Linux, prepare the raw client shards, shared public vocabulary, and immutable
-untouched evaluation dataset directly:
+Prepare the raw client shards, shared public vocabulary, and immutable untouched
+evaluation dataset:
 
 ```bash
 uv run --env-file .env.protocol python -m src.data_prep --partitions 4 --client-shard-dir artifacts/clients --public-artifact-dir artifacts/public --evaluation-artifact-dir artifacts/evaluation
@@ -60,14 +51,7 @@ adapted on that same split. It writes the official test split in ascending sourc
 order to the selected prepared generation, with stable `test:<row-index>`
 identities and a strict checksum manifest. One atomic `.prepared-current`
 switch selects the matching client, public, and evaluation directories together;
-after an interruption during later preparation, either the prior generation or
-the fully prepared new generation remains selected, depending on whether the
-atomic pointer replacement completed. During the first legacy migration,
-preparation may be interrupted after archiving the legacy roots but before
-all aliases and the pointer are installed, leaving the logical roots only
-partially visible and no generation selected. The durable journal makes that
-state recoverable without byte loss, but preparation must be rerun to complete
-selection. The unsupervised split is
+an interruption leaves the prior generation selected. The unsupervised split is
 verified and excluded. The
 generated directories simulate client-scoped
 storage only after this centralized preparation; they are not evidence that data
@@ -77,25 +61,6 @@ generated. The evaluation directory is immutable and evaluation-only: it must no
 be mounted into ClientApp, the dashboard, or the current training ServerApp. PR14
 and PR15 will add the registered consumers and metrics; this command performs no
 evaluation.
-
-Direct evaluation publication retains and revalidates every no-follow directory
-edge from the filesystem root through the destination parent. Missing parent
-components are created descriptor-relatively and each new edge is flushed before
-the next component is created. A failed publication removes only entries whose
-durable ownership state binds the exact parent, private name, nonce, operation, and
-captured identity to that invocation. Unbound `.staging`/`.deleting` lookalikes,
-corrupt state, and identity replacements are preserved rather than inferred from
-their names.
-
-The first generation created over real legacy `artifacts/clients`,
-`artifacts/public`, or `artifacts/evaluation` directories migrates those complete
-directories by same-filesystem rename into
-`artifacts/.prepared-legacy/<generation-id>/`. It then installs the logical paths
-as aliases to `.prepared-current`. Nothing in the legacy directories is deleted;
-inspect and remove an archived copy only while every consumer is stopped.
-Unrecognized legacy files remain only in that archive and are never copied into a
-selected client, public, or evaluation generation. Public generations expose
-exactly the canonical `manifest.json` and checksummed `vocab.txt` inventory.
 
 The server does not read raw shard files during training, but it receives each
 client's resulting model parameters, sample counts, training metrics, and
@@ -111,15 +76,12 @@ uv run --env-file .env.protocol python -m src.local_training --client-data-dir a
 
 The local command treats `--run-artifact-dir` as a reusable history root. Every
 training invocation writes to a new `runs/<run_id>` directory; finalization binds
-its regular files into a checksum-verified artifact snapshot. Public, private-client,
-current, historical, and evaluation snapshot loaders keep every configured directory
-edge and required file open, read and inventory through retained descriptors, and
-reject even byte-identical directory or file replacement before returning.
+its regular files into a checksum-verified artifact snapshot.
 
-## Direct Flower simulation (Linux)
+## Direct Flower simulation
 
-On Linux, run the Flower app directly using the per-partition raw directories
-generated above. This is the fast local development path and does not use Docker:
+Run the Flower app directly using the per-partition raw directories generated
+above. This is the fast local development path and does not use Docker:
 
 ```bash
 uv run --env-file .env.protocol flwr run . --stream --federation-config "num-supernodes=4"
@@ -131,8 +93,12 @@ Run the dashboard against the selected server artifact directory:
 FML_SERVER_ARTIFACT_DIR=artifacts/server uv run --env-file .env.protocol streamlit run dashboard.py
 ```
 
-On Windows and macOS, use the containerized dashboard in the local distributed
-runtime below so artifact validation remains inside Linux.
+On PowerShell:
+
+```powershell
+$env:FML_SERVER_ARTIFACT_DIR = "artifacts/server"
+uv run --env-file .env.protocol streamlit run dashboard.py
+```
 
 ### Runtime paths
 
@@ -157,7 +123,7 @@ The server never clears its configured artifact root. It writes each experiment 
 metrics, provenance, and verified SHA-256 checksums. Existing completed runs remain
 available for comparison:
 
-```bash
+```powershell
 uv run --env-file .env.protocol flwr run . --stream --federation-config "num-supernodes=4" --run-config "use-update-noise=false use-huber=false"
 uv run --env-file .env.protocol flwr run . --stream --federation-config "num-supernodes=4" --run-config "use-update-noise=false use-huber=true huber-threshold=10.0"
 uv run --env-file .env.protocol flwr run . --stream --federation-config "num-supernodes=4" --run-config "use-update-noise=true use-huber=false"
@@ -173,43 +139,14 @@ Every server run and the documented local-training command create an immutable
 `run_manifest.json` before training. It
 contains a UUID, the Flower run ID, creation time, complete run configuration,
 Python/OS/package versions, Git revision and worktree state when available, known
-seeds, and SHA-256 checksums for the public manifest and vocabulary. The effective
-`master-seed` defaults to `67`; SHA-256 domain-separated namespaces deterministically
-derive distinct model-construction, client/round Dropout and training-order, and
-client/round update-noise streams. Each completed
+seeds, and SHA-256 checksums for the public manifest and vocabulary. Each completed
 `artifact_manifest.json` binds the saved model, metrics, and provenance file bytes
-to their SHA-256 checksums. Completed runs also retain the canonical public
-`manifest.json` and `vocab.txt`; consumers validate those bytes against the frozen
-protocol, require the provenance and model dimensions to match them, and reject
-any unmanifested directory entry before loading. Current and explicit historical
-loads apply the same completed-run provenance, directory-identity, public-evidence,
-vocabulary, checksum, and exact-inventory validation boundary.
-Preparation likewise recovers only the exact staging inode named by its flushed
-ownership record; unrelated `.prepare-*.staging` directories are left untouched.
+to their SHA-256 checksums, which consumers validate and snapshot before loading.
 Set
 `FML_CODE_REVISION` to the full Git object ID in images that do not contain `.git`.
 Client shard identities and checksums are not collected by the server manifest.
 In this demo the operator still created all shards centrally; the boundary only
 describes what ServerApp reads at runtime.
-
-Completed-run publication retains no-follow descriptors and filesystem identities
-for every visible edge from the filesystem root through the artifact root, canonical
-`runs/` directory, selected run, and every captured file. The same complete chain is
-revalidated for creation, finalization, recovery, current publication, and pruning.
-Finalizers lock the retained root inode, but still reject a detached visible path;
-replacing a visible lock pathname cannot split serialization across same-run or
-different-run publishers. Public `manifest.json` and `vocab.txt` retention, completed
-manifest installation, and all final verification use the retained run descriptor,
-so a replacement at the run pathname receives no finalization writes. Before the
-final barriers, an atomically replaced private state file records the exact candidate
-pointer and the exact previous pointer identity, bytes, and checksum, or absence. It
-is written through an exclusive temporary file, flushed, renamed descriptor-relatively,
-and followed by a retained-root flush without truncating prior durable state. A retry
-accepts only the recorded previous pointer, from which it republishes, or the exact
-candidate pointer, from which it completes recovery after full revalidation and every
-barrier. Divergent pointers are rejected, and successful publication or one-time
-recovery rejects later retries. No publication call reports success unless every
-required barrier completes.
 
 `artifact-retention-runs` defaults to `10`. Retention orders validated run
 manifests by `(created_at, run_id)`, keeps the newest configured count, and never
@@ -218,29 +155,11 @@ directories are left untouched for manual recovery.
 
 ## Local distributed Docker runtime
 
-Stop the runtime before every preparation. Already-running containers retain the
-immutable directory resolved when their bind mount was created, so they do not
-follow a later `.prepared-current` switch. `docker compose down`, prepare, and
-then recreate the stack; this prevents a run from mixing generations.
-
-On Linux, direct preparation remains available as shown above. Set the host IDs
-when using the Linux-container workflow so generated files retain host ownership:
+Prepare the four client shards, public artifacts, and host-only evaluation
+artifact before starting the runtime:
 
 ```bash
-docker compose down
-mkdir -p artifacts artifacts/server
-FML_HOST_UID="$(id -u)" FML_HOST_GID="$(id -g)" docker compose --profile prepare run --rm --build data-prep
-```
-
-On Windows, enable Docker Desktop's WSL2 integration and keep the checkout in the
-WSL2 Linux filesystem (for example `~/src/federated-machine-learning-independent`,
-not `/mnt/c/...`). Run the same commands from the WSL shell. This preserves Linux
-links, repository-relative paths, and the WSL user's ownership:
-
-```bash
-docker compose down
-mkdir -p artifacts artifacts/server
-FML_HOST_UID="$(id -u)" FML_HOST_GID="$(id -g)" docker compose --profile prepare run --rm --build data-prep
+uv run --env-file .env.protocol python -m src.data_prep --partitions 4 --client-shard-dir artifacts/clients --public-artifact-dir artifacts/public --evaluation-artifact-dir artifacts/evaluation
 ```
 
 Build the single application image and start the separate SuperLink, ServerApp,
@@ -268,13 +187,11 @@ four SuperNodes are registered online. The insecure connection is appropriate
 only for this loopback-only local runtime; do not use it for a remote or public
 SuperLink.
 
-The dashboard is available at <http://127.0.0.1:8501>. Compose resolves every
-public and client bind source below `.prepared-current`, so a legacy directory
-cannot shadow the selected generation. Each ClientApp receives only its matching
-client shard as a read-only mount. Public artifacts are read-only in every
-consuming service; only ServerApp can write `artifacts/server`, which the
-dashboard and offline preparation service mount read-only. The untouched
-evaluation directory is not mounted into any PR13 runtime service. Stop the
+The dashboard is available at <http://127.0.0.1:8501>. Each ClientApp receives
+only its matching `artifacts/clients/client-N` shard as a read-only mount. Public
+artifacts are read-only in every consuming service; only ServerApp can write
+`artifacts/server`, which the dashboard mounts read-only. The untouched
+`artifacts/evaluation` directory is not mounted into this PR13 runtime. Stop the
 runtime with `docker compose down`.
 
 ### Security and privacy scope

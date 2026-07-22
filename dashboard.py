@@ -14,11 +14,7 @@ from src.protocol_runtime import validate_protocol_runtime
 import keras
 import tensorflow as tf
 
-from src.app_manifest import (
-    AppManifest,
-    load_app_manifest,
-    resolve_public_artifact_dir,
-)
+from src.app_manifest import AppManifest, load_app_manifest
 from src.artifact_history import CURRENT_RUN_FILENAME, load_current_run_snapshot
 from src.artifact_compatibility import (
     SERVER_ARTIFACT_MANIFEST_FILENAME,
@@ -62,17 +58,13 @@ def _is_fresh_artifact_root(root: Path) -> bool:
     )
 
 
-def load_model(
-    path: Path | None = None, *, app_manifest: AppManifest | None = None
-) -> Any:
+def load_model(path: Path | None = None) -> Any:
     """Load the trained global sentiment model.
 
     Parameters
     ----------
     path : pathlib.Path or None, optional
         Explicit legacy model path, or ``None`` to load the current run snapshot.
-    app_manifest : AppManifest or None, optional
-        Public snapshot already retained by the dashboard operation.
 
     Returns
     -------
@@ -85,44 +77,8 @@ def load_model(
         If no trained model artifact exists.
     """
     validate_protocol_runtime()
-    public_snapshot = app_manifest or load_public_snapshot()
-    return _load_bound_model(public_snapshot, path)
-
-
-@st.cache_resource
-def _load_public_snapshot_at(public_dir: Path) -> AppManifest:
-    """Load and cache one immutable public generation directory.
-
-    Parameters
-    ----------
-    public_dir : pathlib.Path
-        Canonical immutable public generation directory.
-
-    Returns
-    -------
-    AppManifest
-        Validated public artifact snapshot.
-    """
-    return load_app_manifest(public_artifact_dir=public_dir)
-
-
-def load_public_snapshot() -> AppManifest:
-    """Load the currently selected validated public artifact snapshot.
-
-    Returns
-    -------
-    AppManifest
-        Cached snapshot keyed by its immutable generation directory.
-
-    Raises
-    ------
-    ValueError
-        If the selected generation or public artifacts are unsafe or incompatible.
-    """
-    public_dir = resolve_public_artifact_dir(
-        public_artifact_dir=PUBLIC_ARTIFACT_DIR
-    ).resolve(strict=True)
-    return _load_public_snapshot_at(public_dir)
+    app_manifest = load_app_manifest(public_artifact_dir=PUBLIC_ARTIFACT_DIR)
+    return _load_bound_model(app_manifest, path)
 
 
 def _load_bound_model(app_manifest: AppManifest, path: Path | None = None) -> Any:
@@ -208,15 +164,9 @@ def _validate_model_dimensions(model: Any, public_manifest: Mapping[str, Any]) -
         )
 
 
-def load_vectorizer(
-    app_manifest: AppManifest | None = None,
-) -> keras.layers.TextVectorization:
+@st.cache_resource
+def load_vectorizer() -> keras.layers.TextVectorization:
     """Load the checksum-verified public vocabulary into the shared vectorizer.
-
-    Parameters
-    ----------
-    app_manifest : AppManifest or None, optional
-        Public snapshot already retained by the current operation.
 
     Returns
     -------
@@ -228,18 +178,15 @@ def load_vectorizer(
     ValueError
         If the public manifest or vocabulary artifact is invalid.
     """
-    public_snapshot = app_manifest or load_public_snapshot()
+    app_manifest = load_app_manifest(public_artifact_dir=PUBLIC_ARTIFACT_DIR)
     return create_text_vectorizer(
-        sequence_length=public_snapshot.payload["sequence_length"],
-        vocabulary=public_snapshot.vocabulary_terms[2:],
+        sequence_length=app_manifest.payload["sequence_length"],
+        vocabulary=app_manifest.vocabulary_terms[2:],
     )
 
 
 def load_metrics(
-    path: Path | None = None,
-    *,
-    filename: str = "metrics.csv",
-    app_manifest: AppManifest | None = None,
+    path: Path | None = None, *, filename: str = "metrics.csv"
 ) -> pd.DataFrame | None:
     """Load metrics from a compatible server artifact directory.
 
@@ -249,9 +196,6 @@ def load_metrics(
         Metrics CSV path.
     filename : str, optional
         Current-run artifact filename used when ``path`` is ``None``.
-    app_manifest : AppManifest or None, optional
-        Validated public snapshot that the server artifacts must match. The
-        currently selected snapshot is loaded when omitted.
 
     Returns
     -------
@@ -265,11 +209,10 @@ def load_metrics(
     """
     if path is None and _is_fresh_artifact_root(ARTIFACT_ROOT):
         return None
-    public_snapshot = app_manifest or load_public_snapshot()
     snapshot = (
-        load_current_run_snapshot(ARTIFACT_ROOT, app_manifest=public_snapshot)
+        load_current_run_snapshot(ARTIFACT_ROOT)
         if path is None
-        else load_server_artifact_snapshot(path.parent, app_manifest=public_snapshot)
+        else load_server_artifact_snapshot(path.parent)
     )
     content = snapshot.files.get(path.name if path is not None else filename)
     if content is None:
@@ -283,17 +226,13 @@ def load_metrics(
     return df
 
 
-def predict_sentiment(
-    review_text: str, *, app_manifest: AppManifest | None = None
-) -> tuple[float, str]:
+def predict_sentiment(review_text: str) -> tuple[float, str]:
     """Predict sentiment with one mutually bound model and vocabulary snapshot.
 
     Parameters
     ----------
     review_text : str
         Review text to classify.
-    app_manifest : AppManifest or None, optional
-        Public snapshot already retained by the current dashboard rerun.
 
     Returns
     -------
@@ -306,9 +245,12 @@ def predict_sentiment(
         If runtime or artifact compatibility validation fails.
     """
     validate_protocol_runtime()
-    public_snapshot = app_manifest or load_public_snapshot()
-    model = _load_bound_model(public_snapshot)
-    vectorizer = load_vectorizer(public_snapshot)
+    app_manifest = load_app_manifest(public_artifact_dir=PUBLIC_ARTIFACT_DIR)
+    model = _load_bound_model(app_manifest)
+    vectorizer = create_text_vectorizer(
+        sequence_length=app_manifest.payload["sequence_length"],
+        vocabulary=app_manifest.vocabulary_terms[2:],
+    )
     inputs = tf.constant([review_text])
     token_ids = vectorizer(inputs)
     preds = model.predict(token_ids, verbose=0)
@@ -332,7 +274,6 @@ def main() -> None:
     None
     """
     st.set_page_config(page_title="Federated Sentiment Dashboard", layout="wide")
-    app_manifest = load_public_snapshot()
 
     if "auto_refresh" not in st.session_state:
         st.session_state.auto_refresh = True
@@ -394,9 +335,7 @@ def main() -> None:
 
         if st.button("Predict sentiment") and review.strip():
             try:
-                positive_prob, label = predict_sentiment(
-                    review, app_manifest=app_manifest
-                )
+                positive_prob, label = predict_sentiment(review)
                 st.markdown("### Positive sentiment probability")
                 st.markdown(f"**{positive_prob * 100:.1f}%**")
                 st.markdown(f"**Prediction:** {label}")
@@ -406,7 +345,7 @@ def main() -> None:
     with col_right:
         st.subheader("Training metrics")
 
-        df_metrics = load_metrics(app_manifest=app_manifest)
+        df_metrics = load_metrics()
         if df_metrics is None:
             st.info(
                 "Noch keine Trainingsmetriken gefunden. Wenn gerade ein neuer Lauf startet, "
@@ -428,9 +367,7 @@ def main() -> None:
                 )
 
             st.subheader("Client evaluation accuracy")
-            df_client_metrics = load_metrics(
-                filename="client_metrics.csv", app_manifest=app_manifest
-            )
+            df_client_metrics = load_metrics(filename="client_metrics.csv")
             client_columns = {"round", "client_id", "accuracy"}
             if df_client_metrics is None:
                 st.info("Per-client metrics will appear during the next training run.")

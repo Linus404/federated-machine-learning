@@ -8,22 +8,6 @@ permissions:
   contents: read
 
 jobs:
-  platform-contract:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Reject native Windows artifact handling before mutation
-        shell: python
-        run: |
-          from src.artifact_compatibility import require_secure_artifact_platform
-
-          try:
-              require_secure_artifact_platform()
-          except RuntimeError as error:
-              assert "require Linux" in str(error)
-          else:
-              raise AssertionError("native Windows artifact handling was accepted")
-
   quality:
     runs-on: ubuntu-latest
     steps:
@@ -50,8 +34,8 @@ jobs:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
       - run: uv sync --frozen
-      - run: uv run --env-file .env.protocol coverage run -m unittest discover -s tests -v
-      - run: uv run --env-file .env.protocol coverage report
+      - run: uv run coverage run -m unittest discover -s tests -v
+      - run: uv run coverage report
 
   security:
     runs-on: ubuntu-latest
@@ -109,14 +93,12 @@ jobs:
       - name: Build application image
         run: docker compose build superlink
       - name: Smoke test application image
-        run: |
-          docker compose run --rm --no-deps superlink \
-            uv run --no-sync python -c \
-            'from src.client_app import app as client_app; from src.server_app import app as server_app; from src.evaluation_artifact import load_scientific_protocol; assert client_app is not None and server_app is not None and load_scientific_protocol()["protocol_version"] == 1'
-          docker compose run --rm --no-deps superlink \
-            uv run --no-sync python -m src.data_prep --help
-      - name: Probe absent prepared bind behavior
-        run: python -m unittest tests.test_deployment_contracts
+        run: >-
+          docker compose run --rm --no-deps superlink
+          uv run --no-sync python -c
+          'from src.client_app import app as client_app;
+          from src.server_app import app as server_app;
+          assert client_app is not None and server_app is not None'
       - name: Report container vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         env:

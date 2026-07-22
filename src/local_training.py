@@ -4,12 +4,11 @@ import argparse
 import csv
 import json
 import math
-import os
 import warnings
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, TypeAlias
+from typing import Any, Mapping, TypeAlias
 
 from src.protocol_runtime import validate_protocol_runtime
 
@@ -19,10 +18,9 @@ import numpy as np
 from src.app_manifest import AppManifest, load_app_manifest
 from src.artifact_compatibility import (
     CLIENT_SHARD_SCHEMA_VERSION,
-    RetainedDirectoryChain,
     canonical_json_bytes,
     deep_freeze,
-    read_regular_file_snapshot_at,
+    read_regular_file,
     sha256_bytes,
     validate_artifact_schema,
     write_server_artifact_manifest,
@@ -42,12 +40,6 @@ from src.paths import (
     default_public_artifact_dir,
     resolve_dir,
     resolve_prepared_artifact_dir,
-)
-from src.reproducibility import (
-    DEFAULT_MASTER_SEED,
-    MASTER_SEED_CONFIG_KEY,
-    derive_seed,
-    effective_master_seed,
 )
 from src.text_preprocessing import create_text_vectorizer
 
@@ -187,90 +179,21 @@ def load_client_shard_snapshot(
     logical_directory = resolve_dir(client_data_dir)
     client_root = resolve_prepared_artifact_dir(logical_directory.parent, "client")
     directory = client_root / logical_directory.name
-    chain = RetainedDirectoryChain.open(
-        directory,
-        error_message="client shard directory chain changed while loading",
-    )
-    with chain:
-        canonical_dir = chain.path
-        descriptor = chain.directory.descriptor
-        expected_inventory = {CLIENT_METADATA_FILENAME, CLIENT_REVIEWS_FILENAME}
-        if set(os.listdir(descriptor)) != expected_inventory:
-            raise ValueError("client shard contains unexpected files")
-        chain.verify()
-        retained_metadata = read_regular_file_snapshot_at(
-            descriptor,
-            CLIENT_METADATA_FILENAME,
-            retain=True,
-        )
-        with retained_metadata:
-            metadata_bytes = retained_metadata.snapshot.content
-            chain.verify()
-            retained_records = read_regular_file_snapshot_at(
-                descriptor,
-                CLIENT_REVIEWS_FILENAME,
-                retain=True,
-            )
-            with retained_records:
-                records_bytes = retained_records.snapshot.content
-                chain.verify()
-                snapshot = _validate_client_shard_bytes(
-                    canonical_dir,
-                    metadata_bytes,
-                    records_bytes,
-                    manifest,
-                    expected_client_id,
-                    verify=chain.verify,
-                )
-                chain.verify()
-                if set(os.listdir(descriptor)) != expected_inventory:
-                    raise ValueError("client shard inventory changed while loading")
-                retained_metadata.verify(
-                    descriptor,
-                    CLIENT_METADATA_FILENAME,
-                    expected_content=metadata_bytes,
-                )
-                retained_records.verify(
-                    descriptor,
-                    CLIENT_REVIEWS_FILENAME,
-                    expected_content=records_bytes,
-                )
-                chain.verify()
-                return snapshot
-
-
-def _validate_client_shard_bytes(
-    canonical_dir: Path,
-    metadata_bytes: bytes,
-    records_bytes: bytes,
-    manifest: AppManifest,
-    expected_client_id: int,
-    *,
-    verify: Callable[[], None],
-) -> ClientShardSnapshot:
-    """Validate retained client-shard bytes under repeated ownership checks.
-
-    Parameters
-    ----------
-    canonical_dir : pathlib.Path
-        Retained shard directory used for diagnostics.
-    metadata_bytes : bytes
-        Exact retained metadata bytes.
-    records_bytes : bytes
-        Exact retained canonical record bytes.
-    manifest : AppManifest
-        Validated public artifact snapshot bound by shard metadata.
-    expected_client_id : int
-        Client identity assigned by the caller.
-    verify : callable
-        Complete visible-chain validation run at material boundaries.
-
-    Returns
-    -------
-    ClientShardSnapshot
-        Fully validated immutable shard snapshot.
-    """
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("client shard directory must be a regular directory")
+    canonical_dir = directory.resolve(strict=True)
+    if {path.name for path in directory.iterdir()} != {
+        CLIENT_METADATA_FILENAME,
+        CLIENT_REVIEWS_FILENAME,
+    }:
+        raise ValueError("client shard contains unexpected files")
     try:
+        metadata_bytes = read_regular_file(
+            directory / CLIENT_METADATA_FILENAME, parent=canonical_dir
+        )
+        records_bytes = read_regular_file(
+            directory / CLIENT_REVIEWS_FILENAME, parent=canonical_dir
+        )
         decoded = json.loads(metadata_bytes.decode("utf-8"))
         metadata = _require_exact_mapping_fields(
             validate_artifact_schema(
@@ -283,7 +206,6 @@ def _validate_client_shard_bytes(
         )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError) as error:
         raise ValueError("invalid client shard") from error
-    verify()
     if metadata_bytes != canonical_json_bytes(metadata):
         raise ValueError("client shard metadata bytes are not canonical")
     if metadata["artifact_type"] != "private_client_train_shard":
@@ -300,7 +222,6 @@ def _validate_client_shard_bytes(
         or metadata["row_identity"] != CLIENT_ROW_IDENTITY
     ):
         raise ValueError("client shard row identity contract is invalid")
-    verify()
     if (
         type(metadata["split_seed"]) is not int
         or metadata["split_seed"] < 0
@@ -319,7 +240,6 @@ def _validate_client_shard_bytes(
         for label, count in histogram.items()
     ):
         raise ValueError("client shard label histogram is invalid")
-    verify()
     records_contract = _require_exact_mapping_fields(
         metadata["records"],
         {"filename", "format", "encoding", "newline", "trailing_newline", "checksum"},
@@ -345,7 +265,6 @@ def _validate_client_shard_bytes(
         "checksum": sha256_bytes(manifest.manifest_bytes),
     }:
         raise ValueError("client shard public manifest binding is invalid")
-    verify()
 
     rows: list[tuple[str, str, int]] = []
     counts: Counter[int] = Counter()
@@ -380,21 +299,18 @@ def _validate_client_shard_bytes(
         identities.add(row_id)
         counts[label] += 1
         rows.append((row_id, text, label))
-        verify()
     if len(rows) != metadata["sample_count"]:
         raise ValueError("client shard sample count differs from its records")
     actual_histogram = {str(label): count for label, count in sorted(counts.items())}
     if actual_histogram != dict(histogram):
         raise ValueError("client shard label histogram differs from its records")
-    snapshot = ClientShardSnapshot(
+    return ClientShardSnapshot(
         canonical_dir,
         deep_freeze(metadata),
         metadata_bytes,
         records_bytes,
         tuple(rows),
     )
-    verify()
-    return snapshot
 
 
 def _stratified_split_indices(
@@ -510,9 +426,6 @@ def build_model(
     vocab_size: int,
     sequence_length: int,
     embedding_dim: int,
-    *,
-    master_seed: int = DEFAULT_MASTER_SEED,
-    seed_namespace: tuple[str | int, ...] = ("standalone",),
 ) -> Any:
     """Build the sentiment model reused by local and federated training.
 
@@ -524,10 +437,6 @@ def build_model(
         Exact frozen token sequence length.
     embedding_dim : int
         Exact frozen embedding dimension.
-    master_seed : int, optional
-        Effective run master seed.
-    seed_namespace : tuple of str or int, optional
-        Namespace identifying this model construction.
 
     Returns
     -------
@@ -540,9 +449,6 @@ def build_model(
         If the runtime differs from the frozen protocol.
     """
     validate_protocol_runtime()
-    keras.utils.set_random_seed(
-        derive_seed(master_seed, *seed_namespace, "model-construction")
-    )
     inputs = keras.Input(shape=(sequence_length,), dtype="int32")
 
     x = keras.layers.Embedding(vocab_size, embedding_dim, name="token_embedding")(
@@ -560,10 +466,7 @@ def build_model(
     )(x)
     x = keras.layers.GlobalMaxPooling1D()(x)
     x = keras.layers.Dense(32, activation="relu")(x)
-    x = keras.layers.Dropout(
-        0.3,
-        seed=derive_seed(master_seed, *seed_namespace, "dropout", "initial"),
-    )(x)
+    x = keras.layers.Dropout(0.3)(x)
 
     outputs = keras.layers.Dense(1, activation="sigmoid")(x)
 
@@ -571,38 +474,6 @@ def build_model(
     model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
 
     return model
-
-
-def seed_model_training(
-    model: Any,
-    master_seed: int,
-    *seed_namespace: str | int,
-) -> None:
-    """Reset deterministic training-order and Dropout streams.
-
-    Parameters
-    ----------
-    model : Any
-        Keras model whose Dropout streams are reset.
-    master_seed : int
-        Effective run master seed.
-    *seed_namespace : str or int
-        Client/local and round namespace components.
-
-    Returns
-    -------
-    None
-    """
-    keras.utils.set_random_seed(
-        derive_seed(master_seed, *seed_namespace, "training-order")
-    )
-    for layer_index, layer in enumerate(model.layers):
-        if isinstance(layer, keras.layers.Dropout):
-            dropout_seed = derive_seed(
-                master_seed, *seed_namespace, "dropout", layer_index
-            )
-            layer.seed = dropout_seed
-            layer.seed_generator.state.assign([dropout_seed, 0])
 
 
 def train(args: argparse.Namespace) -> tuple[Any, Any]:
@@ -630,17 +501,15 @@ def train(args: argparse.Namespace) -> tuple[Any, Any]:
         "client-id": getattr(args, "client_id", 0),
         "client-data-dir": args.client_data_dir,
         "epochs": args.epochs,
-        MASTER_SEED_CONFIG_KEY: getattr(args, "master_seed", DEFAULT_MASTER_SEED),
         "public-artifact-dir": args.public_artifact_dir,
         "quiet": args.quiet,
         "run-artifact-dir": args.run_artifact_dir,
         "validation-seed": DEFAULT_VALIDATION_SEED,
         "validation-split": args.validation_split,
     }
-    master_seed = effective_master_seed(run_config)
-    manifest = load_app_manifest(public_artifact_dir=args.public_artifact_dir)
     lock = acquire_run_artifact_lock(artifact_root)
     try:
+        manifest = load_app_manifest(public_artifact_dir=args.public_artifact_dir)
         shard_snapshot = load_client_shard_snapshot(
             args.client_data_dir,
             manifest,
@@ -651,20 +520,14 @@ def train(args: argparse.Namespace) -> tuple[Any, Any]:
             run_config,
             public_artifact_dir=args.public_artifact_dir,
             client_shard=shard_snapshot.provenance(),
-            app_manifest=manifest,
         )
         prune_run_history(artifact_root, retention_runs, active_run_dir=run_dir)
         write_server_artifact_manifest(run_dir, app_manifest=manifest)
         train_data, val_data = _tokenize_client_shard(
             shard_snapshot, manifest, args.validation_split
         )
-        model = build_model_from_manifest(
-            manifest,
-            master_seed=master_seed,
-            seed_namespace=("local",),
-        )
+        model = build_model_from_manifest(manifest)
 
-        seed_model_training(model, master_seed, "local", "round", 1)
         history = model.fit(
             *train_data,
             validation_data=val_data,
@@ -686,7 +549,7 @@ def train(args: argparse.Namespace) -> tuple[Any, Any]:
                 writer.writerow(
                     {"round": epoch, "loss": epoch_loss, "accuracy": epoch_accuracy}
                 )
-        publish_completed_run(artifact_root, run_dir, app_manifest=manifest)
+        publish_completed_run(artifact_root, run_dir)
         prune_run_history(artifact_root, retention_runs, active_run_dir=run_dir)
     finally:
         lock.release()
@@ -718,30 +581,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--epochs", type=int, default=DEFAULT_LOCAL_EPOCHS)
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument(
-        f"--{MASTER_SEED_CONFIG_KEY}", type=int, default=DEFAULT_MASTER_SEED
-    )
     parser.add_argument("--validation-split", type=float, default=0.2)
     parser.add_argument("--quiet", action="store_true")
     return parser.parse_args(argv)
 
 
-def build_model_from_manifest(
-    manifest: AppManifest,
-    *,
-    master_seed: int = DEFAULT_MASTER_SEED,
-    seed_namespace: tuple[str | int, ...] = ("standalone",),
-) -> Any:
+def build_model_from_manifest(manifest: AppManifest) -> Any:
     """Build the sentiment model from public manifest metadata.
 
     Parameters
     ----------
     manifest : AppManifest
         Manifest containing the model dimensions.
-    master_seed : int, optional
-        Effective run master seed.
-    seed_namespace : tuple of str or int, optional
-        Namespace identifying this model construction.
 
     Returns
     -------
@@ -754,8 +605,6 @@ def build_model_from_manifest(
         payload["vocabulary_size"],
         payload["sequence_length"],
         payload["embedding_dim"],
-        master_seed=master_seed,
-        seed_namespace=seed_namespace,
     )
 
 

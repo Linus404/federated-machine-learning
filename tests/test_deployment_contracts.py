@@ -1,7 +1,3 @@
-import shutil
-import subprocess
-import tempfile
-import textwrap
 import unittest
 from pathlib import Path
 
@@ -50,26 +46,10 @@ class DistributedDeploymentContractTests(unittest.TestCase):
             and not line.startswith("    ")
             and line.endswith(":")
         }
-        expected = {"data-prep", "superlink", "serverapp", "dashboard"}
+        expected = {"superlink", "serverapp", "dashboard"}
         expected.update(f"supernode-{index}" for index in range(4))
         expected.update(f"clientapp-{index}" for index in range(4))
         self.assertEqual(services, expected)
-
-    def test_ci_matrix_uses_protocol_environment_before_coverage_startup(
-        self,
-    ) -> None:
-        workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
-
-        self.assertIn('python-version: ["3.11", "3.12", "3.13"]', workflow)
-        self.assertIn(
-            "uv run --env-file .env.protocol coverage run -m unittest discover -s tests -v",
-            workflow,
-        )
-        self.assertIn(
-            "uv run --env-file .env.protocol coverage report",
-            workflow,
-        )
-        self.assertNotIn("uv run coverage ", workflow)
 
     def test_host_ports_are_published_on_loopback_only(self) -> None:
         self.assertIn('"127.0.0.1:9093:9093"', service_block(self.compose, "superlink"))
@@ -112,7 +92,6 @@ class DistributedDeploymentContractTests(unittest.TestCase):
 
     def test_distributed_stack_uses_separate_flower_roles_with_one_image(self) -> None:
         expected_commands = {
-            "data-prep": "python -m src.data_prep",
             "superlink": "flower-superlink",
             "serverapp": "flower-superexec",
             "dashboard": "streamlit run dashboard.py",
@@ -166,10 +145,6 @@ class DistributedDeploymentContractTests(unittest.TestCase):
 
         self.assertIn(".git", dockerignore)
         self.assertNotIn("COPY .git", dockerfile)
-        self.assertIn(
-            "COPY docs/scientific-protocol-v1.toml ./docs/scientific-protocol-v1.toml",
-            dockerfile,
-        )
 
     def test_contract_helpers_follow_project_docstring_conventions(self) -> None:
         docstring = service_block.__doc__ or ""
@@ -181,15 +156,13 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         for index in range(4):
             clientapp = service_block(self.compose, f"clientapp-{index}")
             with self.subTest(index=index):
-                source = f"source: ./artifacts/.prepared-current/client/client-{index}"
-                self.assertIn(source, clientapp)
+                self.assertIn(f"source: ./artifacts/clients/client-{index}", clientapp)
                 self.assertEqual(
-                    self.compose.count(source),
+                    self.compose.count(f"source: ./artifacts/clients/client-{index}"),
                     1,
                 )
                 self.assertIn("target: /app/client-data", clientapp)
                 self.assertIn("read_only: true", clientapp)
-                self.assertIn("create_host_path: false", clientapp)
                 for other_index in set(range(4)) - {index}:
                     self.assertNotIn(f"client-{other_index}", clientapp)
 
@@ -218,16 +191,8 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         for service in consumers:
             with self.subTest(service=service):
                 self.assertIn(
-                    "source: ./artifacts/.prepared-current/public",
+                    "./artifacts/public:/app/artifacts/public:ro",
                     service_block(self.compose, service),
-                )
-                self.assertIn(
-                    "target: /app/artifacts/public",
-                    service_block(self.compose, service),
-                )
-                self.assertIn("read_only: true", service_block(self.compose, service))
-                self.assertIn(
-                    "create_host_path: false", service_block(self.compose, service)
                 )
         for service in ["superlink"] + [f"supernode-{index}" for index in range(4)]:
             with self.subTest(service=service):
@@ -238,16 +203,8 @@ class DistributedDeploymentContractTests(unittest.TestCase):
     def test_untouched_evaluation_artifact_is_not_exposed_to_runtime_services(
         self,
     ) -> None:
-        runtime_services = (
-            ["superlink", "serverapp", "dashboard"]
-            + [f"supernode-{index}" for index in range(4)]
-            + [f"clientapp-{index}" for index in range(4)]
-        )
-        for service in runtime_services:
-            with self.subTest(service=service):
-                block = service_block(self.compose, service)
-                self.assertNotIn("artifacts/evaluation", block)
-                self.assertNotIn("FML_EVALUATION_ARTIFACT_DIR", block)
+        self.assertNotIn("artifacts/evaluation", self.compose)
+        self.assertNotIn("FML_EVALUATION_ARTIFACT_DIR", self.compose)
 
     def test_server_outputs_have_one_writer_and_read_only_dashboard(self) -> None:
         self.assertIn(
@@ -258,90 +215,6 @@ class DistributedDeploymentContractTests(unittest.TestCase):
             "./artifacts/server:/app/artifacts/server:ro",
             service_block(self.compose, "dashboard"),
         )
-        self.assertIn(
-            "./artifacts/server:/app/artifacts/server:ro",
-            service_block(self.compose, "data-prep"),
-        )
-
-    def test_offline_container_preparation_preserves_host_paths_and_ownership(
-        self,
-    ) -> None:
-        data_prep = service_block(self.compose, "data-prep")
-        readme = Path("README.md").read_text(encoding="utf-8")
-
-        self.assertIn("profiles:\n      - prepare", data_prep)
-        self.assertIn("${FML_HOST_UID:-1000}:${FML_HOST_GID:-1000}", data_prep)
-        self.assertIn("./artifacts:/app/artifacts", data_prep)
-        self.assertIn("--client-shard-dir artifacts/clients", data_prep)
-        self.assertIn("--public-artifact-dir artifacts/public", data_prep)
-        self.assertIn("--evaluation-artifact-dir artifacts/evaluation", data_prep)
-        self.assertIn(
-            "docker compose --profile prepare run --rm --build data-prep", readme
-        )
-        self.assertIn("FML_HOST_UID", readme)
-        self.assertIn("WSL2 Linux filesystem", readme)
-        self.assertIn("not `/mnt/c/", readme)
-
-    def test_prepared_mounts_bypass_legacy_directories_and_require_recreation(
-        self,
-    ) -> None:
-        readme = Path("README.md").read_text(encoding="utf-8")
-
-        self.assertNotIn("./artifacts/public:/app/artifacts/public:ro", self.compose)
-        self.assertEqual(
-            self.compose.count("source: ./artifacts/.prepared-current/public"),
-            6,
-        )
-        self.assertEqual(self.compose.count("create_host_path: false"), 10)
-        self.assertIn("already-running containers", readme.lower())
-        self.assertIn("docker compose down", readme)
-
-    def test_docker_engine_refuses_absent_prepared_bind_without_mutation(self) -> None:
-        if shutil.which("docker") is None:
-            self.skipTest("Docker CLI is unavailable")
-        if subprocess.run(
-            ["docker", "info"], check=False, capture_output=True
-        ).returncode:
-            self.skipTest("Docker engine is unavailable")
-        image = "federated-machine-learning:latest"
-        if subprocess.run(
-            ["docker", "image", "inspect", image], check=False, capture_output=True
-        ).returncode:
-            self.skipTest("exact application image has not been built")
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            absent = root / "missing-prepared-source"
-            compose = root / "compose.yaml"
-            compose.write_text(
-                textwrap.dedent(
-                    f"""
-                    services:
-                      probe:
-                        image: {image}
-                        pull_policy: never
-                        entrypoint: ["/bin/true"]
-                        volumes:
-                          - type: bind
-                            source: {absent}
-                            target: /app/prepared
-                            read_only: true
-                            bind:
-                              create_host_path: false
-                    """
-                ),
-                encoding="utf-8",
-            )
-
-            completed = subprocess.run(
-                ["docker", "compose", "-f", str(compose), "run", "--rm", "probe"],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-
-            self.assertNotEqual(completed.returncode, 0)
-            self.assertFalse(absent.exists())
 
     def test_local_superlink_profile_uses_user_flower_config(self) -> None:
         pyproject = Path("pyproject.toml").read_text(encoding="utf-8")

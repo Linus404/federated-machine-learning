@@ -27,26 +27,6 @@ x-supernode: &supernode
     start_period: 10s
 
 services:
-  data-prep:
-    <<: *flower-service
-    build: .
-    profiles:
-      - prepare
-    restart: "no"
-    user: "${FML_HOST_UID:-1000}:${FML_HOST_GID:-1000}"
-    environment:
-      HOME: /tmp/fml-home
-    command: >
-      sh -c 'mkdir -p "$${HOME}" &&
-      uv run --no-sync python -m src.data_prep
-      --partitions 4
-      --client-shard-dir artifacts/clients
-      --public-artifact-dir artifacts/public
-      --evaluation-artifact-dir artifacts/evaluation'
-    volumes:
-      - ./artifacts:/app/artifacts
-      - ./artifacts/server:/app/artifacts/server:ro
-
   superlink:
     <<: *flower-service
     build: .
@@ -90,12 +70,7 @@ services:
       superlink:
         condition: service_healthy
     volumes:
-      - type: bind
-        source: ./artifacts/.prepared-current/public
-        target: /app/artifacts/public
-        read_only: true
-        bind:
-          create_host_path: false
+      - ./artifacts/public:/app/artifacts/public:ro
       - ./artifacts/server:/app/artifacts/server
 
   supernode-0:
@@ -124,18 +99,11 @@ services:
       supernode-0:
         condition: service_healthy
     volumes:
+      - ./artifacts/public:/app/artifacts/public:ro
       - type: bind
-        source: ./artifacts/.prepared-current/public
-        target: /app/artifacts/public
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./artifacts/.prepared-current/client/client-0
+        source: ./artifacts/clients/client-0
         target: /app/client-data
         read_only: true
-        bind:
-          create_host_path: false
 
   supernode-1:
     <<: *supernode
@@ -163,18 +131,11 @@ services:
       supernode-1:
         condition: service_healthy
     volumes:
+      - ./artifacts/public:/app/artifacts/public:ro
       - type: bind
-        source: ./artifacts/.prepared-current/public
-        target: /app/artifacts/public
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./artifacts/.prepared-current/client/client-1
+        source: ./artifacts/clients/client-1
         target: /app/client-data
         read_only: true
-        bind:
-          create_host_path: false
 
   supernode-2:
     <<: *supernode
@@ -202,18 +163,11 @@ services:
       supernode-2:
         condition: service_healthy
     volumes:
+      - ./artifacts/public:/app/artifacts/public:ro
       - type: bind
-        source: ./artifacts/.prepared-current/public
-        target: /app/artifacts/public
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./artifacts/.prepared-current/client/client-2
+        source: ./artifacts/clients/client-2
         target: /app/client-data
         read_only: true
-        bind:
-          create_host_path: false
 
   supernode-3:
     <<: *supernode
@@ -241,18 +195,11 @@ services:
       supernode-3:
         condition: service_healthy
     volumes:
+      - ./artifacts/public:/app/artifacts/public:ro
       - type: bind
-        source: ./artifacts/.prepared-current/public
-        target: /app/artifacts/public
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./artifacts/.prepared-current/client/client-3
+        source: ./artifacts/clients/client-3
         target: /app/client-data
         read_only: true
-        bind:
-          create_host_path: false
 
   dashboard:
     <<: *flower-service
@@ -267,12 +214,7 @@ services:
     ports:
       - "127.0.0.1:8501:8501"
     volumes:
-      - type: bind
-        source: ./artifacts/.prepared-current/public
-        target: /app/artifacts/public
-        read_only: true
-        bind:
-          create_host_path: false
+      - ./artifacts/public:/app/artifacts/public:ro
       - ./artifacts/server:/app/artifacts/server:ro
 
 volumes:

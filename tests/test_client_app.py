@@ -65,7 +65,6 @@ class ClientConfigTests(unittest.TestCase):
             use_update_noise=True,
             update_noise_l2_norm_clip=2.0,
             update_noise_multiplier=0.5,
-            master_seed=67,
             client_data_dir=client_app.resolve_dir("data/client-3"),
         )
 
@@ -115,11 +114,7 @@ class ClientConfigTests(unittest.TestCase):
         load_shard.assert_called_once_with(
             client_app.resolve_dir("client-0"), manifest, 0, 0.2
         )
-        build_from_manifest.assert_called_once_with(
-            manifest,
-            master_seed=67,
-            seed_namespace=("client", 0),
-        )
+        build_from_manifest.assert_called_once_with(manifest)
         self.assertIs(client.model, model)
         self.assertIs(client.train_data, train_data)
 
@@ -131,7 +126,6 @@ class FakeHistory:
 class FakeModel:
     def __init__(self) -> None:
         self.weights = [np.array([0.0, 0.0], dtype="float32")]
-        self.layers = []
 
     def set_weights(self, parameters):
         self.weights = [weight.copy() for weight in parameters]
@@ -158,7 +152,6 @@ class UpdateNoiseFitTests(unittest.TestCase):
         client.use_update_noise = use_update_noise
         client.update_noise_l2_norm_clip = 1.0
         client.update_noise_multiplier = 0.001
-        client.master_seed = 67
         return client
 
     def test_fit_returns_trained_weights_when_update_noise_is_disabled(self) -> None:
@@ -166,7 +159,7 @@ class UpdateNoiseFitTests(unittest.TestCase):
         client._add_update_noise = Mock(return_value=[np.array([9.0], dtype="float32")])
 
         weights, num_examples, metrics = client.fit(
-            [np.array([0.0, 0.0], dtype="float32")], {"server_round": 1}
+            [np.array([0.0, 0.0], dtype="float32")], {}
         )
 
         client._add_update_noise.assert_not_called()
@@ -179,15 +172,9 @@ class UpdateNoiseFitTests(unittest.TestCase):
         noisy_weights = [np.array([9.0], dtype="float32")]
         client._add_update_noise = Mock(return_value=noisy_weights)
 
-        weights, _, _ = client.fit(
-            [np.array([0.0, 0.0], dtype="float32")], {"server_round": 1}
-        )
+        weights, _, _ = client.fit([np.array([0.0, 0.0], dtype="float32")], {})
 
         client._add_update_noise.assert_called_once()
-        before, after, server_round = client._add_update_noise.call_args.args
-        np.testing.assert_array_equal(before[0], [0.0, 0.0])
-        np.testing.assert_array_equal(after[0], [1.0, 2.0])
-        self.assertEqual(server_round, 1)
         self.assertIs(weights, noisy_weights)
 
     def test_real_update_noise_remains_float32_through_server_validation(
@@ -198,7 +185,7 @@ class UpdateNoiseFitTests(unittest.TestCase):
         np.random.seed(17)
 
         weights, num_examples, metrics = client.fit(
-            [np.array([0.0, 0.0], dtype=np.float32)], {"server_round": 1}
+            [np.array([0.0, 0.0], dtype=np.float32)], {}
         )
         result = (
             object(),
@@ -228,38 +215,7 @@ class UpdateNoiseFitTests(unittest.TestCase):
         for before, after in invalid_pairs:
             with self.subTest(before=before, after=after):
                 with self.assertRaises(ValueError):
-                    client._add_update_noise(before, after, 1)
-
-    def test_update_noise_is_repeatable_and_separated_without_global_rng(self) -> None:
-        before = [np.array([0.0, 0.0], dtype=np.float32)]
-        after = [np.array([1.0, 2.0], dtype=np.float32)]
-        first = self.make_client(use_update_noise=True)
-        second = self.make_client(use_update_noise=True)
-
-        with patch.object(
-            client_app.np.random,
-            "standard_normal",
-            side_effect=AssertionError("global NumPy RNG used"),
-        ):
-            repeated = first._add_update_noise(before, after, 4)
-            same_stream = second._add_update_noise(before, after, 4)
-            next_round = first._add_update_noise(before, after, 5)
-            first.client_id += 1
-            next_client = first._add_update_noise(before, after, 4)
-
-        np.testing.assert_array_equal(repeated[0], same_stream[0])
-        self.assertFalse(np.array_equal(repeated[0], next_round[0]))
-        self.assertFalse(np.array_equal(repeated[0], next_client[0]))
-
-    def test_fit_rejects_missing_or_invalid_round_seed_namespace(self) -> None:
-        client = self.make_client(use_update_noise=False)
-        for value in (None, True, 0, -1, "1"):
-            with (
-                self.subTest(value=value),
-                self.assertRaisesRegex(ValueError, "server_round"),
-            ):
-                config = {} if value is None else {"server_round": value}
-                client.fit([np.array([0.0, 0.0], dtype=np.float32)], config)
+                    client._add_update_noise(before, after)
 
     def test_fit_configures_client_side_fedprox_loss(self) -> None:
         client = self.make_client(use_update_noise=False)
@@ -267,7 +223,7 @@ class UpdateNoiseFitTests(unittest.TestCase):
 
         client.fit(
             [np.array([0.0, 0.0], dtype="float32")],
-            {"proximal_mu": 0.25, "server_round": 1},
+            {"proximal_mu": 0.25},
         )
 
         client._configure_proximal_loss.assert_called_once_with(0.25)

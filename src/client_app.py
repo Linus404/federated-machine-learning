@@ -19,16 +19,8 @@ from src.local_training import (
     ArrayPair,
     build_model_from_manifest,
     load_client_shard,
-    seed_model_training,
 )
 from src.paths import resolve_dir
-from src.reproducibility import (
-    DEFAULT_MASTER_SEED,
-    MASTER_SEED_CONFIG_KEY,
-    SERVER_ROUND_CONFIG_KEY,
-    derive_seed,
-    effective_master_seed,
-)
 
 UPDATE_NOISE_L2_NORM_CLIP = 1.0
 UPDATE_NOISE_MULTIPLIER = 0.001
@@ -61,7 +53,6 @@ class SentimentClient(NumPyClient):
         use_update_noise: bool = False,
         update_noise_l2_norm_clip: float = UPDATE_NOISE_L2_NORM_CLIP,
         update_noise_multiplier: float = UPDATE_NOISE_MULTIPLIER,
-        master_seed: int = DEFAULT_MASTER_SEED,
     ) -> None:
         validate_protocol_runtime()
         self.client_data_dir = resolve_dir(client_data_dir)
@@ -71,7 +62,6 @@ class SentimentClient(NumPyClient):
         self.use_update_noise = use_update_noise
         self.update_noise_l2_norm_clip = update_noise_l2_norm_clip
         self.update_noise_multiplier = update_noise_multiplier
-        self.master_seed = effective_master_seed({MASTER_SEED_CONFIG_KEY: master_seed})
         self.train_data: ArrayPair
         self.val_data: ArrayPair
         manifest = load_app_manifest(
@@ -80,17 +70,12 @@ class SentimentClient(NumPyClient):
         self.train_data, self.val_data = load_client_shard(
             self.client_data_dir, manifest, self.client_id, validation_split
         )
-        self.model = build_model_from_manifest(
-            manifest,
-            master_seed=self.master_seed,
-            seed_namespace=("client", self.client_id),
-        )
+        self.model = build_model_from_manifest(manifest)
 
     def _add_update_noise(
         self,
         weights_before: list[np.ndarray],
         weights_after: list[np.ndarray],
-        server_round: int,
     ) -> list[np.ndarray]:
         """Apply illustrative float32 update noise, not differential privacy.
 
@@ -100,8 +85,6 @@ class SentimentClient(NumPyClient):
             Complete round-start model weights.
         weights_after : list[numpy.ndarray]
             Complete post-training model weights in the same order.
-        server_round : int
-            One-based Flower server round identifying the noise stream.
 
         Returns
         -------
@@ -128,16 +111,6 @@ class SentimentClient(NumPyClient):
             raise ValueError("update-noise multiplier must be non-negative and finite")
 
         noisy_weights: list[np.ndarray] = []
-        rng = np.random.default_rng(
-            derive_seed(
-                self.master_seed,
-                "client",
-                self.client_id,
-                "round",
-                server_round,
-                "update-noise",
-            )
-        )
         noise_scale = np.float32(
             self.update_noise_multiplier * self.update_noise_l2_norm_clip
         )
@@ -179,7 +152,7 @@ class SentimentClient(NumPyClient):
                 if norm > self.update_noise_l2_norm_clip
                 else update
             )
-            noise = rng.standard_normal(update.shape, dtype=np.float32)
+            noise = np.random.standard_normal(update.shape).astype(np.float32)
             noise *= noise_scale
             noisy_weight = np.add(np.add(weight_before, clipped_update), noise)
             if not np.all(np.isfinite(noisy_weight)):
@@ -219,21 +192,10 @@ class SentimentClient(NumPyClient):
         self, parameters: NDArrays, config: dict[str, Scalar]
     ) -> tuple[NDArrays, int, dict[str, Scalar]]:
         """Train with illustrative update-noise, not formal differential privacy."""
-        server_round = config.get(SERVER_ROUND_CONFIG_KEY)
-        if type(server_round) is not int or server_round < 1:
-            raise ValueError("fit config must contain a positive built-in server_round")
         self.model.set_weights(parameters)
         if PROXIMAL_MU_CONFIG_KEY in config:
             self._configure_proximal_loss(float(config[PROXIMAL_MU_CONFIG_KEY]))
         weights_before = [w.copy() for w in self.model.get_weights()]
-        seed_model_training(
-            self.model,
-            self.master_seed,
-            "client",
-            self.client_id,
-            "round",
-            server_round,
-        )
         history = self.model.fit(
             *self.train_data,
             epochs=self.epochs,
@@ -242,7 +204,7 @@ class SentimentClient(NumPyClient):
         )
         trained_weights = self.model.get_weights()
         weights = (
-            self._add_update_noise(weights_before, trained_weights, server_round)
+            self._add_update_noise(weights_before, trained_weights)
             if self.use_update_noise
             else trained_weights
         )
@@ -292,7 +254,6 @@ def client_fn(context: Any) -> Any:
         update_noise_multiplier=float(
             run_config.get("update-noise-multiplier", UPDATE_NOISE_MULTIPLIER)
         ),
-        master_seed=effective_master_seed(run_config),
     ).to_client()
 
 

@@ -13,28 +13,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from src.app_manifest import (
-    AppManifest,
-    PUBLIC_ARTIFACT_FILENAMES,
-    expected_train_dataset,
-    load_app_manifest,
-    resolve_public_artifact_dir,
-)
+from src.app_manifest import load_app_manifest, resolve_public_artifact_dir
 from src.artifact_compatibility import (
     ARTIFACT_SCHEMA_VERSION,
     sha256_bytes,
-    strict_json_loads,
     validate_artifact_schema,
     write_json_atomically,
 )
 from src.contracts import DEFAULT_SPLIT_SEED, DEFAULT_VALIDATION_SEED
 from src.paths import run_manifest_path
-from src.reproducibility import (
-    MASTER_SEED_CONFIG_KEY,
-    SEED_DERIVATION,
-    SEED_NAMESPACES,
-    effective_master_seed,
-)
 
 CODE_REVISION_ENV = "FML_CODE_REVISION"
 RUNTIME_PACKAGES = ("datasets", "flwr", "keras", "numpy", "tensorflow")
@@ -56,7 +43,6 @@ ENVIRONMENT_FIELDS = {
     "machine",
     "packages",
 }
-_PRIVATE_SHARD_FILENAMES = {"client_metadata.json", "reviews.jsonl"}
 
 
 def _required_nested_fields(
@@ -183,102 +169,23 @@ def _validate_seeds(seeds: Mapping[str, Any]) -> None:
     ValueError
         If seed metadata is missing or malformed.
     """
-    _required_nested_fields(
-        seeds,
-        {
-            "effective_master_seed",
-            "derivation",
-            "namespaces",
-            "run_config",
-            "code_defaults",
-        },
-        "seeds",
-    )
-    master_seed = seeds["effective_master_seed"]
-    derivation = seeds["derivation"]
-    namespaces = seeds["namespaces"]
+    _required_nested_fields(seeds, {"run_config", "code_defaults"}, "seeds")
     run_config = seeds["run_config"]
     code_defaults = seeds["code_defaults"]
-    effective_master_seed({MASTER_SEED_CONFIG_KEY: master_seed})
-    if not isinstance(derivation, Mapping) or dict(derivation) != SEED_DERIVATION:
-        raise ValueError("run provenance manifest has an invalid seeds.derivation")
-    if not isinstance(namespaces, Mapping) or dict(namespaces) != SEED_NAMESPACES:
-        raise ValueError("run provenance manifest has an invalid seeds.namespaces")
     if not isinstance(run_config, Mapping):
         raise ValueError("run provenance manifest has an invalid seeds.run_config")
     _canonical_run_config(run_config)
     if any("seed" not in key.lower() for key in run_config):
         raise ValueError("run provenance manifest has an invalid seeds.run_config")
-    if run_config.get(MASTER_SEED_CONFIG_KEY) != master_seed:
-        raise ValueError(
-            "run provenance manifest has inconsistent master seed metadata"
-        )
     if not isinstance(code_defaults, Mapping):
         raise ValueError("run provenance manifest has an invalid seeds.code_defaults")
-    expected_code_defaults = {
-        "client_validation_split": DEFAULT_VALIDATION_SEED,
-        "data_partition": DEFAULT_SPLIT_SEED,
-    }
-    if dict(code_defaults) != expected_code_defaults or any(
-        type(value) is not int for value in code_defaults.values()
-    ):
-        raise ValueError("run provenance manifest has an invalid seeds.code_defaults")
-
-
-def _canonical_dataset_identity(identity: Mapping[str, Any]) -> str:
-    """Serialize embedded public-dataset identity in its canonical string form.
-
-    Parameters
-    ----------
-    identity : mapping of str to Any
-        Validated public train-dataset identity.
-
-    Returns
-    -------
-    str
-        Compact, key-sorted JSON without insignificant whitespace.
-    """
-    return json.dumps(
-        dict(identity),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
+    _required_nested_fields(
+        code_defaults,
+        {"client_validation_split", "data_partition"},
+        "seeds.code_defaults",
     )
-
-
-def _validate_dataset_identity(identity: str) -> None:
-    """Strictly decode and validate embedded public-dataset identity JSON.
-
-    Parameters
-    ----------
-    identity : str
-        Canonical JSON string stored in ``dataset.identity``.
-
-    Returns
-    -------
-    None
-
-    Raises
-    ------
-    ValueError
-        If decoding, schema, values, or canonical serialization are invalid.
-    """
-    try:
-        decoded = strict_json_loads(
-            identity, source="run provenance manifest dataset.identity"
-        )
-    except ValueError as error:
-        raise ValueError(
-            "run provenance manifest has an invalid dataset.identity"
-        ) from error
-    expected = expected_train_dataset()
-    if (
-        not isinstance(decoded, Mapping)
-        or decoded != expected
-        or identity != _canonical_dataset_identity(decoded)
-    ):
-        raise ValueError("run provenance manifest has an invalid dataset.identity")
+    if any(type(code_defaults[key]) is not int for key in code_defaults):
+        raise ValueError("run provenance manifest has an invalid seeds.code_defaults")
 
 
 def _validate_dataset(dataset: Mapping[str, Any]) -> None:
@@ -300,24 +207,15 @@ def _validate_dataset(dataset: Mapping[str, Any]) -> None:
     """
     _required_nested_fields(
         dataset,
-        {
-            "identity",
-            "checksums",
-            "public_manifest",
-            "status",
-            "private_client_shards",
-        },
+        {"identity", "checksums", "status", "private_client_shards"},
         "dataset",
     )
     identity = dataset["identity"]
     checksums = dataset["checksums"]
     status = dataset["status"]
-    authoritative_public_manifest = dataset["public_manifest"]
     private_shards = dataset["private_client_shards"]
     if identity is not None and (not isinstance(identity, str) or not identity):
         raise ValueError("run provenance manifest has an invalid dataset.identity")
-    if identity is not None:
-        _validate_dataset_identity(identity)
     if not isinstance(checksums, Mapping) or any(
         not isinstance(name, str)
         or not name
@@ -332,23 +230,8 @@ def _validate_dataset(dataset: Mapping[str, Any]) -> None:
         raise ValueError("run provenance manifest has an invalid dataset.status")
     if status == "available" and (identity is None or not checksums):
         raise ValueError("run provenance manifest has inconsistent dataset metadata")
-    if status == "available" and set(checksums) != PUBLIC_ARTIFACT_FILENAMES:
-        raise ValueError("run provenance manifest has an invalid dataset.checksums")
-    if status == "unavailable" and (
-        identity is not None or checksums or authoritative_public_manifest is not None
-    ):
+    if status == "unavailable" and (identity is not None or checksums):
         raise ValueError("run provenance manifest has inconsistent dataset metadata")
-    if status == "available" and (
-        not isinstance(authoritative_public_manifest, Mapping)
-        or set(authoritative_public_manifest) != {"filename", "size_bytes", "checksum"}
-        or authoritative_public_manifest["filename"] != "manifest.json"
-        or type(authoritative_public_manifest["size_bytes"]) is not int
-        or authoritative_public_manifest["size_bytes"] < 1
-        or authoritative_public_manifest["checksum"] != checksums.get("manifest.json")
-    ):
-        raise ValueError(
-            "run provenance manifest has an invalid dataset.public_manifest"
-        )
     if not isinstance(private_shards, Mapping):
         raise ValueError(
             "run provenance manifest has an invalid dataset.private_client_shards"
@@ -401,7 +284,7 @@ def _validate_dataset(dataset: Mapping[str, Any]) -> None:
             or type(shard_identity["sample_count"]) is not int
             or shard_identity["sample_count"] < 1
             or not isinstance(shard_dataset, Mapping)
-            or dict(shard_dataset) != expected_train_dataset()
+            or shard_dataset.get("split") != "train"
             or not isinstance(shard_histogram, Mapping)
             or not shard_histogram
             or any(
@@ -425,16 +308,7 @@ def _validate_dataset(dataset: Mapping[str, Any]) -> None:
             raise ValueError(
                 "run provenance manifest has an invalid dataset.private_client_shards"
             )
-        if (
-            status != "available"
-            or not isinstance(authoritative_public_manifest, Mapping)
-            or dict(public_manifest) != dict(authoritative_public_manifest)
-        ):
-            raise ValueError(
-                "run provenance private shard public manifest binding differs from "
-                "the authoritative public manifest"
-            )
-        if set(shard_checksums) != _PRIVATE_SHARD_FILENAMES or any(
+        if any(
             not isinstance(name, str)
             or not isinstance(checksum, str)
             or len(checksum) != 71
@@ -563,7 +437,6 @@ def _code_revision() -> dict[str, Any]:
 def _dataset_metadata(
     public_artifact_dir: str | Path | None,
     client_shard: Mapping[str, Any] | None = None,
-    app_manifest: AppManifest | None = None,
 ) -> dict[str, Any]:
     """Capture public dataset identity and checksums available to the server.
 
@@ -573,8 +446,6 @@ def _dataset_metadata(
         Directory containing the public model and vocabulary manifest.
     client_shard : mapping of str to Any or None, optional
         Validated private-shard identity and checksums available to local training.
-    app_manifest : AppManifest or None, optional
-        Already validated public snapshot retained by this operation.
 
     Returns
     -------
@@ -586,18 +457,11 @@ def _dataset_metadata(
     ValueError
         If a declared public artifact escapes its configured directory.
     """
-    public_dir = None
-    if app_manifest is None and public_artifact_dir:
-        public_dir = resolve_public_artifact_dir(
-            public_artifact_dir=public_artifact_dir
-        )
-    if client_shard is not None and (
-        not isinstance(client_shard, Mapping)
-        or set(client_shard) != {"identity", "checksums"}
-        or not isinstance(client_shard["checksums"], Mapping)
-        or set(client_shard["checksums"]) != _PRIVATE_SHARD_FILENAMES
-    ):
-        raise ValueError("dataset.private_client_shards provenance is invalid")
+    public_dir = (
+        resolve_public_artifact_dir(public_artifact_dir=public_artifact_dir)
+        if public_artifact_dir
+        else None
+    )
     private_status = (
         {
             "status": "available",
@@ -610,29 +474,27 @@ def _dataset_metadata(
             "reason": "client shard identity is not collected by the server application",
         }
     )
-    if app_manifest is None and (
-        public_dir is None or not (public_dir / "manifest.json").exists()
-    ):
+    if public_dir is None or not (public_dir / "manifest.json").exists():
         return {
             "identity": None,
             "checksums": {},
-            "public_manifest": None,
             "status": "unavailable",
             "private_client_shards": private_status,
         }
 
-    manifest = app_manifest or load_app_manifest(public_artifact_dir=public_dir)
-    identity = _canonical_dataset_identity(manifest.payload["dataset"])
+    manifest = load_app_manifest(public_artifact_dir=public_dir)
+    identity = json.dumps(
+        json.loads(manifest.manifest_bytes)["dataset"],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
     return {
         "identity": identity,
         "checksums": {
             "manifest.json": sha256_bytes(manifest.manifest_bytes),
             manifest.vocabulary_path.name: sha256_bytes(manifest.vocabulary_bytes),
-        },
-        "public_manifest": {
-            "filename": "manifest.json",
-            "size_bytes": len(manifest.manifest_bytes),
-            "checksum": sha256_bytes(manifest.manifest_bytes),
         },
         "status": "available",
         "private_client_shards": private_status,
@@ -645,7 +507,6 @@ def write_run_provenance_manifest(
     *,
     public_artifact_dir: str | Path | None = None,
     client_shard: Mapping[str, Any] | None = None,
-    app_manifest: AppManifest | None = None,
     flower_run_id: int | None = None,
     created_at: str | None = None,
     run_id: str | None = None,
@@ -662,8 +523,6 @@ def write_run_provenance_manifest(
         Public artifacts used by the run.
     client_shard : mapping of str to Any or None, optional
         Validated private shard evidence available only to local training.
-    app_manifest : AppManifest or None, optional
-        Already validated public snapshot retained by this operation.
     flower_run_id : int or None, optional
         Flower's infrastructure-level run identifier when available.
     created_at : str or None, optional
@@ -687,8 +546,7 @@ def write_run_provenance_manifest(
         type(flower_run_id) is not int or flower_run_id < 0
     ):
         raise ValueError("Flower run ID must be a non-negative integer")
-    master_seed = effective_master_seed(run_config)
-    config = _canonical_run_config({**run_config, MASTER_SEED_CONFIG_KEY: master_seed})
+    config = _canonical_run_config(run_config)
     timestamp = created_at or datetime.now(timezone.utc).isoformat().replace(
         "+00:00", "Z"
     )
@@ -709,18 +567,13 @@ def write_run_provenance_manifest(
         "environment": _environment_metadata(),
         "code_revision": _code_revision(),
         "seeds": {
-            "effective_master_seed": master_seed,
-            "derivation": SEED_DERIVATION,
-            "namespaces": SEED_NAMESPACES,
             "run_config": seed_config,
             "code_defaults": {
                 "client_validation_split": DEFAULT_VALIDATION_SEED,
                 "data_partition": DEFAULT_SPLIT_SEED,
             },
         },
-        "dataset": _dataset_metadata(
-            public_artifact_dir, client_shard, app_manifest=app_manifest
-        ),
+        "dataset": _dataset_metadata(public_artifact_dir, client_shard),
     }
     _validate_environment(payload["environment"])
     _validate_code_revision(payload["code_revision"])
@@ -757,18 +610,16 @@ def load_run_provenance_manifest(
     """
     manifest_path = Path(path)
     try:
-        document = (
-            manifest_path.read_bytes() if manifest_bytes is None else manifest_bytes
+        payload = validate_artifact_schema(
+            json.loads(
+                manifest_path.read_text(encoding="utf-8")
+                if manifest_bytes is None
+                else manifest_bytes.decode("utf-8")
+            ),
+            "run provenance manifest",
         )
-    except OSError as error:
+    except (UnicodeDecodeError, json.JSONDecodeError, OSError) as error:
         raise ValueError(f"invalid run provenance manifest: {manifest_path}") from error
-    payload = validate_artifact_schema(
-        strict_json_loads(
-            document,
-            source=f"run provenance manifest: {manifest_path}",
-        ),
-        "run provenance manifest",
-    )
     missing = REQUIRED_FIELDS - payload.keys()
     if missing:
         raise ValueError(
@@ -799,14 +650,9 @@ def load_run_provenance_manifest(
     for field in ("run_config", "environment", "code_revision", "seeds", "dataset"):
         if not isinstance(payload[field], Mapping):
             raise ValueError(f"run provenance manifest has an invalid {field}")
-    canonical_config = _canonical_run_config(payload["run_config"])
+    _canonical_run_config(payload["run_config"])
     _validate_environment(payload["environment"])
     _validate_code_revision(payload["code_revision"])
     _validate_seeds(payload["seeds"])
-    expected_seed_config = {
-        key: value for key, value in canonical_config.items() if "seed" in key.lower()
-    }
-    if dict(payload["seeds"]["run_config"]) != expected_seed_config:
-        raise ValueError("run provenance manifest has inconsistent seed configuration")
     _validate_dataset(payload["dataset"])
     return payload

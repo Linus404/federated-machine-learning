@@ -10,33 +10,8 @@ import numpy as np
 from flwr.common import Context, ndarrays_to_parameters, parameters_to_ndarrays
 
 import src.server_app as server_app
-from src.app_manifest import expected_train_dataset
-from src.artifact_compatibility import (
-    SERVER_ARTIFACT_SCHEMA_VERSION,
-    load_server_artifact_manifest,
-)
+from src.artifact_compatibility import load_server_artifact_manifest
 from tests.artifact_helpers import fake_app_manifest
-
-
-def server_app_manifest(public_dir: Path) -> SimpleNamespace:
-    """Return a public snapshot suitable for server startup provenance.
-
-    Parameters
-    ----------
-    public_dir : pathlib.Path
-        Public directory used for diagnostic vocabulary identity.
-
-    Returns
-    -------
-    types.SimpleNamespace
-        App-manifest-shaped immutable snapshot.
-    """
-    snapshot = fake_app_manifest()
-    dataset = expected_train_dataset()
-    snapshot.payload["dataset"] = dataset
-    snapshot.manifest_bytes = json.dumps({"dataset": dataset}).encode("utf-8")
-    snapshot.vocabulary_path = public_dir / "vocab.txt"
-    return snapshot
 
 
 class ServerStartupArtifactHistoryTests(unittest.TestCase):
@@ -72,11 +47,6 @@ class ServerStartupArtifactHistoryTests(unittest.TestCase):
                 return Mock(name="strategy")
 
             with (
-                patch.object(
-                    server_app,
-                    "load_app_manifest",
-                    return_value=server_app_manifest(public_dir),
-                ),
                 patch.object(
                     server_app, "create_strategy", side_effect=create_strategy_probe
                 ),
@@ -128,54 +98,6 @@ class ServerStartupArtifactHistoryTests(unittest.TestCase):
             create_strategy.assert_not_called()
             self.assertTrue(manifest.exists())
 
-    def test_server_fn_threads_one_public_snapshot_through_startup(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            public_dir = root / "public"
-            public_dir.mkdir()
-            artifact_dir = root / "server"
-            snapshot = server_app_manifest(public_dir)
-            context = cast(
-                Context,
-                SimpleNamespace(
-                    run_config={
-                        "public-artifact-dir": public_dir,
-                        "server-artifact-dir": artifact_dir,
-                        "num-server-rounds": 1,
-                    }
-                ),
-            )
-            strategy = SimpleNamespace()
-            run_dir = artifact_dir / "runs" / "run"
-            with (
-                patch.object(
-                    server_app,
-                    "load_app_manifest",
-                    side_effect=(snapshot, AssertionError("pointer reopened")),
-                ) as load_manifest,
-                patch.object(
-                    server_app,
-                    "create_run_artifact_dir",
-                    return_value=run_dir,
-                ) as create_run,
-                patch.object(server_app, "prune_run_history"),
-                patch.object(
-                    server_app, "create_strategy", return_value=strategy
-                ) as create_strategy,
-                patch.object(
-                    server_app,
-                    "ServerAppComponents",
-                    side_effect=lambda **kwargs: kwargs,
-                ),
-            ):
-                result = cast(dict[str, Any], server_app.server_fn(context))
-
-            load_manifest.assert_called_once_with(public_artifact_dir=public_dir)
-            self.assertIs(create_run.call_args.kwargs["app_manifest"], snapshot)
-            self.assertIs(create_strategy.call_args.kwargs["app_manifest"], snapshot)
-            self.assertIs(result["strategy"], strategy)
-            create_strategy.call_args.kwargs["artifact_lock"].release()
-
     def test_server_fn_rejects_overlapping_artifact_writers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             public_dir = Path(tmpdir) / "public"
@@ -199,11 +121,6 @@ class ServerStartupArtifactHistoryTests(unittest.TestCase):
                 return strategy
 
             with (
-                patch.object(
-                    server_app,
-                    "load_app_manifest",
-                    return_value=server_app_manifest(public_dir),
-                ),
                 patch.object(
                     server_app, "create_strategy", side_effect=create_strategy_probe
                 ),
@@ -239,17 +156,8 @@ class ServerStartupArtifactHistoryTests(unittest.TestCase):
                 ),
             )
 
-            with (
-                patch.object(
-                    server_app,
-                    "load_app_manifest",
-                    return_value=server_app_manifest(public_dir),
-                ),
-                patch.object(
-                    server_app,
-                    "create_strategy",
-                    side_effect=ValueError("invalid app"),
-                ),
+            with patch.object(
+                server_app, "create_strategy", side_effect=ValueError("invalid app")
             ):
                 with self.assertRaisesRegex(ValueError, "invalid app"):
                     server_app.server_fn(context)
@@ -307,8 +215,7 @@ class MetricAggregationTests(unittest.TestCase):
                 )
 
             self.assertEqual(
-                load_server_artifact_manifest(Path(tmpdir))["schema_version"],
-                SERVER_ARTIFACT_SCHEMA_VERSION,
+                load_server_artifact_manifest(Path(tmpdir))["schema_version"], 2
             )
 
     def test_weighted_average_uses_num_examples(self) -> None:
@@ -670,7 +577,6 @@ class MetricAggregationTests(unittest.TestCase):
             strategy.artifact_root = root
             strategy.artifact_retention_runs = 3
             strategy.final_round = 2
-            strategy.app_manifest = fake_app_manifest()
             artifact_lock = Mock()
             strategy._artifact_lock = artifact_lock
             strategy.expected_client_ids = frozenset({0, 1})
@@ -699,9 +605,7 @@ class MetricAggregationTests(unittest.TestCase):
 
             self.assertAlmostEqual(loss, 0.575)
             self.assertEqual(metrics, {"accuracy": 0.625})
-            publish.assert_called_once_with(
-                root, run_dir, app_manifest=strategy.app_manifest
-            )
+            publish.assert_called_once_with(root, run_dir)
             prune.assert_called_once_with(root, 3, active_run_dir=run_dir)
             artifact_lock.release.assert_called_once_with()
 
@@ -720,7 +624,6 @@ class MetricAggregationTests(unittest.TestCase):
                 strategy.artifact_root = root
                 strategy.artifact_retention_runs = 3
                 strategy.final_round = 1
-                strategy.app_manifest = fake_app_manifest()
                 artifact_lock = server_app.acquire_run_artifact_lock(run_dir)
                 strategy._artifact_lock = artifact_lock
                 strategy.expected_client_ids = frozenset({0})
