@@ -42,11 +42,13 @@ evaluation artifacts, run provenance, and current-run index use schema `1`:
 Each consumer accepts only its artifact kind's current schema. Missing,
 non-integer, older, and newer versions are rejected before the artifact is used.
 Extra metadata fields are compatible where that artifact kind's loader permits
-them. Evaluation manifests and records, and prepared-generation indexes, use
-exact field sets; adding or removing a field requires an increment of that
-artifact kind's schema. Changing required field names, types, meanings,
-filenames, CSV columns, or the model serialization format likewise requires a
-schema increment without changing unrelated schemas.
+them. Exact field sets are required for client metadata, records, and binding
+subobjects; public vocabulary metadata; server binding and model-dimension
+subobjects; evaluation manifests and records; and prepared-generation indexes.
+Adding or removing any of those fields requires an increment of that artifact
+kind's schema. Changing required field names, types, meanings, filenames, CSV
+columns, or the model serialization format likewise requires a schema increment
+without changing unrelated schemas.
 
 ## Migration and retention
 

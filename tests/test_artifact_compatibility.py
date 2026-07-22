@@ -31,6 +31,18 @@ class ArtifactCompatibilityTests(unittest.TestCase):
         self.assertIn("Regenerate public schema\n`2`, client schema `2`", policy)
         self.assertNotIn("all other persisted contracts remain schema `1`", policy)
 
+    def test_compatibility_policy_lists_exact_field_contracts(self) -> None:
+        policy = (
+            Path(__file__).resolve().parent.parent / "COMPATIBILITY.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "Exact field sets are required for client metadata, records, and binding\n"
+            "subobjects; public vocabulary metadata; server binding and model-dimension\n"
+            "subobjects; evaluation manifests and records; and prepared-generation indexes.",
+            policy,
+        )
+
     def test_current_schema_is_supported(self) -> None:
         payload = {"schema_version": ARTIFACT_SCHEMA_VERSION}
 
