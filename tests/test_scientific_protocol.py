@@ -587,6 +587,27 @@ class ScientificProtocolTests(unittest.TestCase):
     def test_protocol_is_frozen_parseable_and_complete(self) -> None:
         self.assertEqual(self.protocol["protocol_version"], 1)
         self.assertEqual(self.protocol["status"], "frozen")
+        scope = self.protocol["scope"]
+        self.assertIn("later PR12 experiment runner", scope["purpose"])
+        self.assertIn("does not contain a runner", scope["implementation_status"])
+        self.assertIn(
+            "not the registered experiment runner", scope["reviewed_server_boundary"]
+        )
+        self.assertIn("client-local evaluation", scope["reviewed_server_boundary"])
+        self.assertIn("expected-client-count=4", scope["deployment_configuration"])
+        for unavailable_runtime_feature in (
+            "threat transforms",
+            "FedMedian",
+            "FedTrimmedAvg",
+            "server-held validation union",
+        ):
+            self.assertIn(
+                unavailable_runtime_feature, scope["reviewed_server_boundary"]
+            )
+        self.assertIn(
+            "client scales 4, 16, and 64", scope["experiment_runner_requirement"]
+        )
+        self.assertIn("no client evaluation", scope["experiment_runner_requirement"])
         self.assertIsNone(
             re.search(r"\b(?:TODO|TBD)\b", self.raw_protocol, re.IGNORECASE)
         )
@@ -1683,11 +1704,15 @@ print(json.dumps({
         np.testing.assert_allclose(
             initial, huber_golden["initial_estimate"], rtol=0, atol=0
         )
-        np.testing.assert_allclose(
+        self.assertIn("estimate_10.astype(numpy.float32)", huber["reconstruction"])
+        self.assertEqual(aggregate.dtype, np.dtype(np.float32))
+        np.testing.assert_array_equal(
             aggregate,
-            huber_golden["estimate_after_10_updates"],
-            rtol=0,
-            atol=1e-15,
+            np.asarray(huber_golden["aggregate_vector"], dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            aggregate.view(np.uint32),
+            np.asarray(huber_golden["aggregate_float32_uint32"], dtype=np.uint32),
         )
 
         beta = strategies["fedtrimmedavg"]["beta"]

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from numbers import Integral, Real
+from numbers import Real
 
 import numpy as np
 from flwr.common import NDArrays
@@ -8,45 +8,75 @@ from flwr.common import NDArrays
 DEFAULT_HUBER_THRESHOLD = 10.0
 WEISZFELD_ITERS = 10
 WEISZFELD_EPS = 1e-8
-_SUPPORTED_DTYPES = frozenset((np.dtype(np.float32), np.dtype(np.float64)))
+_PROTOCOL_DTYPE = np.dtype(np.float32)
 
 
 def _flatten(weights: NDArrays) -> np.ndarray:
-    """Flatten supported model weights into one C-order vector.
+    """Flatten protocol model weights into one C-order vector.
 
-    Args:
-        weights: Nonempty float32 or float64 model weights in model order.
+    Parameters
+    ----------
+    weights : NDArrays
+        Nonempty finite float32 model weights in model order.
 
-    Returns:
-        The concatenated model vector.
+    Returns
+    -------
+    numpy.ndarray
+        The concatenated float32 model vector.
 
-    Raises:
-        ValueError: If no weights are provided or a weight has an unsupported dtype.
+    Raises
+    ------
+    ValueError
+        If the weights violate the frozen aggregation contract.
     """
     arrays = [np.asarray(weight) for weight in weights]
     if not arrays:
         raise ValueError("Huber model weights must be nonempty")
-    if any(array.dtype not in _SUPPORTED_DTYPES for array in arrays):
-        raise ValueError("Huber model weights must use float32 or float64")
-    return np.concatenate([array.flatten() for array in arrays])
+    if any(array.dtype != _PROTOCOL_DTYPE for array in arrays):
+        raise ValueError("Huber model weights must use exactly float32")
+    if any(array.ndim == 0 or array.size == 0 for array in arrays):
+        raise ValueError("Huber model weights must be non-scalar and nonempty")
+    if any(not np.all(np.isfinite(array)) for array in arrays):
+        raise ValueError("Huber model weights must contain only finite values")
+    return np.concatenate([array.flatten(order="C") for array in arrays])
 
 
 def _unflatten(vector: np.ndarray, reference: NDArrays) -> NDArrays:
     """Reshape a flat vector to reference model shapes in C order.
 
-    Args:
-        vector: One-dimensional aggregate vector.
-        reference: Nonempty model weights whose shapes define reconstruction.
+    Parameters
+    ----------
+    vector : numpy.ndarray
+        One-dimensional finite float32 aggregate vector.
+    reference : NDArrays
+        Nonempty float32 model weights whose shapes define reconstruction.
 
-    Returns:
-        Aggregate arrays in reference model-weight order.
+    Returns
+    -------
+    NDArrays
+        Float32 aggregate arrays in reference model-weight order.
 
-    Raises:
-        ValueError: If the vector or reference cannot define an exact reconstruction.
+    Raises
+    ------
+    ValueError
+        If the vector or reference cannot define an exact reconstruction.
     """
     vector = np.asarray(vector)
-    if vector.ndim != 1 or not reference:
+    if vector.dtype != _PROTOCOL_DTYPE or vector.ndim != 1 or vector.size == 0:
+        raise ValueError("Huber reconstruction requires a nonempty float32 vector")
+    if not np.all(np.isfinite(vector)):
+        raise ValueError("Huber reconstruction vector must contain only finite values")
+    if not reference:
         raise ValueError("Huber reconstruction requires a vector and model reference")
+    reference_arrays = [np.asarray(weight) for weight in reference]
+    if any(array.dtype != _PROTOCOL_DTYPE for array in reference_arrays):
+        raise ValueError("Huber reconstruction reference must use exactly float32")
+    if any(array.ndim == 0 or array.size == 0 for array in reference_arrays):
+        raise ValueError(
+            "Huber reconstruction reference must be non-scalar and nonempty"
+        )
+    if any(not np.all(np.isfinite(array)) for array in reference_arrays):
+        raise ValueError("Huber reconstruction reference must contain finite values")
     expected_size = sum(weight.size for weight in reference)
     if vector.size != expected_size:
         raise ValueError("Huber vector length must match the reference model")
@@ -68,16 +98,25 @@ def huber_aggregate(
 ) -> np.ndarray:
     """Aggregate post-fit client vectors by minimizing multidimensional Huber loss.
 
-    Args:
-        client_vectors: Flattened post-fit model vectors in ascending client ID order.
-        sample_counts: Positive fitted-row counts in the same client order.
-        threshold: Positive Huber residual threshold.
+    Parameters
+    ----------
+    client_vectors : list[numpy.ndarray]
+        Finite, nonempty float32 post-fit model vectors in ascending client ID order.
+    sample_counts : list[int]
+        Positive built-in Python integer fitted-row counts in the same client order.
+    threshold : float
+        Positive finite Huber residual threshold.
 
-    Returns:
-        The float64 aggregate after the fixed number of reweighting iterations.
+    Returns
+    -------
+    numpy.ndarray
+        The aggregate explicitly rounded to float32 after the fixed float64
+        reweighting iterations.
 
-    Raises:
-        ValueError: If inputs violate the frozen aggregation contract.
+    Raises
+    ------
+    ValueError
+        If inputs violate the frozen aggregation contract.
     """
     if not client_vectors:
         raise ValueError("Huber aggregation requires at least one client vector")
@@ -90,21 +129,22 @@ def huber_aggregate(
         raise ValueError("Huber threshold must be finite and positive")
 
     flattened_vectors = [np.asarray(vector) for vector in client_vectors]
-    if any(vector.dtype not in _SUPPORTED_DTYPES for vector in flattened_vectors):
-        raise ValueError("Huber client vectors must use float32 or float64")
+    if any(vector.dtype != _PROTOCOL_DTYPE for vector in flattened_vectors):
+        raise ValueError("Huber client vectors must use exactly float32")
     vector_length = flattened_vectors[0].size
     if vector_length == 0 or any(
         vector.ndim != 1 or vector.size != vector_length for vector in flattened_vectors
     ):
         raise ValueError("Huber client vectors must be nonempty one-dimensional peers")
-    vectors = np.stack(flattened_vectors).astype(np.float32, copy=False)
+    vectors = np.stack(flattened_vectors)
     if not np.all(np.isfinite(vectors)):
         raise ValueError("Huber client vectors must contain only finite values")
     if len(sample_counts) != len(vectors) or any(
-        isinstance(count, bool) or not isinstance(count, Integral) or count <= 0
-        for count in sample_counts
+        type(count) is not int or count <= 0 for count in sample_counts
     ):
-        raise ValueError("Huber sample counts must be positive integers per client")
+        raise ValueError(
+            "Huber sample counts must be positive built-in integers per client"
+        )
 
     weights = np.asarray(sample_counts, dtype=np.float64)
     weight_sum = weights.sum()
@@ -129,4 +169,7 @@ def huber_aggregate(
         if not np.all(np.isfinite(centre)):
             raise ValueError("Huber aggregate became non-finite")
 
-    return centre
+    aggregate = centre.astype(np.float32)
+    if not np.all(np.isfinite(aggregate)):
+        raise ValueError("Huber float32 aggregate became non-finite")
+    return aggregate

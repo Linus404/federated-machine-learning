@@ -80,8 +80,24 @@ class AggregationProtocolTests(unittest.TestCase):
             self.contract["coordinate_layout"],
         )
         self.assertIn(
-            "No invalid registered cell", self.contract["common_invalid_inputs"]
+            "No invalid registered input", self.contract["common_invalid_inputs"]
         )
+
+    def test_protocol_scope_does_not_claim_current_matrix_execution(self) -> None:
+        scope = self.protocol["scope"]
+
+        self.assertIn("does not contain a runner", scope["implementation_status"])
+        self.assertIn(
+            "not the registered experiment runner", scope["reviewed_server_boundary"]
+        )
+        self.assertIn("FedMedian", scope["reviewed_server_boundary"])
+        self.assertIn("FedTrimmedAvg", scope["reviewed_server_boundary"])
+        self.assertIn("threat transforms", scope["reviewed_server_boundary"])
+        self.assertIn("client-local evaluation", scope["reviewed_server_boundary"])
+        self.assertIn(
+            "does not independently derive", scope["reviewed_server_boundary"]
+        )
+        self.assertIn("no client evaluation", scope["experiment_runner_requirement"])
 
     def test_golden_threat_is_applied_to_delta_before_full_weight_aggregation(
         self,

@@ -32,6 +32,7 @@ class ServerStartupArtifactHistoryTests(unittest.TestCase):
                         "public-artifact-dir": public_dir,
                         "server-artifact-dir": artifact_dir,
                         "num-server-rounds": 1,
+                        "expected-client-count": 16,
                         "proximal-mu": 0.25,
                         "use-huber": "true",
                         "huber-threshold": 3.5,
@@ -60,6 +61,7 @@ class ServerStartupArtifactHistoryTests(unittest.TestCase):
             run_dir = captured_strategy_kwargs["artifact_dir"]
             self.assertEqual(run_dir.parent, artifact_dir.resolve() / "runs")
             self.assertEqual(captured_strategy_kwargs["proximal_mu"], 0.25)
+            self.assertEqual(captured_strategy_kwargs["min_clients"], 16)
             self.assertTrue(captured_strategy_kwargs["use_huber"])
             self.assertEqual(captured_strategy_kwargs["huber_threshold"], 3.5)
             self.assertEqual(components["config"].num_rounds, 1)
@@ -162,8 +164,48 @@ class ServerStartupArtifactHistoryTests(unittest.TestCase):
             lock = server_app.acquire_run_artifact_lock(artifact_dir)
             lock.release()
 
+    def test_server_fn_rejects_invalid_expected_client_count(self) -> None:
+        for value in (0, -1, True, 4.5, "4"):
+            with self.subTest(value=value):
+                context = cast(
+                    Context,
+                    SimpleNamespace(
+                        run_config={
+                            "expected-client-count": value,
+                            "num-server-rounds": 1,
+                        }
+                    ),
+                )
+
+                with self.assertRaisesRegex(ValueError, "positive built-in integer"):
+                    server_app.server_fn(context)
+
 
 class MetricAggregationTests(unittest.TestCase):
+    def test_create_strategy_configures_exact_clients_and_failure_rejection(
+        self,
+    ) -> None:
+        model = Mock()
+        model.get_weights.return_value = [np.zeros(2, dtype=np.float32)]
+        strategy = SimpleNamespace()
+
+        with (
+            patch.object(server_app, "load_app_manifest", return_value=object()),
+            patch.object(server_app, "build_model_from_manifest", return_value=model),
+            patch.object(
+                server_app, "SentimentServer", return_value=strategy
+            ) as server_type,
+        ):
+            actual = server_app.create_strategy(min_clients=16)
+
+        self.assertIs(actual, strategy)
+        self.assertEqual(strategy.expected_client_ids, frozenset(range(16)))
+        self.assertEqual(strategy.expected_weight_shapes, ((2,),))
+        strategy_kwargs = server_type.call_args.kwargs
+        self.assertFalse(strategy_kwargs["accept_failures"])
+        self.assertEqual(strategy_kwargs["min_fit_clients"], 16)
+        self.assertEqual(strategy_kwargs["min_available_clients"], 16)
+
     def test_strategy_publishes_server_artifact_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch.object(server_app.FedProx, "__init__", return_value=None):
@@ -187,9 +229,11 @@ class MetricAggregationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             strategy = server_app.SentimentServer.__new__(server_app.SentimentServer)
             strategy.use_huber = False
-            strategy.accept_failures = True
+            strategy.accept_failures = False
             strategy.inplace = True
             strategy.fit_metrics_aggregation_fn = None
+            strategy.expected_client_ids = frozenset(range(3))
+            strategy.expected_weight_shapes = ((1,),)
             strategy.artifact_dir = Path(tmpdir)
             strategy.app_manifest = object()
             results = [
@@ -222,9 +266,10 @@ class MetricAggregationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             strategy = server_app.SentimentServer.__new__(server_app.SentimentServer)
             strategy.use_huber = True
-            strategy.accept_failures = True
             strategy.fit_metrics_aggregation_fn = None
             strategy.huber_threshold = 10.0
+            strategy.expected_client_ids = frozenset(range(3))
+            strategy.expected_weight_shapes = ((1,),)
             strategy.artifact_dir = Path(tmpdir)
             strategy.app_manifest = object()
             results = [
@@ -250,7 +295,7 @@ class MetricAggregationTests(unittest.TestCase):
                 patch.object(
                     server_app,
                     "huber_aggregate",
-                    return_value=np.array([2.0], dtype=np.float64),
+                    return_value=np.array([2.0], dtype=np.float32),
                 ) as aggregate,
                 patch.object(
                     server_app, "build_model_from_manifest", return_value=model
@@ -265,19 +310,33 @@ class MetricAggregationTests(unittest.TestCase):
             self.assertEqual(counts, [10, 20, 30])
             self.assertEqual(threshold, 10.0)
 
-    def test_fit_aggregation_rejects_missing_or_duplicate_client_ids(self) -> None:
+    def test_fit_aggregation_rejects_incomplete_duplicate_or_out_of_range_ids(
+        self,
+    ) -> None:
         missing = [(Mock(), SimpleNamespace(metrics={}))]
         duplicate = [
             (Mock(), SimpleNamespace(metrics={"client_id": 1})),
             (Mock(), SimpleNamespace(metrics={"client_id": 1})),
         ]
+        incomplete = [(Mock(), SimpleNamespace(metrics={"client_id": 0}))]
+        out_of_range = [
+            (Mock(), SimpleNamespace(metrics={"client_id": 0})),
+            (Mock(), SimpleNamespace(metrics={"client_id": 2})),
+        ]
+        non_builtin = [
+            (Mock(), SimpleNamespace(metrics={"client_id": np.int64(0)})),
+            (Mock(), SimpleNamespace(metrics={"client_id": 1})),
+        ]
 
-        for results in (missing, duplicate):
+        for results in (missing, duplicate, incomplete, out_of_range, non_builtin):
             with self.subTest(results=results):
                 with self.assertRaises(ValueError):
-                    server_app._sorted_fit_results(results)
+                    server_app._sorted_fit_results(results, frozenset({0, 1}))
 
-    def test_fit_failure_rejection_precedes_client_id_validation(self) -> None:
+        with self.assertRaisesRegex(ValueError, "contiguous from zero"):
+            server_app._sorted_fit_results(out_of_range, frozenset({0, 2}))
+
+    def test_fit_failure_hard_fails_before_client_id_validation(self) -> None:
         invalid_results = [(Mock(), SimpleNamespace(metrics={}))]
 
         for use_huber in (False, True):
@@ -286,20 +345,16 @@ class MetricAggregationTests(unittest.TestCase):
                     server_app.SentimentServer
                 )
                 strategy.use_huber = use_huber
-                strategy.accept_failures = False
 
-                self.assertEqual(
-                    strategy.aggregate_fit(
-                        1, invalid_results, [RuntimeError("failed")]
-                    ),
-                    (None, {}),
-                )
+                with self.assertRaisesRegex(RuntimeError, "failed for 1 client"):
+                    strategy.aggregate_fit(1, invalid_results, [RuntimeError("failed")])
 
     def test_huber_fit_aggregation_rejects_mismatched_model_shapes(self) -> None:
         strategy = server_app.SentimentServer.__new__(server_app.SentimentServer)
         strategy.use_huber = True
-        strategy.accept_failures = True
         strategy.huber_threshold = 1.0
+        strategy.expected_client_ids = frozenset({0, 1})
+        strategy.expected_weight_shapes = ((2,),)
         results = [
             (
                 Mock(),
@@ -317,8 +372,91 @@ class MetricAggregationTests(unittest.TestCase):
             )
         ]
 
-        with self.assertRaisesRegex(ValueError, "weight shapes must match"):
+        with self.assertRaisesRegex(ValueError, "shapes must match round start"):
             strategy.aggregate_fit(1, results, [])
+
+    def test_fit_validation_rejects_hostile_sample_counts(self) -> None:
+        weights = [np.array([1.0], dtype=np.float32)]
+
+        for count in (0, -1, True, np.int64(1)):
+            with self.subTest(count=count):
+                result = (
+                    Mock(),
+                    SimpleNamespace(
+                        parameters=ndarrays_to_parameters(weights),
+                        num_examples=count,
+                        metrics={"client_id": 0},
+                    ),
+                )
+                with self.assertRaisesRegex(ValueError, "positive built-in integer"):
+                    server_app._validate_fit_results([result], frozenset({0}), ((1,),))
+
+    def test_fit_validation_rejects_hostile_model_tensors(self) -> None:
+        invalid_tensors = [
+            np.array([1.0], dtype=np.float64),
+            np.array([1], dtype=np.int64),
+            np.array([np.nan], dtype=np.float32),
+            np.array([np.inf], dtype=np.float32),
+            np.array(1.0, dtype=np.float32),
+            np.array([], dtype=np.float32),
+            np.array([[1.0]], dtype=np.float32),
+        ]
+
+        for tensor in invalid_tensors:
+            with self.subTest(dtype=tensor.dtype, shape=tensor.shape):
+                result = (
+                    Mock(),
+                    SimpleNamespace(
+                        parameters=ndarrays_to_parameters([tensor]),
+                        num_examples=1,
+                        metrics={"client_id": 0},
+                    ),
+                )
+                with self.assertRaises(ValueError):
+                    server_app._validate_fit_results([result], frozenset({0}), ((1,),))
+
+    def test_plain_aggregation_rejects_missing_aggregate(self) -> None:
+        strategy = server_app.SentimentServer.__new__(server_app.SentimentServer)
+        strategy.use_huber = False
+        strategy.expected_client_ids = frozenset({0})
+        strategy.expected_weight_shapes = ((1,),)
+        result = (
+            Mock(),
+            SimpleNamespace(
+                parameters=ndarrays_to_parameters([np.array([1.0], dtype=np.float32)]),
+                num_examples=1,
+                metrics={"client_id": 0},
+            ),
+        )
+
+        with patch.object(server_app.FedProx, "aggregate_fit", return_value=(None, {})):
+            with self.assertRaisesRegex(RuntimeError, "produced no aggregate"):
+                strategy.aggregate_fit(1, [result], [])
+
+    def test_plain_aggregation_rejects_invalid_strategy_output(self) -> None:
+        strategy = server_app.SentimentServer.__new__(server_app.SentimentServer)
+        strategy.use_huber = False
+        strategy.expected_client_ids = frozenset({0})
+        strategy.expected_weight_shapes = ((1,),)
+        result = (
+            Mock(),
+            SimpleNamespace(
+                parameters=ndarrays_to_parameters([np.array([1.0], dtype=np.float32)]),
+                num_examples=1,
+                metrics={"client_id": 0},
+            ),
+        )
+        invalid_aggregate = ndarrays_to_parameters(
+            [np.array([np.nan], dtype=np.float32)]
+        )
+
+        with patch.object(
+            server_app.FedProx,
+            "aggregate_fit",
+            return_value=(invalid_aggregate, {}),
+        ):
+            with self.assertRaisesRegex(ValueError, "finite values"):
+                strategy.aggregate_fit(1, [result], [])
 
     def test_client_evaluation_metrics_are_written_per_round(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

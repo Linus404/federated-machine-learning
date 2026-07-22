@@ -85,6 +85,7 @@ class ScientificContractTests(unittest.TestCase):
                 "public-artifact-dir": "artifacts/public",
                 "server-artifact-dir": "artifacts/server",
                 "artifact-retention-runs": 10,
+                "expected-client-count": 4,
                 "client-data-dir": "artifacts/clients/client-{partition}",
                 "proximal-mu": 0.1,
                 "use-huber": False,
@@ -107,12 +108,17 @@ class ScientificContractTests(unittest.TestCase):
 
     def test_huber_aggregation_result_is_stable(self) -> None:
         result = huber_aggregate(
-            [np.asarray([0.0]), np.asarray([1.0]), np.asarray([100.0])],
+            [
+                np.asarray([0.0], dtype=np.float32),
+                np.asarray([1.0], dtype=np.float32),
+                np.asarray([100.0], dtype=np.float32),
+            ],
             [1, 1, 1],
             threshold=1.0,
         )
 
-        self.assertAlmostEqual(float(result[0]), 1.0178052498120798)
+        self.assertEqual(result.dtype, np.dtype(np.float32))
+        self.assertAlmostEqual(float(result[0]), 1.0178052186965942)
 
     def test_update_noise_clips_each_weight_update_before_adding_noise(self) -> None:
         client = SentimentClient.__new__(SentimentClient)

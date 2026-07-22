@@ -3,6 +3,13 @@ name = "federated-imdb-scientific-protocol"
 status = "frozen"
 amendment_policy = "Changes require a separately reviewed protocol version before comparative results are produced."
 
+[scope]
+purpose = "Preregistered, executable specification for the later PR12 experiment runner and its generated comparative results."
+implementation_status = "This repository revision freezes the protocol before the experiment runner is split out; it does not contain a runner that executes the registered matrix. No matrix cell or comparative result may be claimed as executed by this revision."
+reviewed_server_boundary = "src/server_app.py is the current deployment/demo server, not the registered experiment runner. It exposes FedProx with either Flower sample-weighted aggregation or the Huber aggregate, requires an exact configured client-ID set for fitting, validates that submitted sample counts are positive built-in integers but does not independently derive the registered fitted-row counts, and performs client-local evaluation aggregation. It does not implement threat transforms, FedMedian, FedTrimmedAvg, deterministic protocol partition construction, the server-held validation union, the untouched-test schedule, privacy analyses, or matrix orchestration."
+deployment_configuration = "The deployment defaults to expected-client-count=4 because compose.yaml registers client IDs 0 through 3. Changing expected-client-count changes only the deployment server's exact fit-result set; it does not select or execute a protocol matrix client_scale cell."
+experiment_runner_requirement = "A later runner claiming protocol conformance must implement every registered cell and validation/evaluation boundary exactly, including client scales 4, 16, and 64, registered strategies and threats, no client evaluation, one server-held validation-union evaluation per round, final untouched-test evaluation, hard cell failure, and provenance. Reusing src/server_app.py without those additions is non-conformant."
+
 [dataset]
 id = "stanfordnlp/imdb"
 config = "plain_text"
@@ -302,7 +309,7 @@ submitted_value = "The aggregation input is each client's complete post-fit mode
 threat_order = "First complete the honest local epoch and decode the complete honest post-fit weights. Second validate client IDs, sample counts, round-start weights, and every honest post-fit array. Third, only for selected malicious clients and independently for each model.weights tensor in model.weights order, execute the registered threat transformation. Fourth, aggregate the resulting complete submitted weights. Never aggregate honest weights before applying a threat."
 threat_transformation = "For each selected malicious client's corresponding float32 honest post-fit tensor H and common float32 round-start tensor G, execute D=numpy.subtract(H,G), T=numpy.multiply(D,numpy.float32(threat_scale)), and S=numpy.add(G,T), using NumPy 2.4.4 defaults with no dtype argument or out argument. D, T, and S remain float32. Use threat_scale=10.0 for outlier and -10.0 for sign_flip. S replaces H as that client's complete submitted tensor. Hard-fail if D, T, or S is non-finite."
 coordinate_layout = "For mathematical indexing and golden probes only, flatten every submitted tensor separately with numpy.ndarray.flatten(order='C'), concatenate those vectors in model.weights order, and number coordinates from zero. Reconstruct by splitting at the original tensor element counts and applying numpy.reshape(part, original_shape, order='C') with no dtype cast. The executable Flower calls operate tensor-by-tensor and are bitwise equivalent to this coordinate layout; coordinates never mix."
-common_invalid_inputs = "Hard-fail the cell before aggregation for any result-set, client-ID, sample-count, model, threat-intermediate, flattening, or reconstruction violation above. Also hard-fail if the selected strategy returns a different tensor count or shape, a non-float32 dtype, or any non-finite value. No invalid registered cell may be skipped, repaired, clipped, cast, partially aggregated, or assigned a fallback result."
+common_invalid_inputs = "Hard-fail the cell before aggregation for any result-set, client-ID, sample-count, model, threat-intermediate, flattening, or reconstruction violation above. Also hard-fail if the selected strategy returns a different tensor count or shape, a non-float32 dtype, or any non-finite value. No invalid registered input may be skipped, repaired, clipped, cast, partially aggregated, or assigned a fallback result. The explicit strategies.fedprox_huber reconstruction cast is part of that valid strategy's registered output formula and is not input repair."
 
 [aggregation.golden_probe]
 tensor_shapes = [[2], [2]]
@@ -387,13 +394,15 @@ residual_norm = "At iteration t, residual_i = numpy.linalg.norm(estimate_t - cli
 epsilon_rule = "If residual_i <= threshold, set scale_i=1.0 without using epsilon; otherwise set scale_i=threshold/(residual_i+epsilon) exactly."
 huber_weight = "Set effective_weight_i = sample_weight_i * scale_i."
 update = "For t=0 through 9, normalize effective weights by their sum, then set estimate_(t+1) = numpy.average(client_vectors, axis=0, weights=normalized_effective_weights), preserving ascending client_id order in float64. Execute exactly 10 updates with no early stopping. Hard-fail on non-finite values or a non-positive effective-weight sum."
-reconstruction = "After iteration 10, split the float64 estimate_10 at the original model-weight element counts and reshape each part in C order to its reference model.weights shape without a dtype cast; serialize those arrays as the aggregated global parameters."
+reconstruction = "After iteration 10, execute estimate_10.astype(numpy.float32) exactly once with default casting and no copy argument. Hard-fail if the cast result is non-finite. Split that float32 vector at the original model-weight element counts and reshape each part in C order to its reference model.weights shape without any further dtype cast; serialize those float32 arrays as the aggregated global parameters. This registered result cast is part of the Huber formula and is not input repair."
 
 [strategies.fedprox_huber.golden_probe]
 client_vectors = [[0.0, 0.0], [30.0, 0.0], [0.0, 40.0]]
 sample_weights = [2, 1, 1]
 initial_estimate = [7.5, 10.0]
 estimate_after_10_updates = [4.335034175752573, 4.163210734443747]
+aggregate_vector = [4.335034370422363, 4.163210868835449]
+aggregate_float32_uint32 = [1082833050, 1082472710]
 
 [strategies.fedmedian]
 kind = "coordinate_wise_median"
