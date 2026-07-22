@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import tempfile
 import unittest
@@ -31,9 +32,19 @@ class LocalTrainingTests(unittest.TestCase):
                 validation_split=0.25,
             )
             args.public_artifact_dir.mkdir()
-            (args.public_artifact_dir / "vocab.txt").write_text(
-                "\n[UNK]\ngood\nbad\n", encoding="utf-8"
-            )
+            vocabulary = b"\n[UNK]\ngood\nbad\n"
+            vocabulary_sha256 = hashlib.sha256(vocabulary).hexdigest()
+            (args.public_artifact_dir / "vocab.txt").write_bytes(vocabulary)
+            dataset = {
+                "id": "example/imdb",
+                "config": "plain_text",
+                "revision": "frozen",
+                "datasets_version": "1.0.0",
+                "split": "train",
+                "rows": 4,
+                "raw_parquet_sha256": "1" * 64,
+                "content_sha256": "2" * 64,
+            }
             (args.public_artifact_dir / "manifest.json").write_text(
                 json.dumps(
                     {
@@ -41,12 +52,43 @@ class LocalTrainingTests(unittest.TestCase):
                         "embedding_dim": 8,
                         "sequence_length": 16,
                         "vocabulary_size": 4,
-                        "vocabulary": {"filename": "vocab.txt"},
-                        "provenance": "test dataset",
+                        "vocabulary": {
+                            "filename": "vocab.txt",
+                            "sha256": vocabulary_sha256,
+                            "size_bytes": len(vocabulary),
+                        },
+                        "dataset": dataset,
                     }
                 ),
                 encoding="utf-8",
             )
+            protocol = {
+                "dataset": {
+                    **{
+                        key: dataset[key]
+                        for key in (
+                            "id",
+                            "config",
+                            "revision",
+                            "datasets_version",
+                        )
+                    },
+                    "splits": {
+                        "train": {
+                            key: dataset[key]
+                            for key in (
+                                "rows",
+                                "raw_parquet_sha256",
+                                "content_sha256",
+                            )
+                        }
+                    },
+                },
+                "preprocessing": {
+                    "vocabulary_size": 4,
+                    "vocabulary_sha256": vocabulary_sha256,
+                },
+            }
             history = SimpleNamespace(
                 history={
                     "loss": [0.4],
@@ -79,6 +121,10 @@ class LocalTrainingTests(unittest.TestCase):
                 ) as load_shard,
                 patch(
                     "src.local_training.build_model_from_manifest", return_value=model
+                ),
+                patch(
+                    "src.app_manifest.load_scientific_protocol",
+                    return_value=protocol,
                 ),
             ):
                 train(args)

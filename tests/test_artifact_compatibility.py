@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import tempfile
@@ -43,12 +44,56 @@ class ArtifactCompatibilityTests(unittest.TestCase):
                 load_app_manifest(public_artifact_dir=path)
 
     def test_public_manifest_checks_each_schema_version_state(self) -> None:
+        vocabulary = b"\n[UNK]\ngood\n"
+        vocabulary_sha256 = hashlib.sha256(vocabulary).hexdigest()
+        dataset = {
+            "id": "example/imdb",
+            "config": "plain_text",
+            "revision": "frozen",
+            "datasets_version": "1.0.0",
+            "split": "train",
+            "rows": 3,
+            "raw_parquet_sha256": "1" * 64,
+            "content_sha256": "2" * 64,
+        }
+        protocol = {
+            "dataset": {
+                **{
+                    key: dataset[key]
+                    for key in (
+                        "id",
+                        "config",
+                        "revision",
+                        "datasets_version",
+                    )
+                },
+                "splits": {
+                    "train": {
+                        key: dataset[key]
+                        for key in (
+                            "rows",
+                            "raw_parquet_sha256",
+                            "content_sha256",
+                        )
+                    }
+                },
+            },
+            "preprocessing": {
+                "vocabulary_size": 3,
+                "vocabulary_sha256": vocabulary_sha256,
+            },
+        }
         valid_payload = {
             "schema_version": ARTIFACT_SCHEMA_VERSION,
             "embedding_dim": 100,
             "sequence_length": 500,
             "vocabulary_size": 3,
-            "vocabulary": {"filename": "vocab.txt"},
+            "vocabulary": {
+                "filename": "vocab.txt",
+                "sha256": vocabulary_sha256,
+                "size_bytes": len(vocabulary),
+            },
+            "dataset": dataset,
         }
         for version, error in ((None, "no valid"), (0, "older"), (2, "newer")):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as tmpdir:
@@ -67,10 +112,11 @@ class ArtifactCompatibilityTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir)
+            (path / "vocab.txt").write_bytes(vocabulary)
             (path / "manifest.json").write_text(
                 json.dumps(valid_payload), encoding="utf-8"
             )
-            manifest = load_app_manifest(public_artifact_dir=path)
+            manifest = load_app_manifest(public_artifact_dir=path, protocol=protocol)
             self.assertEqual(manifest.payload, valid_payload)
 
     def test_server_artifact_manifest_declares_supported_outputs(self) -> None:

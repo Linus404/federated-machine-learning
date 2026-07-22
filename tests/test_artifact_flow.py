@@ -20,14 +20,29 @@ from src.local_training import (
 
 
 def write_public_artifacts(path: Path, sequence_length: int = 4) -> AppManifest:
-    vocabulary = "\n[UNK]\ngood\nbad\nmovie"
-    (path / "vocab.txt").write_text(vocabulary, encoding="utf-8")
+    vocabulary = b"\n[UNK]\ngood\nbad\nmovie\n"
+    vocabulary_sha256 = hashlib.sha256(vocabulary).hexdigest()
+    (path / "vocab.txt").write_bytes(vocabulary)
     payload = {
         "schema_version": ARTIFACT_SCHEMA_VERSION,
         "embedding_dim": 100,
         "sequence_length": sequence_length,
         "vocabulary_size": 5,
-        "vocabulary": {"filename": "vocab.txt"},
+        "vocabulary": {
+            "filename": "vocab.txt",
+            "sha256": vocabulary_sha256,
+            "size_bytes": len(vocabulary),
+        },
+        "dataset": {
+            "id": "example/imdb",
+            "config": "plain_text",
+            "revision": "frozen",
+            "datasets_version": "1.0.0",
+            "split": "train",
+            "rows": 4,
+            "raw_parquet_sha256": "1" * 64,
+            "content_sha256": "2" * 64,
+        },
     }
     manifest_path = path / "manifest.json"
     manifest_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -37,10 +52,42 @@ def write_public_artifacts(path: Path, sequence_length: int = 4) -> AppManifest:
     return AppManifest(payload, path / "vocab.txt")
 
 
+def public_protocol() -> dict[str, object]:
+    """Return the small frozen public-artifact protocol used by flow tests.
+
+    Returns
+    -------
+    dict of str to object
+        Dataset and vocabulary identity matching ``write_public_artifacts``.
+    """
+    vocabulary = b"\n[UNK]\ngood\nbad\nmovie\n"
+    return {
+        "dataset": {
+            "id": "example/imdb",
+            "config": "plain_text",
+            "revision": "frozen",
+            "datasets_version": "1.0.0",
+            "splits": {
+                "train": {
+                    "rows": 4,
+                    "raw_parquet_sha256": "1" * 64,
+                    "content_sha256": "2" * 64,
+                }
+            },
+        },
+        "preprocessing": {
+            "vocabulary_size": 5,
+            "vocabulary_sha256": hashlib.sha256(vocabulary).hexdigest(),
+        },
+    }
+
+
 def check_public_manifest_loads_the_model_shape(tmp_path: Path) -> None:
     write_public_artifacts(tmp_path, sequence_length=500)
 
-    manifest = load_app_manifest(public_artifact_dir=tmp_path)
+    manifest = load_app_manifest(
+        public_artifact_dir=tmp_path, protocol=public_protocol()
+    )
 
     assert manifest.vocabulary_path == tmp_path.resolve() / "vocab.txt"
     assert manifest.payload["embedding_dim"] == 100
@@ -207,7 +254,18 @@ def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> No
                     "content_sha256": hashlib.sha256(content).hexdigest(),
                 },
             },
-        }
+        },
+        "preprocessing": {
+            "vocabulary_size": 5,
+            "vocabulary_sha256": hashlib.sha256(
+                b"\n[UNK]\nreview\ngood\nmovie\n"
+            ).hexdigest(),
+        },
+        "framework": {
+            "tensorflow_version": "2.20.0",
+            "keras_version": "3.14.0",
+            "numpy_version": "2.4.4",
+        },
     }
     dataset = {
         "train": Split(
@@ -278,6 +336,77 @@ def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> No
 
 
 class ArtifactFlowTests(unittest.TestCase):
+    def test_preparation_publishes_evaluation_only_after_retryable_outputs(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            evaluation_dir = root / "evaluation"
+            dataset = {
+                "train": {"text": ["negative", "positive"], "label": [0, 1]},
+                "test": [{"text": "untouched", "label": 0}],
+            }
+            protocol = {
+                "dataset": {
+                    "id": "example/imdb",
+                    "config": "plain_text",
+                    "revision": "frozen",
+                    "datasets_version": "1.0.0",
+                    "splits": {
+                        "train": {
+                            "rows": 2,
+                            "raw_parquet_sha256": "1" * 64,
+                            "content_sha256": "2" * 64,
+                        }
+                    },
+                },
+                "framework": {
+                    "tensorflow_version": "2.20.0",
+                    "keras_version": "3.14.0",
+                    "numpy_version": "2.4.4",
+                },
+            }
+
+            def publish_evaluation(rows, output_dir, *, protocol):
+                del rows, protocol
+                Path(output_dir).mkdir()
+
+            with (
+                patch("src.data_prep.load_verified_imdb_dataset", return_value=dataset),
+                patch("src.data_prep.build_vectorizer", return_value=object()),
+                patch("src.data_prep.load_scientific_protocol", return_value=protocol),
+                patch("src.data_prep.publish_public_artifacts", return_value={}),
+                patch(
+                    "src.data_prep.package_raw_client_shards",
+                    side_effect=[
+                        RuntimeError("injected client publication failure"),
+                        [],
+                    ],
+                ),
+                patch(
+                    "src.data_prep.publish_evaluation_artifact",
+                    side_effect=publish_evaluation,
+                ) as publish_test,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected"):
+                    prepare_all(
+                        2,
+                        root / "clients",
+                        root / "public",
+                        evaluation_dir,
+                    )
+                self.assertFalse(evaluation_dir.exists())
+
+                prepare_all(
+                    2,
+                    root / "clients",
+                    root / "public",
+                    evaluation_dir,
+                )
+
+            self.assertTrue(evaluation_dir.is_dir())
+            publish_test.assert_called_once()
+
     def test_preparation_rejects_overlapping_artifact_boundaries_before_loading(
         self,
     ) -> None:

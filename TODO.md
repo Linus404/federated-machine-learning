@@ -29,10 +29,10 @@ federated learning system.
 - [ ] Publish reproducible commands and a results table in the README.
 - [ ] Store the code version, run configuration, dataset version, seeds, and artifact checksums for every experiment.
   - Partial: each run now records code/configuration/environment metadata, known
-    seeds, exact public training-dataset identity/checksums, the immutable global
-    test artifact identity/checksum, and completed model/metrics/provenance
-    checksums for federated and local training. Experiment-level client-shard
-    checksum bindings remain part of the published experiment work.
+    seeds, exact public training-dataset identity/checksums, and completed
+    model/metrics/provenance checksums for federated and local training.
+    Experiment-level test-artifact and client-shard checksum bindings remain part
+    of the published experiment work.
 
 ## P0 — Privacy and security claims
 

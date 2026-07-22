@@ -6,10 +6,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
+
 from src.data_prep import (
     _validate_loaded_dataset,
     build_vectorizer,
     load_verified_imdb_dataset,
+    prepare_all,
 )
 from src.evaluation_artifact import (
     EVALUATION_MANIFEST_FILENAME,
@@ -315,6 +318,47 @@ class EvaluationArtifactTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "datasets version differs"):
                 load_verified_imdb_dataset()
+
+        load_dataset.assert_not_called()
+
+    def test_vectorizer_rejects_hostile_framework_versions_before_construction(
+        self,
+    ) -> None:
+        import keras
+        import tensorflow as tf
+
+        with (
+            patch.object(np, "__version__", "99.0.0"),
+            patch.object(keras, "__version__", "99.0.0"),
+            patch.object(tf, "__version__", "99.0.0"),
+            patch.object(keras.layers, "TextVectorization") as vectorizer,
+            self.assertRaisesRegex(ValueError, "framework versions differ"),
+        ):
+            build_vectorizer(["must not be preprocessed"])
+
+        vectorizer.assert_not_called()
+
+    def test_preparation_rejects_hostile_frameworks_before_dataset_loading(
+        self,
+    ) -> None:
+        import keras
+        import tensorflow as tf
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with (
+                patch.object(np, "__version__", "99.0.0"),
+                patch.object(keras, "__version__", "99.0.0"),
+                patch.object(tf, "__version__", "99.0.0"),
+                patch("src.data_prep.load_verified_imdb_dataset") as load_dataset,
+                self.assertRaisesRegex(ValueError, "framework versions differ"),
+            ):
+                prepare_all(
+                    2,
+                    root / "clients",
+                    root / "public",
+                    root / "evaluation",
+                )
 
         load_dataset.assert_not_called()
 

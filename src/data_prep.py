@@ -176,6 +176,47 @@ def load_verified_imdb_dataset(*, local_files_only: bool = False) -> Any:
     return dataset
 
 
+def _validated_frameworks() -> tuple[Any, Any, Mapping[str, Any]]:
+    """Load frameworks only when their versions match the frozen protocol.
+
+    Returns
+    -------
+    tuple
+        Keras, TensorFlow, and the parsed frozen protocol.
+
+    Raises
+    ------
+    ValueError
+        If any registered framework version differs from the runtime.
+    """
+    import keras
+    import tensorflow as tf
+
+    protocol = load_scientific_protocol()
+    framework = protocol["framework"]
+    installed_versions = {
+        "tensorflow": tf.__version__,
+        "keras": keras.__version__,
+        "numpy": np.__version__,
+    }
+    expected_versions = {
+        "tensorflow": framework["tensorflow_version"],
+        "keras": framework["keras_version"],
+        "numpy": framework["numpy_version"],
+    }
+    mismatches = [
+        f"{name}: expected {expected_versions[name]}, got {installed_versions[name]}"
+        for name in expected_versions
+        if installed_versions[name] != expected_versions[name]
+    ]
+    if mismatches:
+        raise ValueError(
+            "framework versions differ from the frozen protocol: "
+            + "; ".join(mismatches)
+        )
+    return keras, tf, protocol
+
+
 def build_vectorizer(texts: Any) -> Any:
     """Build and verify the shared public token-ID contract.
 
@@ -189,8 +230,7 @@ def build_vectorizer(texts: Any) -> Any:
     keras.layers.TextVectorization
         Adapted vectorizer matching the frozen vocabulary contract.
     """
-    import keras
-    import tensorflow as tf
+    keras, tf, protocol = _validated_frameworks()
 
     def protocol_standardize(text):
         text = tf.strings.regex_replace(text, "<[^>]+>", " ")
@@ -210,12 +250,15 @@ def build_vectorizer(texts: Any) -> Any:
     vectorizer.adapt(
         tf.data.Dataset.from_tensor_slices(list(texts)).batch(256, drop_remainder=False)
     )
-    protocol = load_scientific_protocol()["preprocessing"]
+    preprocessing = protocol["preprocessing"]
     vocabulary = vectorizer.get_vocabulary()
     vocabulary_bytes = b"".join(item.encode("utf-8") + b"\n" for item in vocabulary)
-    if len(vocabulary) != protocol["vocabulary_size"]:
+    if len(vocabulary) != preprocessing["vocabulary_size"]:
         raise ValueError("vocabulary size differs from the frozen protocol")
-    if hashlib.sha256(vocabulary_bytes).hexdigest() != protocol["vocabulary_sha256"]:
+    if (
+        hashlib.sha256(vocabulary_bytes).hexdigest()
+        != preprocessing["vocabulary_sha256"]
+    ):
         raise ValueError("vocabulary SHA-256 differs from the frozen protocol")
     return vectorizer
 
@@ -358,10 +401,15 @@ def publish_public_artifacts(
     output_path = resolve_dir(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     vocabulary = vectorizer.get_vocabulary()
-    (output_path / "vocab.txt").write_text(
-        "".join(item + "\n" for item in vocabulary), encoding="utf-8"
-    )
+    vocabulary_bytes = b"".join(item.encode("utf-8") + b"\n" for item in vocabulary)
     frozen = protocol or load_scientific_protocol()
+    preprocessing = frozen["preprocessing"]
+    vocabulary_sha256 = hashlib.sha256(vocabulary_bytes).hexdigest()
+    if len(vocabulary) != preprocessing["vocabulary_size"]:
+        raise ValueError("vocabulary size differs from the frozen protocol")
+    if vocabulary_sha256 != preprocessing["vocabulary_sha256"]:
+        raise ValueError("vocabulary SHA-256 differs from the frozen protocol")
+    (output_path / "vocab.txt").write_bytes(vocabulary_bytes)
     dataset = frozen["dataset"]
     train = dataset["splits"]["train"]
     manifest = {
@@ -369,7 +417,11 @@ def publish_public_artifacts(
         "embedding_dim": DEFAULT_EMBEDDING_DIM,
         "sequence_length": DEFAULT_SEQUENCE_LENGTH,
         "vocabulary_size": len(vocabulary),
-        "vocabulary": {"filename": "vocab.txt"},
+        "vocabulary": {
+            "filename": "vocab.txt",
+            "sha256": vocabulary_sha256,
+            "size_bytes": len(vocabulary_bytes),
+        },
         "dataset": {
             "id": dataset["id"],
             "config": dataset["config"],
@@ -436,13 +488,13 @@ def prepare_all(
             "the immutable test set"
         )
 
+    _validated_frameworks()
     dataset = load_verified_imdb_dataset()
     train = dataset["train"]
     texts = np.asarray(train["text"])
     labels = np.asarray(train["label"], dtype="int32")
     vectorizer = build_vectorizer(texts)
     protocol = load_scientific_protocol()
-    publish_evaluation_artifact(dataset["test"], evaluation_dir, protocol=protocol)
     manifest = publish_public_artifacts(vectorizer, public_dir, protocol=protocol)
     dataset_spec = protocol["dataset"]
     train_spec = dataset_spec["splits"]["train"]
@@ -465,6 +517,7 @@ def prepare_all(
             "row_identity": "train:{zero_based_official_split_row_index}",
         },
     )
+    publish_evaluation_artifact(dataset["test"], evaluation_dir, protocol=protocol)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
