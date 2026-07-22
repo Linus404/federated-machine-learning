@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 from src.app_manifest import AppManifest, expected_train_dataset, load_app_manifest
 from src.artifact_history import (
+    create_run_artifact_dir,
     load_current_run_snapshot,
     prune_run_history,
     publish_completed_run as _publish_completed_run,
@@ -203,6 +204,58 @@ def rewrite_current_artifact_manifest(root: Path, run_dir: Path) -> None:
 
 
 class ArtifactHistoryTests(unittest.TestCase):
+    def test_run_creation_durably_installs_each_missing_directory_edge(self) -> None:
+        """Flush every new artifact-root and runs edge before descending."""
+        from src import artifact_compatibility, artifact_history
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "base" / "outer" / "root"
+            real_mkdir = os.mkdir
+            real_fsync = os.fsync
+            events: list[tuple[str, tuple[int, int]]] = []
+
+            def record_mkdir(name, mode=0o777, *, dir_fd=None):
+                assert dir_fd is not None
+                owner = os.fstat(dir_fd)
+                result = real_mkdir(name, mode=mode, dir_fd=dir_fd)
+                events.append((f"mkdir:{name}", (owner.st_dev, owner.st_ino)))
+                return result
+
+            def record_fsync(descriptor):
+                current = os.fstat(descriptor)
+                events.append(("fsync", (current.st_dev, current.st_ino)))
+                return real_fsync(descriptor)
+
+            with (
+                patch.object(
+                    artifact_history,
+                    "require_secure_artifact_platform",
+                    return_value=None,
+                ),
+                patch.object(
+                    artifact_compatibility.os, "mkdir", side_effect=record_mkdir
+                ),
+                patch.object(
+                    artifact_compatibility.os, "fsync", side_effect=record_fsync
+                ),
+                patch.object(
+                    artifact_history,
+                    "write_run_provenance_manifest",
+                    return_value=None,
+                ),
+            ):
+                run = create_run_artifact_dir(root, {})
+
+            self.assertTrue(run.is_dir())
+            mkdir_positions = [
+                index
+                for index, event in enumerate(events)
+                if event[0].startswith("mkdir:")
+            ]
+            self.assertGreaterEqual(len(mkdir_positions), 3)
+            for position in mkdir_positions:
+                self.assertEqual(events[position + 1], ("fsync", events[position][1]))
+
     def setUp(self) -> None:
         """Use the small frozen public contract created by history fixtures.
 
@@ -1949,52 +2002,80 @@ with patch("src.app_manifest.load_scientific_protocol", return_value=_TEST_PROTO
         self,
     ) -> None:
         """Restore pending state on the retained root at both complete boundaries."""
+        for boundary in ("before", "after"):
+            for replaced_component in ("base", "outer", "root"):
+                with self.subTest(
+                    boundary=boundary, replaced_component=replaced_component
+                ):
+                    self._assert_complete_transition_ancestor_replacement(
+                        boundary, replaced_component
+                    )
+
+    def _assert_complete_transition_ancestor_replacement(
+        self, boundary: str, replaced_component: str
+    ) -> None:
+        """Reject one ancestor substitution around the complete transition.
+
+        Parameters
+        ----------
+        boundary : str
+            Whether replacement occurs before or after the state transition.
+        replaced_component : str
+            Ancestor basename replaced during finalization.
+
+        Returns
+        -------
+        None
+        """
         from src import artifact_history
 
-        for boundary in ("before", "after"):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir) / "base"
+            root = base / "outer" / "root"
+            root.mkdir(parents=True)
+            run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            ancestors = {
+                "base": base,
+                "outer": base / "outer",
+                "root": root,
+            }
+            replaced_path = ancestors[replaced_component]
+            parked = replaced_path.parent / f"parked-{replaced_component}"
+            parked_root = parked / root.relative_to(replaced_path)
+            real_record = artifact_history._record_finalization_state
+            replaced = False
+
+            def replace_root():
+                nonlocal replaced
+                if replaced:
+                    return
+                replaced = True
+                replaced_path.rename(parked)
+                (root / "runs").mkdir(parents=True)
+                (replaced_path / "unrelated").write_bytes(b"replacement")
+
+            def record(retained_root, run_id, state):
+                if state.status == "complete" and boundary == "before":
+                    replace_root()
+                result = real_record(retained_root, run_id, state)
+                if state.status == "complete" and boundary == "after":
+                    replace_root()
+                return result
+
             with (
-                self.subTest(boundary=boundary),
-                tempfile.TemporaryDirectory() as tmpdir,
+                patch.object(
+                    artifact_history,
+                    "_record_finalization_state",
+                    side_effect=record,
+                ),
+                self.assertRaisesRegex(ValueError, "history changed"),
             ):
-                root = Path(tmpdir) / "root"
-                root.mkdir()
-                run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
-                parked = root.parent / "parked-root"
-                real_record = artifact_history._record_finalization_state
-                replaced = False
+                publish_completed_run(root, run)
 
-                def replace_root():
-                    nonlocal replaced
-                    if replaced:
-                        return
-                    replaced = True
-                    root.rename(parked)
-                    root.mkdir()
-                    (root / "runs").mkdir()
-
-                def record(retained_root, run_id, state):
-                    if state.status == "complete" and boundary == "before":
-                        replace_root()
-                    result = real_record(retained_root, run_id, state)
-                    if state.status == "complete" and boundary == "after":
-                        replace_root()
-                    return result
-
-                with (
-                    patch.object(
-                        artifact_history,
-                        "_record_finalization_state",
-                        side_effect=record,
-                    ),
-                    self.assertRaisesRegex(ValueError, "history changed"),
-                ):
-                    publish_completed_run(root, run)
-
-                state_path = parked / f".{RUN_IDS[0]}.finalize.state"
-                self.assertEqual(
-                    json.loads(state_path.read_bytes())["state"], "pending"
-                )
-                self.assertFalse((root / "current.json").exists())
+            state_path = parked_root / f".{RUN_IDS[0]}.finalize.state"
+            self.assertEqual(json.loads(state_path.read_bytes())["state"], "pending")
+            self.assertFalse((root / "current.json").exists())
+            self.assertEqual((replaced_path / "unrelated").read_bytes(), b"replacement")
 
     def test_pruning_removes_only_safe_finalization_state(self) -> None:
         """Remove complete and obsolete state while preserving recoverable state."""
@@ -2131,6 +2212,57 @@ with patch("src.app_manifest.load_scientific_protocol", return_value=_TEST_PROTO
                 self.assertTrue(state_path.is_file())
                 self.assertEqual(prune_run_history(root, 1), [])
                 self.assertFalse(state_path.exists())
+
+    def test_pruning_rejects_every_detached_artifact_root_ancestor(self) -> None:
+        """Never delete a run after any higher root ancestor is replaced."""
+        from src import artifact_history
+
+        for replaced_component in ("base", "outer", "root"):
+            with (
+                self.subTest(replaced_component=replaced_component),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                base = Path(tmpdir) / "base"
+                root = base / "outer" / "root"
+                root.mkdir(parents=True)
+                oldest = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+                current = create_run(root, RUN_IDS[1], "2026-01-02T00:00:00Z")
+                publish_completed_run(root, oldest)
+                publish_completed_run(root, current)
+                ancestors = {
+                    "base": base,
+                    "outer": base / "outer",
+                    "root": root,
+                }
+                replaced_path = ancestors[replaced_component]
+                parked = replaced_path.parent / f"parked-{replaced_component}"
+                parked_root = parked / root.relative_to(replaced_path)
+                real_load = artifact_history._load_current_index_at
+                loads = 0
+
+                def replace_before_prune(*args, **kwargs):
+                    nonlocal loads
+                    loads += 1
+                    if loads == 2:
+                        replaced_path.rename(parked)
+                        (root / "runs").mkdir(parents=True)
+                        (replaced_path / "unrelated").write_bytes(b"replacement")
+                    return real_load(*args, **kwargs)
+
+                with (
+                    patch.object(
+                        artifact_history,
+                        "_load_current_index_at",
+                        side_effect=replace_before_prune,
+                    ),
+                    self.assertRaisesRegex(ValueError, "history changed"),
+                ):
+                    prune_run_history(root, 1)
+
+                self.assertTrue((parked_root / "runs" / oldest.name).is_dir())
+                self.assertEqual(
+                    (replaced_path / "unrelated").read_bytes(), b"replacement"
+                )
 
     def test_pruning_cleans_only_safe_state_for_absent_runs(self) -> None:
         """Clean complete and obsolete pending state but retain recovery evidence."""

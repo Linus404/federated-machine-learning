@@ -58,14 +58,19 @@ index use schema `1`:
 Both current-pointer and explicit historical consumers validate completed-run
 provenance bytes, directory/run identity, frozen public dataset and vocabulary
 bindings, checksums, and exact inventory before returning artifact bytes.
-Publication retains no-follow descriptors and filesystem identities for the root,
-canonical `runs/` directory, selected run, and captured files. It flushes the
-retained files, completed run directory, and `runs/` directory, revalidates the exact
-entry inventory, identities, and bytes, replaces `current.json` descriptor-relatively,
-and finally flushes the retained artifact root. The exclusive temporary pointer remains
-open through replacement; the installed entry must retain that inode and exact bytes
-before and after the root flush. Finalizers serialize on that retained root inode rather
-than a replaceable lock entry. Before the final barriers, a private,
+Publication retains no-follow descriptors and exact directory-edge identities from
+the filesystem root through the artifact root, canonical `runs/` directory, and
+selected run, plus every captured file. Creation flushes each owning directory before
+using a newly created artifact-root or `runs/` edge. Publication and pruning revalidate
+the complete visible chain around every mutation, durability barrier, rollback, and
+successful return; retaining or locking a detached root inode never proves visible-path
+ownership. Publication flushes the retained files, completed run directory, and `runs/`
+directory, revalidates the exact entry inventory, identities, and bytes, replaces
+`current.json` descriptor-relatively, and finally flushes the retained artifact root.
+The exclusive temporary pointer remains open through replacement; the installed entry
+must retain that inode and exact bytes before and after the root flush. Finalizers
+serialize on that retained root inode rather than a replaceable lock entry. Before the
+final barriers, a private,
 strict-canonical state file is atomically replaced and flushed with the exact candidate
 pointer plus the exact previous pointer identity, bytes, and checksum, or its absence.
 A restart accepts only those two recorded pointer states: it retries publication from

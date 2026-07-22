@@ -78,6 +78,13 @@ be mounted into ClientApp, the dashboard, or the current training ServerApp. PR1
 and PR15 will add the registered consumers and metrics; this command performs no
 evaluation.
 
+Direct evaluation publication retains and revalidates every no-follow directory
+edge from the filesystem root through the destination parent. Missing parent
+components are created descriptor-relatively and each new edge is flushed before
+the next component is created. A failed publication removes only entries whose
+captured identity proves that invocation owns them; nonempty or detached recovery
+state is preserved for a safe retry.
+
 The first generation created over real legacy `artifacts/clients`,
 `artifacts/public`, or `artifacts/evaluation` directories migrates those complete
 directories by same-filesystem rename into
@@ -179,9 +186,12 @@ In this demo the operator still created all shards centrally; the boundary only
 describes what ServerApp reads at runtime.
 
 Completed-run publication retains no-follow descriptors and filesystem identities
-for the artifact root, canonical `runs/` directory, selected run, and every captured
-file. Finalizers lock the retained root inode, so replacing a visible lock pathname
-cannot split serialization across same-run or different-run publishers. Before the
+for every visible edge from the filesystem root through the artifact root, canonical
+`runs/` directory, selected run, and every captured file. The same complete chain is
+revalidated for creation, finalization, recovery, current publication, and pruning.
+Finalizers lock the retained root inode, but still reject a detached visible path;
+replacing a visible lock pathname cannot split serialization across same-run or
+different-run publishers. Before the
 final barriers, an atomically replaced private state file records the exact candidate
 pointer and the exact previous pointer identity, bytes, and checksum, or absence. It
 is written through an exclusive temporary file, flushed, renamed descriptor-relatively,

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from src.artifact_compatibility import (
+    RetainedDirectoryChain,
     canonical_json_bytes,
     deep_freeze,
     read_regular_file,
@@ -95,12 +96,44 @@ class _RetainedEvaluationFile:
 
 @dataclass(frozen=True)
 class _RetainedEvaluationParent:
-    """Retain the visible destination parent and its owning directory."""
+    """Retain the complete visible chain through the destination parent."""
 
     path: Path
-    descriptor: int
-    owner_descriptor: int | None
-    name: str | None
+    chain: RetainedDirectoryChain
+
+    @property
+    def descriptor(self) -> int:
+        """Return the destination-parent descriptor.
+
+        Returns
+        -------
+        int
+            Retained final directory descriptor.
+        """
+        return self.chain.directory.descriptor
+
+    @property
+    def owner_descriptor(self) -> int | None:
+        """Return the immediate owner descriptor when one exists.
+
+        Returns
+        -------
+        int or None
+            Immediate retained parent, excluding the filesystem anchor.
+        """
+        directories = self.chain.directories
+        return directories[-2].descriptor if len(directories) > 1 else None
+
+    @property
+    def name(self) -> str | None:
+        """Return the visible destination-parent basename.
+
+        Returns
+        -------
+        str or None
+            Basename, or ``None`` for the filesystem anchor.
+        """
+        return None if self.path == Path(self.path.anchor) else self.path.name
 
 
 def load_scientific_protocol() -> Mapping[str, Any]:
@@ -233,48 +266,16 @@ def _open_new_artifact_parent(
     if output_path.name in {"", ".", ".."}:
         raise ValueError("evaluation artifact path must name a child directory")
 
-    anchor = Path(output_path.anchor)
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(anchor, flags)
-    current = anchor
-    try:
-        relative_parts = output_path.parent.parts[len(anchor.parts) :]
-        for index, component in enumerate(relative_parts):
-            try:
-                component_stat = os.stat(
-                    component, dir_fd=descriptor, follow_symlinks=False
-                )
-            except FileNotFoundError:
-                os.mkdir(component, mode=0o755, dir_fd=descriptor)
-                component_stat = os.stat(
-                    component, dir_fd=descriptor, follow_symlinks=False
-                )
-            if not stat.S_ISDIR(component_stat.st_mode):
-                raise ValueError(
-                    "every existing evaluation artifact path component must be a "
-                    "regular directory"
-                )
-            next_descriptor = os.open(component, flags, dir_fd=descriptor)
-            if index == len(relative_parts) - 1:
-                return (
-                    _RetainedEvaluationParent(
-                        current / component,
-                        next_descriptor,
-                        descriptor,
-                        component,
-                    ),
-                    output_path.name,
-                )
-            os.close(descriptor)
-            descriptor = next_descriptor
-            current /= component
-        return (
-            _RetainedEvaluationParent(current, descriptor, None, None),
-            output_path.name,
-        )
-    except BaseException:
-        os.close(descriptor)
-        raise
+    chain = RetainedDirectoryChain.open(
+        output_path.parent,
+        create=True,
+        error_message=(
+            "every existing evaluation artifact path component must be a regular "
+            "directory"
+        ),
+        check_platform=False,
+    )
+    return _RetainedEvaluationParent(output_path.parent, chain), output_path.name
 
 
 def _verify_evaluation_parent(parent: _RetainedEvaluationParent) -> None:
@@ -289,15 +290,31 @@ def _verify_evaluation_parent(parent: _RetainedEvaluationParent) -> None:
     -------
     None
     """
-    if parent.owner_descriptor is None:
-        if not stat.S_ISDIR(os.fstat(parent.descriptor).st_mode):
-            raise ValueError("evaluation parent changed during publication")
-        return
-    assert parent.name is not None
-    if not _directory_entry_matches_descriptor(
-        parent.owner_descriptor, parent.name, parent.descriptor
-    ):
+    try:
+        parent.chain.verify()
+    except ValueError:
         raise ValueError("evaluation parent changed during publication")
+
+
+def _fsync_evaluation_descriptor(
+    parent: _RetainedEvaluationParent, descriptor: int
+) -> None:
+    """Flush one file or directory while its complete path remains visible.
+
+    Parameters
+    ----------
+    parent : _RetainedEvaluationParent
+        Complete retained destination-parent chain.
+    descriptor : int
+        Open file or directory descriptor to flush.
+
+    Returns
+    -------
+    None
+    """
+    _verify_evaluation_parent(parent)
+    os.fsync(descriptor)
+    _verify_evaluation_parent(parent)
 
 
 def _acquire_evaluation_lock(
@@ -515,14 +532,8 @@ def _directory_entry_matches_descriptor(
     bool
         Whether the directory entry and retained descriptor identities match.
     """
-    try:
-        entry = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
-        retained = os.fstat(directory_descriptor)
-    except OSError:
-        return False
-    return stat.S_ISDIR(entry.st_mode) and (entry.st_dev, entry.st_ino) == (
-        retained.st_dev,
-        retained.st_ino,
+    return RetainedDirectoryChain.entry_matches_descriptor(
+        parent_descriptor, name, directory_descriptor
     )
 
 
@@ -601,11 +612,12 @@ def _publish_evaluation_artifact_unlocked(
             f"evaluation artifact path already exists; refusing replacement: {output_path}"
         )
     staging_name = f".{output_name}.{uuid.uuid4().hex}.staging"
+    _verify_evaluation_parent(parent)
     os.mkdir(staging_name, mode=0o700, dir_fd=parent_descriptor)
-    staging_descriptor = os.open(
+    _verify_evaluation_parent(parent)
+    staging_descriptor = parent.chain.open_child(
         staging_name,
-        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
-        dir_fd=parent_descriptor,
+        os.O_RDONLY | os.O_DIRECTORY,
     )
     record_hash = hashlib.sha256()
     content_hash = hashlib.sha256()
@@ -614,11 +626,11 @@ def _publish_evaluation_artifact_unlocked(
     retained_files: dict[str, _RetainedEvaluationFile] = {}
     destination_owned = False
     try:
-        records_descriptor = os.open(
+        records_descriptor = parent.chain.open_child(
             EVALUATION_RECORDS_FILENAME,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
             0o600,
-            dir_fd=staging_descriptor,
+            parent_descriptor=staging_descriptor,
         )
         with os.fdopen(records_descriptor, "wb") as file:
             for index, row in enumerate(rows):
@@ -632,13 +644,15 @@ def _publish_evaluation_artifact_unlocked(
                 label_counts[label] += 1
                 row_count += 1
             file.flush()
-            os.fsync(file.fileno())
+            _fsync_evaluation_descriptor(parent, file.fileno())
+        _verify_evaluation_parent(parent)
         os.chmod(
             EVALUATION_RECORDS_FILENAME,
             0o644,
             dir_fd=staging_descriptor,
             follow_symlinks=False,
         )
+        _verify_evaluation_parent(parent)
 
         expected_counts = dataset_manifest["label_counts"]
         if row_count != dataset_manifest["rows"]:
@@ -671,17 +685,17 @@ def _publish_evaluation_artifact_unlocked(
             },
             "checksums": {EVALUATION_RECORDS_FILENAME: records_checksum},
         }
-        manifest_descriptor = os.open(
+        manifest_descriptor = parent.chain.open_child(
             EVALUATION_MANIFEST_FILENAME,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
             0o644,
-            dir_fd=staging_descriptor,
+            parent_descriptor=staging_descriptor,
         )
         with os.fdopen(manifest_descriptor, "wb") as file:
             manifest_bytes = canonical_json_bytes(manifest)
             file.write(manifest_bytes)
             file.flush()
-            os.fsync(file.fileno())
+            _fsync_evaluation_descriptor(parent, file.fileno())
         for name in (EVALUATION_MANIFEST_FILENAME, EVALUATION_RECORDS_FILENAME):
             retained_files[name] = _read_retained_evaluation_file(
                 staging_descriptor, name
@@ -694,7 +708,7 @@ def _publish_evaluation_artifact_unlocked(
         ):
             raise ValueError("evaluation records changed during publication")
         _verify_evaluation_inventory(staging_descriptor, retained_files)
-        os.fsync(staging_descriptor)
+        _fsync_evaluation_descriptor(parent, staging_descriptor)
         staged_stat = os.stat(
             staging_name, dir_fd=parent_descriptor, follow_symlinks=False
         )
@@ -717,7 +731,7 @@ def _publish_evaluation_artifact_unlocked(
             parent_descriptor, output_name, staging_descriptor
         ):
             raise ValueError("evaluation destination changed during publication")
-        os.fsync(parent_descriptor)
+        _fsync_evaluation_descriptor(parent, parent_descriptor)
         _verify_evaluation_parent(parent)
         if not _directory_entry_matches_descriptor(
             parent_descriptor, output_name, staging_descriptor
@@ -729,6 +743,8 @@ def _publish_evaluation_artifact_unlocked(
             parent_descriptor, output_name, staging_descriptor
         ):
             raise ValueError("evaluation destination changed during publication")
+        parent.chain.commit()
+        _verify_evaluation_parent(parent)
         return output_path
     except BaseException:
         try:
@@ -738,11 +754,17 @@ def _publish_evaluation_artifact_unlocked(
                 else (staging_name, output_name)
             )
             for owned_name in owned_names:
+                chain_visible = True
+                try:
+                    _verify_evaluation_parent(parent)
+                except ValueError:
+                    chain_visible = False
                 if _directory_entry_matches_descriptor(
                     parent_descriptor, owned_name, staging_descriptor
                 ):
                     shutil.rmtree(owned_name, dir_fd=parent_descriptor)
-                    os.fsync(parent_descriptor)
+                    if chain_visible:
+                        _fsync_evaluation_descriptor(parent, parent_descriptor)
                     break
         except FileNotFoundError:
             pass
@@ -787,7 +809,8 @@ def publish_evaluation_artifact(
     """
     require_secure_artifact_platform()
     parent, output_name = _open_new_artifact_parent(output_dir)
-    try:
+    with parent.chain:
+        _verify_evaluation_parent(parent)
         lock = _acquire_evaluation_lock(parent.descriptor, output_name)
         try:
             _verify_evaluation_parent(parent)
@@ -802,9 +825,11 @@ def publish_evaluation_artifact(
                 )
                 if not stat.S_ISDIR(residue_stat.st_mode):
                     raise ValueError("evaluation staging residue is unsafe")
+                _verify_evaluation_parent(parent)
                 shutil.rmtree(residue_name, dir_fd=parent.descriptor)
+                _fsync_evaluation_descriptor(parent, parent.descriptor)
             _verify_evaluation_parent(parent)
-            return _publish_evaluation_artifact_unlocked(
+            result = _publish_evaluation_artifact_unlocked(
                 rows,
                 parent,
                 output_name,
@@ -812,10 +837,8 @@ def publish_evaluation_artifact(
             )
         finally:
             lock.release()
-    finally:
-        os.close(parent.descriptor)
-        if parent.owner_descriptor is not None:
-            os.close(parent.owner_descriptor)
+        _verify_evaluation_parent(parent)
+        return result
 
 
 def _require_exact_fields(

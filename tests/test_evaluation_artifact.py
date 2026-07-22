@@ -1,6 +1,8 @@
 import hashlib
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -62,65 +64,48 @@ def test_protocol(rows: list[dict[str, object]]) -> dict[str, object]:
 
 
 class EvaluationArtifactTests(unittest.TestCase):
-    def test_publication_rejects_parent_replacement_at_every_commit_boundary(
-        self,
-    ) -> None:
-        """Never return a path through a renamed or replaced visible parent."""
-        from src import evaluation_artifact
+    def test_nested_parent_creation_flushes_each_edge_and_retries(self) -> None:
+        """Durably publish every new parent edge before creating its child."""
+        from src import artifact_compatibility, evaluation_artifact
 
-        for boundary in ("before rename", "after rename", "during fsync", "return"):
+        for failed_edge in range(3):
             with (
-                self.subTest(boundary=boundary),
+                self.subTest(failed_edge=failed_edge),
                 tempfile.TemporaryDirectory() as tmpdir,
             ):
                 root = Path(tmpdir)
-                parent = root / "parent"
-                parent.mkdir()
-                output = parent / "evaluation"
-                parked = root / "parked-parent"
-                parent_identity = (parent.stat().st_dev, parent.stat().st_ino)
-                real_rename = os.rename
+                output = root / "first" / "second" / "third" / "evaluation"
+                descriptor_baseline = len(os.listdir("/proc/self/fd"))
+                real_mkdir = os.mkdir
                 real_fsync = os.fsync
-                real_inventory = evaluation_artifact._verify_evaluation_inventory
-                replaced = False
-                inventory_calls = 0
+                events: list[tuple[str, str, tuple[int, int]]] = []
+                created = 0
+                failed = False
 
-                def replace_parent() -> None:
-                    nonlocal replaced
-                    if replaced:
-                        return
-                    replaced = True
-                    real_rename(parent, parked)
-                    parent.mkdir()
+                def record_mkdir(name, mode=0o777, *, dir_fd=None):
+                    nonlocal created
+                    assert dir_fd is not None
+                    owner = os.fstat(dir_fd)
+                    result = real_mkdir(name, mode=mode, dir_fd=dir_fd)
+                    events.append(("mkdir", str(name), (owner.st_dev, owner.st_ino)))
+                    created += 1
+                    return result
 
-                def replace_around_rename(source, destination, **kwargs):
-                    if destination == "evaluation":
-                        if boundary == "before rename":
-                            replace_parent()
-                        result = real_rename(source, destination, **kwargs)
-                        if boundary == "after rename":
-                            replace_parent()
-                        return result
-                    return real_rename(source, destination, **kwargs)
-
-                def replace_during_fsync(descriptor):
-                    result = real_fsync(descriptor)
-                    file_stat = os.fstat(descriptor)
+                def fail_edge_fsync(descriptor):
+                    nonlocal failed
+                    current = os.fstat(descriptor)
+                    identity = (current.st_dev, current.st_ino)
                     if (
-                        boundary == "during fsync"
-                        and (file_stat.st_dev, file_stat.st_ino) == parent_identity
-                        and output.is_dir()
+                        not failed
+                        and created == failed_edge + 1
+                        and events[-1][0] == "mkdir"
+                        and events[-1][2] == identity
                     ):
-                        replace_parent()
-                    return result
-
-                def replace_before_return(descriptor, files):
-                    nonlocal inventory_calls
-                    result = real_inventory(descriptor, files)
-                    inventory_calls += 1
-                    if boundary == "return" and inventory_calls == 2:
-                        replace_parent()
-                    return result
+                        failed = True
+                        real_fsync(descriptor)
+                        raise OSError(f"edge {failed_edge} fsync failure")
+                    events.append(("fsync", "", identity))
+                    return real_fsync(descriptor)
 
                 with (
                     patch.object(
@@ -129,35 +114,253 @@ class EvaluationArtifactTests(unittest.TestCase):
                         return_value=None,
                     ),
                     patch.object(
-                        evaluation_artifact.os,
-                        "rename",
-                        side_effect=replace_around_rename,
+                        artifact_compatibility.os,
+                        "mkdir",
+                        side_effect=record_mkdir,
                     ),
                     patch.object(
-                        evaluation_artifact.os,
+                        artifact_compatibility.os,
                         "fsync",
-                        side_effect=replace_during_fsync,
+                        side_effect=fail_edge_fsync,
                     ),
-                    patch.object(
-                        evaluation_artifact,
-                        "_verify_evaluation_inventory",
-                        side_effect=replace_before_return,
-                    ),
-                    self.assertRaisesRegex(ValueError, "parent changed"),
+                    self.assertRaisesRegex(OSError, "edge .* fsync failure"),
                 ):
                     publish_evaluation_artifact(
                         self.rows, output, protocol=self.protocol
                     )
 
-                self.assertTrue(replaced)
-                self.assertFalse(output.exists())
-                self.assertFalse((parked / "evaluation").exists())
+                self.assertTrue(failed)
+                self.assertFalse((root / "first").exists())
+                self.assertEqual(len(os.listdir("/proc/self/fd")), descriptor_baseline)
                 self.assertEqual(
                     publish_evaluation_artifact(
                         self.rows, output, protocol=self.protocol
                     ),
                     output,
                 )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            output = root / "first" / "second" / "third" / "evaluation"
+            real_mkdir = os.mkdir
+            real_fsync = os.fsync
+            events: list[tuple[str, tuple[int, int]]] = []
+
+            def record_mkdir(name, mode=0o777, *, dir_fd=None):
+                assert dir_fd is not None
+                owner = os.fstat(dir_fd)
+                result = real_mkdir(name, mode=mode, dir_fd=dir_fd)
+                if str(name) in {"first", "second", "third"}:
+                    events.append((f"mkdir:{name}", (owner.st_dev, owner.st_ino)))
+                return result
+
+            def record_fsync(descriptor):
+                current = os.fstat(descriptor)
+                events.append(("fsync", (current.st_dev, current.st_ino)))
+                return real_fsync(descriptor)
+
+            with (
+                patch.object(
+                    evaluation_artifact,
+                    "require_secure_artifact_platform",
+                    return_value=None,
+                ),
+                patch.object(
+                    artifact_compatibility.os, "mkdir", side_effect=record_mkdir
+                ),
+                patch.object(
+                    artifact_compatibility.os, "fsync", side_effect=record_fsync
+                ),
+            ):
+                publish_evaluation_artifact(self.rows, output, protocol=self.protocol)
+
+            for index, name in enumerate(("first", "second", "third")):
+                position = next(
+                    offset
+                    for offset, event in enumerate(events)
+                    if event[0] == f"mkdir:{name}"
+                )
+                self.assertEqual(events[position + 1], ("fsync", events[position][1]))
+                if index < 2:
+                    next_position = next(
+                        offset
+                        for offset, event in enumerate(events)
+                        if event[0] == f"mkdir:{('second', 'third')[index]}"
+                    )
+                    self.assertLess(position + 1, next_position)
+
+    def test_nested_parent_creation_recovers_after_each_process_death(self) -> None:
+        """Retry from every durably created parent prefix after writer death."""
+        for stopped_edge in range(3):
+            with (
+                self.subTest(stopped_edge=stopped_edge),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                output = Path(tmpdir) / "first" / "second" / "third" / "evaluation"
+                script = """
+import os
+import sys
+from pathlib import Path
+from src import artifact_compatibility
+
+real_mkdir = os.mkdir
+real_fsync = os.fsync
+created = 0
+stop = int(sys.argv[2])
+
+def count_mkdir(name, mode=0o777, *, dir_fd=None):
+    global created
+    result = real_mkdir(name, mode=mode, dir_fd=dir_fd)
+    created += 1
+    return result
+
+def stop_after_edge_fsync(descriptor):
+    result = real_fsync(descriptor)
+    if created == stop + 1:
+        os._exit(71)
+    return result
+
+artifact_compatibility.os.mkdir = count_mkdir
+artifact_compatibility.os.fsync = stop_after_edge_fsync
+artifact_compatibility.RetainedDirectoryChain.open(
+    Path(sys.argv[1]).parent, create=True, check_platform=False
+)
+os._exit(72)
+"""
+                result = subprocess.run(
+                    [sys.executable, "-c", script, str(output), str(stopped_edge)],
+                    cwd=Path.cwd(),
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 71)
+                self.assertEqual(
+                    publish_evaluation_artifact(
+                        self.rows, output, protocol=self.protocol
+                    ),
+                    output,
+                )
+
+    def test_publication_rejects_parent_replacement_at_every_commit_boundary(
+        self,
+    ) -> None:
+        """Never return a path through a renamed or replaced visible parent."""
+        for boundary in ("before rename", "after rename", "during fsync", "return"):
+            for replaced_component in ("outer", "middle", "parent"):
+                with self.subTest(
+                    boundary=boundary, replaced_component=replaced_component
+                ):
+                    self._assert_replaced_evaluation_ancestor_fails(
+                        boundary, replaced_component
+                    )
+
+    def _assert_replaced_evaluation_ancestor_fails(
+        self, boundary: str, replaced_component: str
+    ) -> None:
+        """Exercise one complete-chain publication replacement boundary.
+
+        Parameters
+        ----------
+        boundary : str
+            Publication checkpoint that performs the substitution.
+        replaced_component : str
+            Ancestor basename to rename and replace.
+
+        Returns
+        -------
+        None
+        """
+        from src import evaluation_artifact
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            parent = root / "outer" / "middle" / "parent"
+            parent.mkdir(parents=True)
+            ancestors = {
+                "outer": root / "outer",
+                "middle": root / "outer" / "middle",
+                "parent": parent,
+            }
+            replaced_path = ancestors[replaced_component]
+            output = parent / "evaluation"
+            parked = replaced_path.parent / f"parked-{replaced_component}"
+            parent_identity = (parent.stat().st_dev, parent.stat().st_ino)
+            real_rename = os.rename
+            real_fsync = os.fsync
+            real_inventory = evaluation_artifact._verify_evaluation_inventory
+            replaced = False
+            inventory_calls = 0
+
+            def replace_ancestor() -> None:
+                nonlocal replaced
+                if replaced:
+                    return
+                replaced = True
+                real_rename(replaced_path, parked)
+                parent.mkdir(parents=True)
+                (replaced_path / "unrelated").write_bytes(b"replacement")
+
+            def replace_around_rename(source, destination, **kwargs):
+                if destination == "evaluation":
+                    if boundary == "before rename":
+                        replace_ancestor()
+                    result = real_rename(source, destination, **kwargs)
+                    if boundary == "after rename":
+                        replace_ancestor()
+                    return result
+                return real_rename(source, destination, **kwargs)
+
+            def replace_during_fsync(descriptor):
+                result = real_fsync(descriptor)
+                file_stat = os.fstat(descriptor)
+                if (
+                    boundary == "during fsync"
+                    and (file_stat.st_dev, file_stat.st_ino) == parent_identity
+                    and output.is_dir()
+                ):
+                    replace_ancestor()
+                return result
+
+            def replace_before_return(descriptor, files):
+                nonlocal inventory_calls
+                result = real_inventory(descriptor, files)
+                inventory_calls += 1
+                if boundary == "return" and inventory_calls == 2:
+                    replace_ancestor()
+                return result
+
+            with (
+                patch.object(
+                    evaluation_artifact,
+                    "require_secure_artifact_platform",
+                    return_value=None,
+                ),
+                patch.object(
+                    evaluation_artifact.os,
+                    "rename",
+                    side_effect=replace_around_rename,
+                ),
+                patch.object(
+                    evaluation_artifact.os,
+                    "fsync",
+                    side_effect=replace_during_fsync,
+                ),
+                patch.object(
+                    evaluation_artifact,
+                    "_verify_evaluation_inventory",
+                    side_effect=replace_before_return,
+                ),
+                self.assertRaisesRegex(ValueError, "parent changed"),
+            ):
+                publish_evaluation_artifact(self.rows, output, protocol=self.protocol)
+
+            self.assertTrue(replaced)
+            self.assertFalse(output.exists())
+            self.assertFalse((parked / "evaluation").exists())
+            self.assertEqual((replaced_path / "unrelated").read_bytes(), b"replacement")
+            self.assertEqual(
+                publish_evaluation_artifact(self.rows, output, protocol=self.protocol),
+                output,
+            )
 
     def test_post_rename_failures_remove_owned_destination_and_allow_retry(
         self,

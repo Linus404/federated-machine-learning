@@ -11,6 +11,7 @@ import shutil
 import stat
 import sys
 import tempfile
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -48,6 +49,492 @@ _SERVER_BINDING_FIELDS = {
     "model_dimensions",
 }
 _MODEL_DIMENSION_FIELDS = {"vocabulary_size", "sequence_length", "embedding_dim"}
+
+
+@dataclass(frozen=True)
+class RetainedDirectory:
+    """Retain one no-follow directory descriptor and filesystem identity.
+
+    Parameters
+    ----------
+    descriptor : int
+        Open directory descriptor owned by a retained chain.
+    device : int
+        Captured filesystem device.
+    inode : int
+        Captured filesystem inode.
+    """
+
+    descriptor: int
+    device: int
+    inode: int
+
+
+class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
+    """Own and verify every directory edge from ``/`` through one path."""
+
+    def __init__(
+        self,
+        path: Path,
+        directories: list[RetainedDirectory],
+        names: list[str],
+        created: list[bool],
+        *,
+        error_message: str,
+    ) -> None:
+        self.path = path
+        self._directories = directories
+        self._names = names
+        self._created = created
+        self._error_message = error_message
+        self._committed = False
+        self._closed = False
+
+    @classmethod
+    def open(
+        cls,
+        path: str | Path,
+        *,
+        create: bool = False,
+        mode: int = 0o755,
+        error_message: str = "artifact directory chain changed",
+        check_platform: bool = True,
+    ) -> "RetainedDirectoryChain":
+        """Open an absolute, symlink-free directory chain.
+
+        Parameters
+        ----------
+        path : str or pathlib.Path
+            Directory to retain. Relative paths are launch-directory relative.
+        create : bool, optional
+            Create missing components descriptor-relatively.
+        mode : int, optional
+            Permissions requested for newly created components.
+        error_message : str, optional
+            Fail-closed message used for unsafe or replaced edges.
+        check_platform : bool, optional
+            Enforce the Linux contract unless the caller already did so.
+
+        Returns
+        -------
+        RetainedDirectoryChain
+            Owned descriptors for the complete visible path.
+
+        Raises
+        ------
+        ValueError
+            If a component is missing, linked, replaced, or not a directory.
+        """
+        if check_platform:
+            require_secure_artifact_platform()
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        absolute = Path(os.path.abspath(candidate))
+        anchor = Path(absolute.anchor)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        directories: list[RetainedDirectory] = []
+        names: list[str] = []
+        created: list[bool] = []
+        chain = cls(
+            absolute,
+            directories,
+            names,
+            created,
+            error_message=error_message,
+        )
+        try:
+            anchor_descriptor = os.open(anchor, flags)
+            directories.append(
+                cls._capture(anchor_descriptor, error_message=error_message)
+            )
+            created.append(False)
+            for component in absolute.parts[len(anchor.parts) :]:
+                parent = directories[-1]
+                made = False
+                try:
+                    entry = os.stat(
+                        component,
+                        dir_fd=parent.descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    if not create:
+                        raise ValueError(error_message) from None
+                    chain.verify()
+                    os.mkdir(component, mode=mode, dir_fd=parent.descriptor)
+                    made = True
+                    entry = os.stat(
+                        component,
+                        dir_fd=parent.descriptor,
+                        follow_symlinks=False,
+                    )
+                if not stat.S_ISDIR(entry.st_mode):
+                    raise ValueError(error_message)
+                descriptor = os.open(component, flags, dir_fd=parent.descriptor)
+                retained = cls._capture(descriptor, error_message=error_message)
+                directories.append(retained)
+                names.append(component)
+                created.append(made)
+                chain.verify()
+                if made:
+                    os.fsync(parent.descriptor)
+                    chain.verify()
+            chain.verify()
+            return chain
+        except BaseException:
+            chain._cleanup_created()
+            chain.close()
+            raise
+
+    @staticmethod
+    def _capture(descriptor: int, *, error_message: str) -> RetainedDirectory:
+        """Capture one open directory descriptor.
+
+        Parameters
+        ----------
+        descriptor : int
+            Open descriptor whose ownership transfers to the returned value.
+        error_message : str
+            Fail-closed validation error.
+
+        Returns
+        -------
+        RetainedDirectory
+            Captured descriptor identity.
+        """
+        try:
+            current = os.fstat(descriptor)
+            if not stat.S_ISDIR(current.st_mode) or current.st_nlink < 1:
+                raise ValueError(error_message)
+            return RetainedDirectory(descriptor, current.st_dev, current.st_ino)
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    @property
+    def directory(self) -> RetainedDirectory:
+        """Return the retained target directory.
+
+        Returns
+        -------
+        RetainedDirectory
+            Final descriptor in the chain.
+        """
+        return self._directories[-1]
+
+    @property
+    def directories(self) -> tuple[RetainedDirectory, ...]:
+        """Return retained directories from the anchor through the target.
+
+        Returns
+        -------
+        tuple of RetainedDirectory
+            Stable retained chain.
+        """
+        return tuple(self._directories)
+
+    def at(self, path: str | Path) -> RetainedDirectory:
+        """Return the retained directory corresponding to one chain path.
+
+        Parameters
+        ----------
+        path : str or pathlib.Path
+            Absolute directory already retained by this chain.
+
+        Returns
+        -------
+        RetainedDirectory
+            Descriptor for the requested path.
+
+        Raises
+        ------
+        ValueError
+            If the path is outside or below the retained target.
+        """
+        candidate = Path(os.path.abspath(Path(path)))
+        anchor = Path(self.path.anchor)
+        parts = candidate.parts[len(anchor.parts) :]
+        if (
+            candidate.anchor != self.path.anchor
+            or self.path.parts[: len(candidate.parts)] != candidate.parts
+        ):
+            raise ValueError("directory is not part of the retained chain")
+        return self._directories[len(parts)]
+
+    def verify(self) -> None:
+        """Require every retained descriptor and visible edge to still match.
+
+        Returns
+        -------
+        None
+        """
+        if self._closed or not self._directories:
+            raise ValueError(self._error_message)
+        anchor = os.stat(self.path.anchor, follow_symlinks=False)
+        self._verify_identity(anchor, self._directories[0])
+        for index, name in enumerate(self._names, start=1):
+            try:
+                entry = os.stat(
+                    name,
+                    dir_fd=self._directories[index - 1].descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                raise ValueError(self._error_message) from error
+            self._verify_identity(entry, self._directories[index])
+
+    def stat(self, name: str) -> os.stat_result:
+        """Stat one direct child without following links under chain checks.
+
+        Parameters
+        ----------
+        name : str
+            Direct child name.
+
+        Returns
+        -------
+        os.stat_result
+            No-follow entry metadata.
+        """
+        self._require_child_name(name)
+        self.verify()
+        result = os.stat(name, dir_fd=self.directory.descriptor, follow_symlinks=False)
+        self.verify()
+        return result
+
+    def open_child(
+        self,
+        name: str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        parent_descriptor: int | None = None,
+    ) -> int:
+        """Open one direct child without following it under chain checks.
+
+        Parameters
+        ----------
+        name : str
+            Direct child name.
+        flags : int
+            Linux ``open(2)`` flags.
+        mode : int, optional
+            Creation permissions when ``flags`` includes ``O_CREAT``.
+        parent_descriptor : int or None, optional
+            Retained descendant descriptor, or the chain target when omitted.
+
+        Returns
+        -------
+        int
+            Caller-owned file descriptor.
+        """
+        self._require_child_name(name)
+        self.verify()
+        owner = (
+            self.directory.descriptor
+            if parent_descriptor is None
+            else parent_descriptor
+        )
+        try:
+            descriptor = os.open(
+                name,
+                flags | os.O_NOFOLLOW,
+                mode,
+                dir_fd=owner,
+            )
+        except OSError:
+            self.verify()
+            raise
+        try:
+            self.verify()
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def fsync(self, directory: RetainedDirectory | None = None) -> None:
+        """Flush one retained directory while preserving visible ownership.
+
+        Parameters
+        ----------
+        directory : RetainedDirectory or None, optional
+            Chain member to flush, or the target directory when omitted.
+
+        Returns
+        -------
+        None
+        """
+        retained = self.directory if directory is None else directory
+        if retained not in self._directories:
+            raise ValueError("directory is not part of the retained chain")
+        self.verify()
+        os.fsync(retained.descriptor)
+        self.verify()
+
+    def commit(self) -> None:
+        """Preserve invocation-created directories after a verified success.
+
+        Returns
+        -------
+        None
+        """
+        self.verify()
+        self._committed = True
+
+    def remove_created_target(self) -> None:
+        """Remove an invocation-created target tree while it remains visible.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If the target was not created by this chain or is no longer visible.
+        """
+        if len(self._directories) < 2 or not self._created[-1]:
+            raise ValueError("retained target is not invocation-owned")
+        self.verify()
+        child = self._directories[-1]
+        parent = self._directories[-2]
+        shutil.rmtree(self._names[-1], dir_fd=parent.descriptor)
+        os.fsync(parent.descriptor)
+        os.close(child.descriptor)
+        self._directories.pop()
+        self._created.pop()
+        self._names.pop()
+        self.verify()
+
+    def _verify_identity(
+        self, entry: os.stat_result, retained: RetainedDirectory
+    ) -> None:
+        """Require an edge and descriptor to name the same linked directory.
+
+        Parameters
+        ----------
+        entry : os.stat_result
+            No-follow metadata for the visible entry.
+        retained : RetainedDirectory
+            Captured descriptor identity.
+
+        Returns
+        -------
+        None
+        """
+        current = os.fstat(retained.descriptor)
+        if (
+            not stat.S_ISDIR(entry.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or entry.st_nlink < 1
+            or current.st_nlink < 1
+            or (entry.st_dev, entry.st_ino) != (retained.device, retained.inode)
+            or (current.st_dev, current.st_ino) != (retained.device, retained.inode)
+        ):
+            raise ValueError(self._error_message)
+
+    @staticmethod
+    def entry_matches_descriptor(
+        parent_descriptor: int, name: str, descriptor: int
+    ) -> bool:
+        """Return whether one edge exactly selects a linked directory descriptor.
+
+        Parameters
+        ----------
+        parent_descriptor : int
+            Retained owning directory descriptor.
+        name : str
+            Direct child name.
+        descriptor : int
+            Retained child directory descriptor.
+
+        Returns
+        -------
+        bool
+            Whether type, link state, device, and inode all match.
+        """
+        try:
+            RetainedDirectoryChain._require_child_name(name)
+            entry = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+            current = os.fstat(descriptor)
+        except (OSError, ValueError):
+            return False
+        return (
+            stat.S_ISDIR(entry.st_mode)
+            and stat.S_ISDIR(current.st_mode)
+            and entry.st_nlink >= 1
+            and current.st_nlink >= 1
+            and (entry.st_dev, entry.st_ino) == (current.st_dev, current.st_ino)
+        )
+
+    @staticmethod
+    def _require_child_name(name: str) -> None:
+        """Require one non-traversing direct child name.
+
+        Parameters
+        ----------
+        name : str
+            Candidate descriptor-relative child name.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If the name is empty, special, or contains a path separator.
+        """
+        if name in {"", ".", ".."} or Path(name).name != name:
+            raise ValueError("descriptor-relative name must be a direct child")
+
+    def _cleanup_created(self) -> None:
+        """Remove only still-visible, invocation-owned empty suffixes."""
+        if self._committed:
+            return
+        while len(self._directories) > 1 and self._created[-1]:
+            child = self._directories[-1]
+            parent = self._directories[-2]
+            name = self._names[-1]
+            try:
+                self.verify()
+                if os.listdir(child.descriptor):
+                    return
+                os.rmdir(name, dir_fd=parent.descriptor)
+                os.fsync(parent.descriptor)
+            except (OSError, ValueError):
+                return
+            os.close(child.descriptor)
+            self._directories.pop()
+            self._created.pop()
+            self._names.pop()
+            try:
+                self.verify()
+            except ValueError:
+                return
+
+    def close(self) -> None:
+        """Close every owned descriptor exactly once.
+
+        Returns
+        -------
+        None
+        """
+        if self._closed:
+            return
+        for directory in reversed(self._directories):
+            os.close(directory.descriptor)
+        self._directories.clear()
+        self._names.clear()
+        self._created.clear()
+        self._closed = True
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        """Clean failed creations and close the complete retained chain."""
+        if exc_type is not None:
+            self._cleanup_created()
+        self.close()
 
 
 def reject_duplicate_json_keys(
