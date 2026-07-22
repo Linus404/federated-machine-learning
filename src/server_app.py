@@ -57,6 +57,33 @@ def weighted_average(metrics: list[tuple[int, dict[str, float]]]) -> dict[str, f
     return {"accuracy": accuracy}
 
 
+def _sorted_fit_results(results: list[Any]) -> list[Any]:
+    """Order fit results by the protocol's numeric client identifier.
+
+    Args:
+        results: Flower ``(ClientProxy, FitRes)`` pairs for one round.
+
+    Returns:
+        A new list sorted by ascending zero-based client ID.
+
+    Raises:
+        ValueError: If a client ID is missing, invalid, or duplicated.
+    """
+    identified_results: list[tuple[int, Any]] = []
+    for result in results:
+        client_id = result[1].metrics.get("client_id")
+        if isinstance(client_id, bool) or not isinstance(client_id, int):
+            raise ValueError("every fit result must contain an integer client_id")
+        if client_id < 0:
+            raise ValueError("fit result client_id must be non-negative")
+        identified_results.append((client_id, result))
+
+    client_ids = [client_id for client_id, _ in identified_results]
+    if len(set(client_ids)) != len(client_ids):
+        raise ValueError("fit result client_id values must be unique")
+    return [result for _, result in sorted(identified_results)]
+
+
 class SentimentServer(FedProx):
     """Run FedProx with optional experimental Huber aggregation and artifacts."""
 
@@ -124,23 +151,32 @@ class SentimentServer(FedProx):
 
     def aggregate_fit(self, server_round, results, failures):
         parameters: Parameters | None
-        if self.use_huber and results:
+        ordered_results = _sorted_fit_results(results)
+        if self.use_huber and ordered_results:
+            if failures and not self.accept_failures:
+                return None, {}
             # Robust Huber aggregation instead of plain FedProx averaging
-            reference = parameters_to_ndarrays(results[0][1].parameters)
+            reference = parameters_to_ndarrays(ordered_results[0][1].parameters)
             vectors = [
-                _flatten(parameters_to_ndarrays(r.parameters)) for _, r in results
+                _flatten(parameters_to_ndarrays(result.parameters))
+                for _, result in ordered_results
             ]
-            counts = [r.num_examples for _, r in results]
+            counts = [result.num_examples for _, result in ordered_results]
             aggregated = huber_aggregate(vectors, counts, self.huber_threshold)
             parameters = ndarrays_to_parameters(_unflatten(aggregated, reference))
             metrics = {}
             if self.fit_metrics_aggregation_fn:
                 metrics = self.fit_metrics_aggregation_fn(
-                    [(r.num_examples, r.metrics) for _, r in results]
+                    [
+                        (result.num_examples, result.metrics)
+                        for _, result in ordered_results
+                    ]
                 )
         else:
             # Standard FedProx averaging
-            parameters, metrics = super().aggregate_fit(server_round, results, failures)
+            parameters, metrics = super().aggregate_fit(
+                server_round, ordered_results, failures
+            )
 
         # Artifact saving
         if parameters is not None:

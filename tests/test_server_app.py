@@ -6,7 +6,8 @@ from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import Mock, patch
 
-from flwr.common import Context
+import numpy as np
+from flwr.common import Context, ndarrays_to_parameters, parameters_to_ndarrays
 
 import src.server_app as server_app
 from src.artifact_compatibility import load_server_artifact_manifest
@@ -181,6 +182,100 @@ class MetricAggregationTests(unittest.TestCase):
         ]
 
         self.assertEqual(server_app.weighted_average(metrics), {"accuracy": 0.875})
+
+    def test_plain_fit_aggregation_uses_ascending_client_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            strategy = server_app.SentimentServer.__new__(server_app.SentimentServer)
+            strategy.use_huber = False
+            strategy.accept_failures = True
+            strategy.inplace = True
+            strategy.fit_metrics_aggregation_fn = None
+            strategy.artifact_dir = Path(tmpdir)
+            strategy.app_manifest = object()
+            results = [
+                (
+                    Mock(),
+                    SimpleNamespace(
+                        parameters=ndarrays_to_parameters(
+                            [np.array([value], dtype=np.float32)]
+                        ),
+                        num_examples=1,
+                        metrics={"client_id": client_id},
+                    ),
+                )
+                for client_id, value in [(2, 1.0), (1, -1e20), (0, 1e20)]
+            ]
+            model = Mock()
+
+            with patch.object(
+                server_app, "build_model_from_manifest", return_value=model
+            ):
+                parameters, _ = strategy.aggregate_fit(1, results, [])
+
+            self.assertIsNotNone(parameters)
+            np.testing.assert_array_equal(
+                parameters_to_ndarrays(parameters)[0],
+                np.array([np.float32(1.0 / 3.0)], dtype=np.float32),
+            )
+
+    def test_huber_fit_aggregation_uses_ascending_client_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            strategy = server_app.SentimentServer.__new__(server_app.SentimentServer)
+            strategy.use_huber = True
+            strategy.accept_failures = True
+            strategy.fit_metrics_aggregation_fn = None
+            strategy.huber_threshold = 10.0
+            strategy.artifact_dir = Path(tmpdir)
+            strategy.app_manifest = object()
+            results = [
+                (
+                    Mock(),
+                    SimpleNamespace(
+                        parameters=ndarrays_to_parameters(
+                            [np.array([value], dtype=np.float32)]
+                        ),
+                        num_examples=count,
+                        metrics={"client_id": client_id},
+                    ),
+                )
+                for client_id, value, count in [
+                    (2, 3.0, 30),
+                    (0, 1.0, 10),
+                    (1, 2.0, 20),
+                ]
+            ]
+            model = Mock()
+
+            with (
+                patch.object(
+                    server_app,
+                    "huber_aggregate",
+                    return_value=np.array([2.0], dtype=np.float64),
+                ) as aggregate,
+                patch.object(
+                    server_app, "build_model_from_manifest", return_value=model
+                ),
+            ):
+                strategy.aggregate_fit(1, results, [])
+
+            vectors, counts, threshold = aggregate.call_args.args
+            np.testing.assert_array_equal(
+                np.stack(vectors), np.array([[1.0], [2.0], [3.0]], dtype=np.float32)
+            )
+            self.assertEqual(counts, [10, 20, 30])
+            self.assertEqual(threshold, 10.0)
+
+    def test_fit_aggregation_rejects_missing_or_duplicate_client_ids(self) -> None:
+        missing = [(Mock(), SimpleNamespace(metrics={}))]
+        duplicate = [
+            (Mock(), SimpleNamespace(metrics={"client_id": 1})),
+            (Mock(), SimpleNamespace(metrics={"client_id": 1})),
+        ]
+
+        for results in (missing, duplicate):
+            with self.subTest(results=results):
+                with self.assertRaises(ValueError):
+                    server_app._sorted_fit_results(results)
 
     def test_client_evaluation_metrics_are_written_per_round(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

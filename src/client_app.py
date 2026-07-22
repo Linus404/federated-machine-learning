@@ -136,6 +136,7 @@ class SentimentClient(NumPyClient):
         metrics: dict[str, Scalar] = {
             name: float(values[-1]) for name, values in history.history.items()
         }
+        metrics["client_id"] = self.client_id
 
         return weights, len(self.train_data[0]), metrics
 

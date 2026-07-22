@@ -14,6 +14,8 @@ from unittest.mock import patch
 
 import numpy as np
 
+from src.huber_strategy import WEISZFELD_EPS, WEISZFELD_ITERS, huber_aggregate
+
 
 PROTOCOL_PATH = Path("docs/scientific-protocol-v1.toml")
 
@@ -528,42 +530,6 @@ def paired_contrast_pairs(
             raise ValueError(f"unregistered baseline for {contrast['name']}")
         pairs.append((candidate, baseline))
     return pairs
-
-
-def iterative_huber_aggregate(
-    client_vectors: np.ndarray,
-    sample_weights: np.ndarray,
-    threshold: float,
-    epsilon: float,
-    iterations: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Execute the registered iterative Huber aggregation.
-
-    Args:
-        client_vectors: Finite flattened post-fit model parameter vectors.
-        sample_weights: Positive fitted-row counts in client order.
-        threshold: Registered Huber residual threshold.
-        epsilon: Registered zero-residual denominator floor.
-        iterations: Exact number of iteratively reweighted updates.
-
-    Returns:
-        Initial sample-weighted mean and final aggregate.
-    """
-    vectors = np.asarray(client_vectors, dtype=np.float32)
-    weights = np.asarray(sample_weights, dtype=np.float64)
-    weights /= weights.sum()
-    estimate = np.average(vectors, axis=0, weights=weights)
-    initial = estimate.copy()
-    for _ in range(iterations):
-        residuals = np.linalg.norm(estimate - vectors, axis=1)
-        effective = weights * np.where(
-            residuals <= threshold,
-            1.0,
-            threshold / (residuals + epsilon),
-        )
-        effective /= effective.sum()
-        estimate = np.average(vectors, axis=0, weights=effective)
-    return initial, estimate
 
 
 class ScientificProtocolTests(unittest.TestCase):
@@ -1662,6 +1628,11 @@ print(json.dumps({
         )
         self.assertIn("fitted training rows", fedprox["aggregation_sample_weight"])
         self.assertIn("ascending client_id order", fedprox["aggregation"])
+        self.assertIn("complete post-fit", fedprox["client_update"])
+        self.assertIn("does not submit a delta", fedprox["client_update"])
+        self.assertIn("aggregate_inplace", fedprox["aggregation"])
+        self.assertIn("native float32", fedprox["aggregation"])
+        self.assertIn("do not reconstruct or aggregate deltas", fedprox["aggregation"])
         fedprox_golden = fedprox["golden_probe"]
         data_loss = float(np.mean(fedprox_golden["batch_example_losses"]))
         squared_distance = sum(
@@ -1701,12 +1672,15 @@ print(json.dumps({
         self.assertIn("residual_i <= threshold", huber["epsilon_rule"])
         self.assertIn("exactly 10 updates", huber["update"])
         huber_golden = huber["golden_probe"]
-        initial, aggregate = iterative_huber_aggregate(
-            np.asarray(huber_golden["client_vectors"]),
-            np.asarray(huber_golden["sample_weights"]),
+        self.assertEqual(WEISZFELD_EPS, huber["epsilon"])
+        self.assertEqual(WEISZFELD_ITERS, huber["iterations"])
+        vectors = np.asarray(huber_golden["client_vectors"], dtype=np.float32)
+        weights = np.asarray(huber_golden["sample_weights"], dtype=np.float64)
+        initial = np.average(vectors, axis=0, weights=weights / weights.sum())
+        aggregate = huber_aggregate(
+            list(vectors),
+            huber_golden["sample_weights"],
             huber["threshold"],
-            huber["epsilon"],
-            huber["iterations"],
         )
         np.testing.assert_allclose(
             initial, huber_golden["initial_estimate"], rtol=0, atol=0
@@ -1788,55 +1762,142 @@ print(json.dumps({
                     matrix[matrix_kind]["paired_delta_policy"],
                     "none_because_no_registered_factor_has_multiple_levels",
                 )
-        self.assertEqual(
-            set(contrasts), set(itertools.chain(*expected_by_matrix.values()))
-        )
+        expected_contrast_names = list(itertools.chain(*expected_by_matrix.values()))
+        self.assertEqual(list(contrasts), expected_contrast_names)
 
-        expected_pair_counts = {
-            "primary_strategy_vs_fedavg": 80,
-            "primary_partition_vs_iid": 75,
-            "local_partition_vs_iid": 15,
-            "scale_vs_4_clients": 70,
-            "robustness_vs_no_attack": 80,
-            "membership_fedavg_vs_centralized": 5,
+        classification_metrics = [
+            "accuracy",
+            "precision",
+            "recall",
+            "f1",
+            "roc_auc",
+        ]
+        federated_metrics = classification_metrics + [
+            "convergence_round",
+            "communication_bytes",
+            "client_training_time_ns",
+        ]
+        expected_metrics = {
+            "primary_strategy_vs_fedavg": federated_metrics,
+            "primary_partition_vs_iid": federated_metrics,
+            "local_partition_vs_iid": classification_metrics + ["training_time_ns"],
+            "scale_vs_4_clients": federated_metrics,
+            "robustness_vs_no_attack": federated_metrics,
+            "membership_fedavg_vs_centralized": [
+                "roc_auc",
+                "max_tpr_minus_fpr",
+                "tpr_at_1_percent_fpr",
+            ],
         }
-        for name, expected_count in expected_pair_counts.items():
-            contrast = contrasts[name]
-            pairs = paired_contrast_pairs(self.protocol, contrast)
-            self.assertEqual(len(pairs), expected_count)
-            self.assertTrue(contrast["metrics"])
-            for candidate, baseline in pairs:
-                self.assertEqual(candidate["seed"], baseline["seed"])
-                candidate_value = float(candidate["seed"] + 1)
-                baseline_value = float(baseline["seed"] - 1)
-                self.assertEqual(candidate_value - baseline_value, 2.0)
-
-        strategy_pair = paired_contrast_pairs(
-            self.protocol, contrasts["primary_strategy_vs_fedavg"]
-        )[0]
-        self.assertEqual(strategy_pair[1]["strategy"], "fedavg")
-        partition_pair = paired_contrast_pairs(
-            self.protocol, contrasts["primary_partition_vs_iid"]
-        )[0]
-        self.assertEqual(partition_pair[1]["partition"], "iid_stratified")
-        self.assertIsNone(partition_pair[1]["alpha"])
-        scale_pair = paired_contrast_pairs(
-            self.protocol, contrasts["scale_vs_4_clients"]
-        )[0]
         self.assertEqual(
-            (scale_pair[1]["matrix_kind"], scale_pair[1]["client_scale"]),
-            ("primary_federated", 4),
+            {name: contrast["metrics"] for name, contrast in contrasts.items()},
+            expected_metrics,
         )
-        robustness_pair = paired_contrast_pairs(
-            self.protocol, contrasts["robustness_vs_no_attack"]
-        )[0]
-        self.assertEqual(robustness_pair[1]["matrix_kind"], "primary_federated")
-        self.assertIsNone(robustness_pair[1]["threat"])
-        membership_pair = paired_contrast_pairs(
-            self.protocol, contrasts["membership_fedavg_vs_centralized"]
-        )[0]
-        self.assertEqual(membership_pair[1]["strategy"], "centralized")
-        self.assertIsNone(membership_pair[1]["partition"])
+
+        seeds = [67, 101, 211, 307, 401]
+        partitions = [
+            "iid_stratified",
+            "dirichlet_1.0",
+            "dirichlet_0.5",
+            "dirichlet_0.1",
+        ]
+        federated_strategies = [
+            "fedavg",
+            "fedprox",
+            "fedprox_huber",
+            "fedmedian",
+            "fedtrimmedavg",
+        ]
+        expected_pairs = {
+            "primary_strategy_vs_fedavg": [
+                (
+                    cell("primary_federated", strategy, partition, 4, seed),
+                    cell("primary_federated", "fedavg", partition, 4, seed),
+                )
+                for strategy, partition, seed in itertools.product(
+                    federated_strategies[1:], partitions, seeds
+                )
+            ],
+            "primary_partition_vs_iid": [
+                (
+                    cell("primary_federated", strategy, partition, 4, seed),
+                    cell("primary_federated", strategy, "iid_stratified", 4, seed),
+                )
+                for strategy, partition, seed in itertools.product(
+                    federated_strategies, partitions[1:], seeds
+                )
+            ],
+            "local_partition_vs_iid": [
+                (
+                    cell("local_only", "local_only", partition, 4, seed),
+                    cell("local_only", "local_only", "iid_stratified", 4, seed),
+                )
+                for partition, seed in itertools.product(partitions[1:], seeds)
+            ],
+            "scale_vs_4_clients": [
+                (
+                    cell("scale", strategy, partition, client_scale, seed),
+                    cell("primary_federated", strategy, partition, 4, seed),
+                )
+                for client_scale, allowed_partitions in (
+                    (16, partitions),
+                    (64, partitions[:3]),
+                )
+                for strategy, partition, seed in itertools.product(
+                    ["fedavg", "fedprox_huber"], allowed_partitions, seeds
+                )
+            ],
+            "robustness_vs_no_attack": [
+                (
+                    cell(
+                        "robustness",
+                        strategy,
+                        "dirichlet_0.5",
+                        4,
+                        seed,
+                        {"attack": attack, "malicious_fraction": fraction},
+                    ),
+                    cell(
+                        "primary_federated",
+                        strategy,
+                        "dirichlet_0.5",
+                        4,
+                        seed,
+                    ),
+                )
+                for strategy, attack, fraction, seed in itertools.product(
+                    ["fedavg", "fedprox_huber", "fedmedian", "fedtrimmedavg"],
+                    ["outlier", "sign_flip"],
+                    [0.25, 0.5],
+                    seeds,
+                )
+            ],
+            "membership_fedavg_vs_centralized": [
+                (
+                    cell(
+                        "membership_inference",
+                        "fedavg",
+                        "dirichlet_0.5",
+                        4,
+                        seed,
+                    ),
+                    cell("membership_inference", "centralized", None, None, seed),
+                )
+                for seed in seeds
+            ],
+        }
+        for name in expected_contrast_names:
+            actual = [
+                (canonical_cell_id(candidate), canonical_cell_id(baseline))
+                for candidate, baseline in paired_contrast_pairs(
+                    self.protocol, contrasts[name]
+                )
+            ]
+            expected = [
+                (canonical_cell_id(candidate), canonical_cell_id(baseline))
+                for candidate, baseline in expected_pairs[name]
+            ]
+            self.assertEqual(actual, expected, name)
 
     def test_privacy_analyses_have_exact_candidates_labels_and_scores(self) -> None:
         privacy = self.protocol["privacy"]

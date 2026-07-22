@@ -146,6 +146,7 @@ class UpdateNoiseFitTests(unittest.TestCase):
         )
         client.epochs = 1
         client.batch_size = 1
+        client.client_id = 3
         client.use_update_noise = use_update_noise
         client.update_noise_l2_norm_clip = 1.0
         client.update_noise_multiplier = 0.001
@@ -162,7 +163,7 @@ class UpdateNoiseFitTests(unittest.TestCase):
         client._add_update_noise.assert_not_called()
         np.testing.assert_array_equal(weights[0], np.array([1.0, 2.0], dtype="float32"))
         self.assertEqual(num_examples, 2)
-        self.assertEqual(metrics, {"loss": 0.2, "accuracy": 0.9})
+        self.assertEqual(metrics, {"loss": 0.2, "accuracy": 0.9, "client_id": 3})
 
     def test_fit_applies_update_noise_when_enabled(self) -> None:
         client = self.make_client(use_update_noise=True)
