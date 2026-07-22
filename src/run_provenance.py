@@ -13,7 +13,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from src.app_manifest import AppManifest, load_app_manifest, resolve_public_artifact_dir
+from src.app_manifest import (
+    AppManifest,
+    expected_train_dataset,
+    load_app_manifest,
+    resolve_public_artifact_dir,
+)
 from src.artifact_compatibility import (
     ARTIFACT_SCHEMA_VERSION,
     sha256_bytes,
@@ -43,16 +48,6 @@ ENVIRONMENT_FIELDS = {
     "operating_system_release",
     "machine",
     "packages",
-}
-DATASET_IDENTITY_FIELDS = {
-    "id",
-    "config",
-    "revision",
-    "datasets_version",
-    "split",
-    "rows",
-    "raw_parquet_sha256",
-    "content_sha256",
 }
 
 
@@ -246,28 +241,10 @@ def _validate_dataset_identity(identity: str) -> None:
         raise ValueError(
             "run provenance manifest has an invalid dataset.identity"
         ) from error
-    if not isinstance(decoded, Mapping) or set(decoded) != DATASET_IDENTITY_FIELDS:
-        raise ValueError("run provenance manifest has an invalid dataset.identity")
-    text_fields = {
-        "id",
-        "config",
-        "revision",
-        "datasets_version",
-    }
+    expected = expected_train_dataset()
     if (
-        any(
-            not isinstance(decoded[field], str) or not decoded[field]
-            for field in text_fields
-        )
-        or decoded["split"] != "train"
-        or type(decoded["rows"]) is not int
-        or decoded["rows"] < 1
-        or any(
-            not isinstance(decoded[field], str)
-            or len(decoded[field]) != 64
-            or any(character not in "0123456789abcdef" for character in decoded[field])
-            for field in ("raw_parquet_sha256", "content_sha256")
-        )
+        not isinstance(decoded, Mapping)
+        or decoded != expected
         or identity != _canonical_dataset_identity(decoded)
     ):
         raise ValueError("run provenance manifest has an invalid dataset.identity")

@@ -998,6 +998,90 @@ class ArtifactFlowTests(unittest.TestCase):
                     self.assertEqual(marker.read_text(encoding="utf-8"), "external")
                     self.assertFalse((external / output_name).exists())
 
+    def test_preparation_rejects_reserved_root_names_before_mutation(self) -> None:
+        reserved_names = (
+            ".prepared-current",
+            ".prepared-generations",
+            ".prepared-legacy",
+            ".prepared-migration.json",
+            ".fml-prepare.lock",
+            ".prepared-attacker-residue",
+            ".prepare-attacker.staging",
+            "..prepared-current.11111111-1111-4111-8111-111111111111.tmp",
+            "..prepared-current.rollback.tmp",
+        )
+        for relative in (False, True):
+            for artifact_name in ("client", "public", "evaluation"):
+                for reserved_name in reserved_names:
+                    with (
+                        self.subTest(
+                            relative=relative,
+                            artifact_name=artifact_name,
+                            reserved_name=reserved_name,
+                        ),
+                        tempfile.TemporaryDirectory() as tmpdir,
+                    ):
+                        root = Path(tmpdir)
+                        names = {
+                            "client": "clients",
+                            "public": "public",
+                            "evaluation": "evaluation",
+                        }
+                        names[artifact_name] = reserved_name
+                        outputs = {
+                            name: Path(value) if relative else root / value
+                            for name, value in names.items()
+                        }
+                        with (
+                            chdir(root),
+                            patch(
+                                "src.data_prep._acquire_preparation_lock"
+                            ) as acquire_lock,
+                            patch("src.data_prep._validated_frameworks") as frameworks,
+                            patch("src.data_prep.validate_protocol_runtime") as runtime,
+                            patch(
+                                "src.data_prep.load_verified_imdb_dataset"
+                            ) as load_dataset,
+                            self.assertRaisesRegex(
+                                ValueError, "reserved preparation name"
+                            ),
+                        ):
+                            prepare_all(
+                                4,
+                                outputs["client"],
+                                outputs["public"],
+                                outputs["evaluation"],
+                            )
+
+                        acquire_lock.assert_not_called()
+                        frameworks.assert_not_called()
+                        runtime.assert_not_called()
+                        load_dataset.assert_not_called()
+                        self.assertEqual(list(root.iterdir()), [])
+
+    def test_preflight_accepts_safe_hidden_root_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            for name in (
+                ".clients",
+                ".cache",
+                ".preparedness",
+                ".preparation-staging",
+                "..prepared-current",
+            ):
+                with self.subTest(name=name):
+                    self.assertEqual(
+                        _preflight_output_root(
+                            root / name,
+                            "client",
+                            reusable=True,
+                            allow_prepared_alias=True,
+                        ),
+                        root / name,
+                    )
+
+            self.assertEqual(list(root.iterdir()), [])
+
     def test_preflight_preserves_relative_lexical_prepared_alias(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

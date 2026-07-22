@@ -45,10 +45,12 @@ from src.evaluation_artifact import (
 )
 from src.paths import (
     PREPARED_CURRENT_FILENAME,
+    PREPARED_CONTROL_BASENAME_PREFIXES,
     PREPARED_GENERATIONS_DIRECTORY,
     PREPARED_GENERATION_SCHEMA_VERSION,
     PREPARED_LEGACY_DIRECTORY,
     PREPARED_MIGRATION_FILENAME,
+    PREPARATION_LOCK_FILENAME,
     RunArtifactLock,
     default_evaluation_artifact_dir,
     default_public_artifact_dir,
@@ -134,6 +136,13 @@ def _preflight_output_root(
     ValueError
         If the root or its existing parent is a symlink or invalid path type.
     """
+    basename = Path(output_dir).expanduser().name
+    if basename == PREPARATION_LOCK_FILENAME or basename.startswith(
+        PREPARED_CONTROL_BASENAME_PREFIXES
+    ):
+        raise ValueError(
+            f"{artifact_name} artifact root uses a reserved preparation name"
+        )
     output_path = _validate_absolute_output_ancestors(output_dir, artifact_name)
     if output_path.is_symlink():
         expected = Path(PREPARED_CURRENT_FILENAME) / artifact_name
@@ -278,8 +287,7 @@ def _acquire_preparation_lock(roots: Mapping[str, Path]) -> RunArtifactLock:
     ValueError
         If the lock path is not a single-link regular file.
     """
-    lock_name = ".fml-prepare.lock"
-    lock_path = roots["client"].parent / lock_name
+    lock_path = roots["client"].parent / PREPARATION_LOCK_FILENAME
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(lock_path, flags, 0o600)

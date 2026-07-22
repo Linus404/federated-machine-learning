@@ -23,6 +23,12 @@ PREPARED_CURRENT_FILENAME = ".prepared-current"
 PREPARED_GENERATIONS_DIRECTORY = ".prepared-generations"
 PREPARED_LEGACY_DIRECTORY = ".prepared-legacy"
 PREPARED_MIGRATION_FILENAME = ".prepared-migration.json"
+PREPARATION_LOCK_FILENAME = ".fml-prepare.lock"
+PREPARED_CONTROL_BASENAME_PREFIXES = (
+    ".prepared-",
+    ".prepare-",
+    f".{PREPARED_CURRENT_FILENAME}.",
+)
 PREPARED_GENERATION_SCHEMA_VERSION = 2
 PREPARED_ARTIFACT_KINDS = frozenset({"client", "public", "evaluation"})
 

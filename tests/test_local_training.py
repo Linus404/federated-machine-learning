@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from src.app_manifest import load_app_manifest
+from src.app_manifest import expected_train_dataset, load_app_manifest
 from src.artifact_compatibility import (
     PUBLIC_ARTIFACT_SCHEMA_VERSION,
     canonical_json_bytes,
@@ -43,16 +43,7 @@ class LocalTrainingTests(unittest.TestCase):
             vocabulary = b"\n[UNK]\ngood\nbad\n"
             vocabulary_sha256 = hashlib.sha256(vocabulary).hexdigest()
             (args.public_artifact_dir / "vocab.txt").write_bytes(vocabulary)
-            dataset = {
-                "id": "example/imdb",
-                "config": "plain_text",
-                "revision": "frozen",
-                "datasets_version": "1.0.0",
-                "split": "train",
-                "rows": 4,
-                "raw_parquet_sha256": "1" * 64,
-                "content_sha256": "2" * 64,
-            }
+            dataset = expected_train_dataset()
             public_payload = {
                 "schema_version": PUBLIC_ARTIFACT_SCHEMA_VERSION,
                 "embedding_dim": 8,

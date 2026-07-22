@@ -8,13 +8,17 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
+from src.app_manifest import expected_train_dataset
 from src.artifact_history import (
     load_current_run_snapshot,
     prune_run_history,
     publish_completed_run,
     resolve_current_run_dir,
 )
-from src.artifact_compatibility import write_server_artifact_manifest
+from src.artifact_compatibility import (
+    canonical_json_bytes,
+    write_server_artifact_manifest,
+)
 from src.run_provenance import write_run_provenance_manifest
 from tests.artifact_helpers import fake_app_manifest
 from tests.test_run_provenance import runtime_environment
@@ -351,6 +355,44 @@ class ArtifactHistoryTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     ValueError, "invalid run provenance manifest"
                 ):
+                    publish_completed_run(root, run)
+
+    def test_finalization_rejects_each_frozen_dataset_identity_change(self) -> None:
+        identity = expected_train_dataset()
+        hostile_values = {
+            "id": "attacker/imdb",
+            "config": "attacker_config",
+            "revision": "0" * 40,
+            "datasets_version": "0.0.0",
+            "split": "test",
+            "rows": 24999,
+            "raw_parquet_sha256": "0" * 64,
+            "content_sha256": "0" * 64,
+        }
+        for field, hostile_value in hostile_values.items():
+            with (
+                self.subTest(field=field),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+                provenance_path = run / "run_manifest.json"
+                provenance = json.loads(provenance_path.read_bytes())
+                provenance["dataset"] = {
+                    **provenance["dataset"],
+                    "identity": json.dumps(
+                        {**identity, field: hostile_value},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ),
+                    "checksums": {"manifest.json": "sha256:" + "0" * 64},
+                    "status": "available",
+                }
+                provenance_path.write_bytes(canonical_json_bytes(provenance))
+
+                with self.assertRaisesRegex(ValueError, "dataset.identity"):
                     publish_completed_run(root, run)
 
     def test_finalization_recovers_after_current_index_write_failure(self) -> None:

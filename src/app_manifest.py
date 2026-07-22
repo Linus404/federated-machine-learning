@@ -84,20 +84,23 @@ def resolve_public_artifact_dir(config=None, *, public_artifact_dir=None) -> Pat
     return resolve_prepared_artifact_dir(logical_dir, "public")
 
 
-def _expected_train_dataset(protocol: Mapping[str, Any]) -> dict[str, Any]:
+def expected_train_dataset(
+    protocol: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Return the exact public train-dataset identity from the frozen protocol.
 
     Parameters
     ----------
-    protocol : mapping of str to Any
-        Parsed frozen scientific protocol.
+    protocol : mapping of str to Any or None, optional
+        Parsed frozen scientific protocol, primarily for deterministic tests.
 
     Returns
     -------
     dict of str to Any
         Exact dataset identity permitted at the public artifact boundary.
     """
-    dataset = protocol["dataset"]
+    frozen = protocol or load_scientific_protocol()
+    dataset = frozen["dataset"]
     train = dataset["splits"]["train"]
     return {
         "id": dataset["id"],
@@ -205,7 +208,7 @@ def load_app_manifest(
         raise ValueError(f"Manifest missing: {', '.join(sorted(missing))}")
 
     frozen = protocol or load_scientific_protocol()
-    if payload["dataset"] != _expected_train_dataset(frozen):
+    if payload["dataset"] != expected_train_dataset(frozen):
         raise ValueError("public dataset identity differs from the frozen protocol")
 
     preprocessing = frozen["preprocessing"]

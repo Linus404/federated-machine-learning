@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from src.app_manifest import expected_train_dataset
 from src.artifact_compatibility import (
     ARTIFACT_SCHEMA_VERSION,
     PUBLIC_ARTIFACT_SCHEMA_VERSION,
@@ -36,16 +37,7 @@ def write_public_dataset_contract(path: Path) -> dict[str, object]:
     vocabulary = b"\n[UNK]\ngood\nbad\n"
     vocabulary_sha256 = hashlib.sha256(vocabulary).hexdigest()
     (path / "vocab.txt").write_bytes(vocabulary)
-    dataset = {
-        "id": "stanfordnlp/imdb",
-        "config": "plain_text",
-        "revision": "e6281661ce1c48d982bc483cf8a173c1bbeb5d31",
-        "datasets_version": "4.8.5",
-        "split": "train",
-        "rows": 25000,
-        "raw_parquet_sha256": "db47d16b" + "0" * 56,
-        "content_sha256": "4639bf10" + "0" * 56,
-    }
+    dataset = expected_train_dataset()
     (path / "manifest.json").write_bytes(
         canonical_json_bytes(
             {
@@ -133,16 +125,50 @@ class RunProvenanceTests(unittest.TestCase):
             snapshot = load_app_manifest(
                 public_artifact_dir=public_dir, protocol=protocol
             )
-            with patch(
-                "src.run_provenance.load_app_manifest",
-                side_effect=AssertionError("public pointer reopened"),
+            with (
+                patch(
+                    "src.run_provenance.load_app_manifest",
+                    side_effect=AssertionError("public pointer reopened"),
+                ),
+                patch(
+                    "src.run_provenance.resolve_public_artifact_dir",
+                    side_effect=AssertionError("public pointer resolved"),
+                ),
+                patch(
+                    "src.run_provenance._code_revision",
+                    return_value={
+                        "commit": None,
+                        "dirty": None,
+                        "source": "unavailable",
+                    },
+                ),
+                patch(
+                    "src.run_provenance._environment_metadata",
+                    return_value=runtime_environment(),
+                ),
             ):
-                metadata = _dataset_metadata(public_dir, app_manifest=snapshot)
+                manifest_path = write_run_provenance_manifest(
+                    Path(tmpdir) / "run",
+                    {},
+                    public_artifact_dir=public_dir,
+                    app_manifest=snapshot,
+                )
+                payload = load_run_provenance_manifest(manifest_path)
 
-        self.assertEqual(metadata["status"], "available")
+        self.assertEqual(payload["dataset"]["status"], "available")
         self.assertEqual(
-            metadata["checksums"]["manifest.json"],
+            payload["dataset"]["checksums"]["manifest.json"],
             "sha256:" + hashlib.sha256(snapshot.manifest_bytes).hexdigest(),
+        )
+        self.assertEqual(
+            payload["dataset"]["identity"],
+            json.dumps(
+                expected_train_dataset(),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ),
         )
 
     def test_public_checksums_use_the_same_snapshot_as_validation(self) -> None:
@@ -160,7 +186,7 @@ class RunProvenanceTests(unittest.TestCase):
             def load_then_mutate(**kwargs):
                 snapshot = load_app_manifest(protocol=protocol, **kwargs)
                 mutated_manifest = manifest_path.read_bytes().replace(
-                    b'"rows": 25000', b'"rows": 35000'
+                    b'"rows":25000', b'"rows":35000'
                 )
                 self.assertEqual(len(mutated_manifest), len(manifest_bytes))
                 manifest_path.write_bytes(mutated_manifest)
@@ -295,16 +321,7 @@ class RunProvenanceTests(unittest.TestCase):
             self.assertEqual(
                 payload["dataset"]["identity"],
                 json.dumps(
-                    {
-                        "id": "stanfordnlp/imdb",
-                        "config": "plain_text",
-                        "revision": "e6281661ce1c48d982bc483cf8a173c1bbeb5d31",
-                        "datasets_version": "4.8.5",
-                        "split": "train",
-                        "rows": 25000,
-                        "raw_parquet_sha256": "db47d16b" + "0" * 56,
-                        "content_sha256": "4639bf10" + "0" * 56,
-                    },
+                    expected_train_dataset(),
                     ensure_ascii=False,
                     sort_keys=True,
                     separators=(",", ":"),
@@ -564,16 +581,7 @@ class RunProvenanceTests(unittest.TestCase):
                     )
                 )
 
-            identity = {
-                "id": "stanfordnlp/imdb",
-                "config": "plain_text",
-                "revision": "e6281661ce1c48d982bc483cf8a173c1bbeb5d31",
-                "datasets_version": "4.8.5",
-                "split": "train",
-                "rows": 25000,
-                "raw_parquet_sha256": "1" * 64,
-                "content_sha256": "2" * 64,
-            }
+            identity = expected_train_dataset()
             canonical_identity = json.dumps(
                 identity,
                 ensure_ascii=False,
@@ -593,6 +601,31 @@ class RunProvenanceTests(unittest.TestCase):
                 load_run_provenance_manifest(valid_path)["dataset"]["identity"],
                 canonical_identity,
             )
+
+            hostile_values = {
+                "id": "attacker/imdb",
+                "config": "attacker_config",
+                "revision": "0" * 40,
+                "datasets_version": "0.0.0",
+                "split": "test",
+                "rows": 24999,
+                "raw_parquet_sha256": "0" * 64,
+                "content_sha256": "0" * 64,
+            }
+            for field, hostile_value in hostile_values.items():
+                with self.subTest(field=field):
+                    hostile = json.loads(json.dumps(base))
+                    hostile["dataset"]["identity"] = json.dumps(
+                        {**identity, field: hostile_value},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                    hostile_path = root / f"hostile-value-{field}.json"
+                    hostile_path.write_bytes(canonical_json_bytes(hostile))
+                    with self.assertRaisesRegex(ValueError, "dataset.identity"):
+                        load_run_provenance_manifest(hostile_path)
 
             hostile_identities = {
                 "nested duplicate": canonical_identity.replace(
@@ -615,11 +648,6 @@ class RunProvenanceTests(unittest.TestCase):
                 ),
                 "wrong field type": json.dumps(
                     {**identity, "rows": "25000"},
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-                "wrong field value": json.dumps(
-                    {**identity, "split": "test"},
                     sort_keys=True,
                     separators=(",", ":"),
                 ),

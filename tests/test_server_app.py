@@ -10,6 +10,7 @@ import numpy as np
 from flwr.common import Context, ndarrays_to_parameters, parameters_to_ndarrays
 
 import src.server_app as server_app
+from src.app_manifest import expected_train_dataset
 from src.artifact_compatibility import load_server_artifact_manifest
 from tests.artifact_helpers import fake_app_manifest
 
@@ -28,16 +29,7 @@ def server_app_manifest(public_dir: Path) -> SimpleNamespace:
         App-manifest-shaped immutable snapshot.
     """
     snapshot = fake_app_manifest()
-    dataset = {
-        "id": "example/imdb",
-        "config": "plain_text",
-        "revision": "frozen",
-        "datasets_version": "1.0.0",
-        "split": "train",
-        "rows": 4,
-        "raw_parquet_sha256": "1" * 64,
-        "content_sha256": "2" * 64,
-    }
+    dataset = expected_train_dataset()
     snapshot.payload["dataset"] = dataset
     snapshot.manifest_bytes = json.dumps({"dataset": dataset}).encode("utf-8")
     snapshot.vocabulary_path = public_dir / "vocab.txt"
