@@ -54,7 +54,7 @@ provide.
 | --- | --- | --- |
 | Raw reviews and labels | Preparation host; one client shard per ClientApp | Plain JSON records reveal the complete examples and labels. The demo operator has all shards. |
 | Client shard metadata | Client shard directory | Sample count, label histogram, split seed, Dirichlet alpha, and manifest checksum reveal distribution information. |
-| Public vocabulary and manifest | Every component and the dashboard | The vocabulary was adapted on the complete demo training split; token inclusion and ordering can reveal corpus properties. |
+| Public vocabulary and manifest | ServerApp, each ClientApp, and the dashboard | The vocabulary was adapted on the complete demo training split; token inclusion and ordering can reveal corpus properties. |
 | Client model parameters | Flower server before aggregation | Parameters can encode information about local examples and distributions. |
 | Fit and evaluation metadata | Flower server | Sample counts, loss, accuracy, client ID, participation, and timing can expose client size, behavior, and data-distribution differences. |
 | Global model | Server artifacts and dashboard process | A released model can memorize training information and be queried for membership or property signals. |
