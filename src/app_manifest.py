@@ -178,8 +178,58 @@ def load_app_manifest(
         raise ValueError("public artifact directory must be a regular directory")
     canonical_dir = public_dir.resolve(strict=True)
     path = public_dir / "manifest.json"
+    manifest_bytes = read_regular_file(path, parent=canonical_dir)
     try:
-        manifest_bytes = read_regular_file(path, parent=canonical_dir)
+        validate_artifact_schema(
+            json.loads(manifest_bytes.decode("utf-8")),
+            "public manifest",
+            supported_version=PUBLIC_ARTIFACT_SCHEMA_VERSION,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("invalid public manifest") from error
+    if {entry.name for entry in public_dir.iterdir()} != PUBLIC_ARTIFACT_FILENAMES:
+        raise ValueError("public artifact contains unexpected files")
+    vocabulary_path = public_dir / "vocab.txt"
+    vocabulary_bytes = read_regular_file(vocabulary_path, parent=canonical_dir)
+    return validate_app_manifest_bytes(
+        manifest_bytes,
+        vocabulary_bytes,
+        vocabulary_path=vocabulary_path,
+        protocol=protocol,
+    )
+
+
+def validate_app_manifest_bytes(
+    manifest_bytes: bytes,
+    vocabulary_bytes: bytes,
+    *,
+    vocabulary_path: Path,
+    protocol: Mapping[str, Any] | None = None,
+) -> AppManifest:
+    """Validate retained public manifest and vocabulary bytes.
+
+    Parameters
+    ----------
+    manifest_bytes : bytes
+        Exact canonical ``manifest.json`` bytes.
+    vocabulary_bytes : bytes
+        Exact ``vocab.txt`` bytes bound by the manifest.
+    vocabulary_path : pathlib.Path
+        Original vocabulary path retained for diagnostics only.
+    protocol : mapping of str to Any or None, optional
+        Parsed frozen protocol, primarily for deterministic tests.
+
+    Returns
+    -------
+    AppManifest
+        Validated immutable public artifact snapshot.
+
+    Raises
+    ------
+    ValueError
+        If the manifest, frozen protocol binding, or vocabulary is invalid.
+    """
+    try:
         payload = dict(
             validate_artifact_schema(
                 json.loads(manifest_bytes.decode("utf-8")),
@@ -187,8 +237,6 @@ def load_app_manifest(
                 supported_version=PUBLIC_ARTIFACT_SCHEMA_VERSION,
             )
         )
-        if {entry.name for entry in public_dir.iterdir()} != PUBLIC_ARTIFACT_FILENAMES:
-            raise ValueError("public artifact contains unexpected files")
         canonical_manifest = canonical_json_bytes(payload)
         if manifest_bytes != canonical_manifest:
             raise ValueError("public manifest bytes are not canonical")
@@ -229,10 +277,10 @@ def load_app_manifest(
     filename = vocabulary["filename"]
     if not isinstance(filename, str) or filename != "vocab.txt":
         raise ValueError("public vocabulary filename must be vocab.txt")
+    if vocabulary_path.name != filename:
+        raise ValueError("public vocabulary path must end with vocab.txt")
     if vocabulary["sha256"] != preprocessing["vocabulary_sha256"]:
         raise ValueError("public vocabulary SHA-256 differs from the frozen protocol")
-    vocabulary_path = public_dir / filename
-    vocabulary_bytes = read_regular_file(vocabulary_path, parent=canonical_dir)
     if type(vocabulary["size_bytes"]) is not int or vocabulary["size_bytes"] != len(
         vocabulary_bytes
     ):

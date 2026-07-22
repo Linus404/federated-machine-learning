@@ -68,6 +68,10 @@ class ArtifactCompatibilityTests(unittest.TestCase):
         self.assertIn("client schema `1` shards", policy)
         self.assertIn("Regenerate public schema\n`2`, client schema `2`", policy)
         self.assertIn("schema-3 generation atomically supersedes it", policy)
+        self.assertIn("server artifact manifests use schema `4`", policy)
+        self.assertIn(
+            "Server schema `3` did not retain canonical public evidence", policy
+        )
         self.assertNotIn("schema-2 generation atomically supersedes it", policy)
         self.assertNotIn("all other persisted contracts remain schema `1`", policy)
 
@@ -250,6 +254,19 @@ class ArtifactCompatibilityTests(unittest.TestCase):
                 canonical_json_bytes(load_server_artifact_manifest(path)),
                 canonical_json_bytes(payload),
             )
+
+    def test_in_progress_snapshot_ignores_unmanifested_writer_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            (path / "global_model.keras").write_bytes(b"model-in-progress")
+            (path / ".metrics.csv.tmp").write_bytes(b"partial")
+            (path / "writer-state").mkdir()
+            write_server_artifact_manifest(path, app_manifest=fake_app_manifest())
+
+            snapshot = load_server_artifact_snapshot(path)
+
+            self.assertEqual(snapshot.files["global_model.keras"], b"model-in-progress")
+            self.assertNotIn(".metrics.csv.tmp", snapshot.files)
 
     def test_server_manifest_read_boundaries_reject_hostile_json(self) -> None:
         for operation in ("load", "finalize"):

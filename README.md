@@ -163,7 +163,10 @@ contains a UUID, the Flower run ID, creation time, complete run configuration,
 Python/OS/package versions, Git revision and worktree state when available, known
 seeds, and SHA-256 checksums for the public manifest and vocabulary. Each completed
 `artifact_manifest.json` binds the saved model, metrics, and provenance file bytes
-to their SHA-256 checksums, which consumers validate and snapshot before loading.
+to their SHA-256 checksums. Completed runs also retain the canonical public
+`manifest.json` and `vocab.txt`; consumers validate those bytes against the frozen
+protocol, require the provenance and model dimensions to match them, and reject
+any unmanifested directory entry before loading.
 Set
 `FML_CODE_REVISION` to the full Git object ID in images that do not contain `.git`.
 Client shard identities and checksums are not collected by the server manifest.

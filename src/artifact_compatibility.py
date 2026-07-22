@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 ARTIFACT_SCHEMA_VERSION = 1
 PUBLIC_ARTIFACT_SCHEMA_VERSION = 2
 CLIENT_SHARD_SCHEMA_VERSION = 2
-SERVER_ARTIFACT_SCHEMA_VERSION = 3
+SERVER_ARTIFACT_SCHEMA_VERSION = 4
 SERVER_ARTIFACT_MANIFEST_FILENAME = "artifact_manifest.json"
 SERVER_ARTIFACTS: dict[str, dict[str, Any]] = {
     "model": {"filename": "global_model.keras", "format": "keras-v3"},
@@ -37,8 +37,10 @@ SERVER_ARTIFACTS: dict[str, dict[str, Any]] = {
 }
 REQUIRED_COMPLETED_ARTIFACTS = {
     "global_model.keras",
+    "manifest.json",
     "metrics.csv",
     "run_manifest.json",
+    "vocab.txt",
 }
 _SERVER_BINDING_FIELDS = {
     "public_manifest_checksum",
@@ -458,14 +460,43 @@ def write_json_atomically(
     ValueError
         If the payload contains values outside the JSON data model.
     """
+    return write_bytes_atomically(
+        path, canonical_json_bytes(payload), overwrite=overwrite
+    )
+
+
+def write_bytes_atomically(
+    path: Path, content: bytes, *, overwrite: bool = True
+) -> Path:
+    """Persist exact bytes atomically.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Destination path.
+    content : bytes
+        Exact bytes to persist.
+    overwrite : bool, optional
+        Replace an existing destination when ``True``. When ``False``, publish by
+        atomic hard link so an existing immutable file cannot be replaced.
+
+    Returns
+    -------
+    pathlib.Path
+        Destination path.
+
+    Raises
+    ------
+    FileExistsError
+        If ``overwrite`` is ``False`` and the destination already exists.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    content = canonical_json_bytes(payload).decode("utf-8")
     descriptor, temporary_name = tempfile.mkstemp(
         dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
     )
     temporary_path = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as file:
+        with os.fdopen(descriptor, "wb") as file:
             file.write(content)
             file.flush()
             os.fsync(file.fileno())
@@ -881,6 +912,10 @@ def load_server_artifact_snapshot(
         if not REQUIRED_COMPLETED_ARTIFACTS <= checksums.keys():
             raise ValueError("server artifact manifest is missing required checksums")
         filenames = set(checksums)
+        inventory = {entry.name for entry in artifact_dir.iterdir()}
+        expected_inventory = {SERVER_ARTIFACT_MANIFEST_FILENAME, *filenames}
+        if inventory != expected_inventory:
+            raise ValueError("completed server artifact inventory does not match")
 
     files: dict[str, bytes] = {}
     for filename in filenames:
@@ -913,6 +948,19 @@ def load_server_artifact_snapshot(
         if expected_size is not None and len(content) != expected_size:
             raise ValueError(f"server artifact size does not match: {filename}")
         files[filename] = content
+    if lifecycle == "complete":
+        from src.app_manifest import validate_app_manifest_bytes
+
+        retained_manifest = validate_app_manifest_bytes(
+            files["manifest.json"],
+            files["vocab.txt"],
+            vocabulary_path=artifact_dir / "vocab.txt",
+        )
+        _validate_server_binding(payload.get("binding"), app_manifest=retained_manifest)
+        if {entry.name for entry in artifact_dir.iterdir()} != expected_inventory:
+            raise ValueError(
+                "completed server artifact inventory changed while loading"
+            )
     return ServerArtifactSnapshot(
         directory=canonical_dir,
         manifest=deep_freeze(payload),

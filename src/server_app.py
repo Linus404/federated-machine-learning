@@ -520,7 +520,11 @@ class SentimentServer(FedProx):
                     }
                 )
             if server_round == self.final_round:
-                publish_completed_run(self.artifact_root, self.artifact_dir)
+                publish_completed_run(
+                    self.artifact_root,
+                    self.artifact_dir,
+                    app_manifest=self.app_manifest,
+                )
                 prune_run_history(
                     self.artifact_root,
                     self.artifact_retention_runs,

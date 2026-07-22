@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import socket
 import tempfile
 import threading
 import time
@@ -13,11 +14,12 @@ from src.app_manifest import AppManifest, expected_train_dataset, load_app_manif
 from src.artifact_history import (
     load_current_run_snapshot,
     prune_run_history,
-    publish_completed_run,
+    publish_completed_run as _publish_completed_run,
     resolve_current_run_dir,
 )
 from src.artifact_compatibility import (
     canonical_json_bytes,
+    load_server_artifact_snapshot,
     server_artifact_binding,
     sha256_bytes,
     write_server_artifact_manifest,
@@ -34,6 +36,34 @@ RUN_IDS = (
     "22222222-2222-4222-8222-222222222222",
     "33333333-3333-4333-8333-333333333333",
 )
+_RUN_PUBLIC_MANIFESTS: dict[Path, AppManifest] = {}
+_TEST_VOCABULARY = b"\n[UNK]\ngood\nbad\n"
+_TEST_VOCABULARY_SHA256 = hashlib.sha256(_TEST_VOCABULARY).hexdigest()
+_TEST_PROTOCOL = {
+    "dataset": {
+        **{
+            key: expected_train_dataset()[key]
+            for key in ("id", "config", "revision", "datasets_version")
+        },
+        "splits": {
+            "train": {
+                key: expected_train_dataset()[key]
+                for key in ("rows", "raw_parquet_sha256", "content_sha256")
+            }
+        },
+    },
+    "preprocessing": {
+        "vocabulary_size": 4,
+        "max_tokens": 4,
+        "output_sequence_length": 500,
+        "vocabulary_sha256": _TEST_VOCABULARY_SHA256,
+    },
+    "model": {
+        "vocabulary_size": 4,
+        "sequence_length": 500,
+        "embedding_dimension": 100,
+    },
+}
 
 
 def create_public_snapshot(
@@ -121,10 +151,230 @@ def create_run(
         "round,loss,accuracy\n1,0.5,0.75\n", encoding="utf-8"
     )
     write_server_artifact_manifest(run_dir, app_manifest=artifact_manifest)
+    _RUN_PUBLIC_MANIFESTS[run_dir] = provenance_manifest
     return run_dir
 
 
+def publish_completed_run(root: Path, run_dir: Path) -> Path:
+    """Publish a test run with the public snapshot used for its provenance.
+
+    Parameters
+    ----------
+    root : pathlib.Path
+        Artifact history root.
+    run_dir : pathlib.Path
+        Candidate run directory created by :func:`create_run`.
+
+    Returns
+    -------
+    pathlib.Path
+        Published current-run index path.
+    """
+    return _publish_completed_run(
+        root, run_dir, app_manifest=_RUN_PUBLIC_MANIFESTS[run_dir]
+    )
+
+
+def rewrite_current_artifact_manifest(root: Path, run_dir: Path) -> None:
+    """Rebind the current index to a deliberately rewritten artifact manifest.
+
+    Parameters
+    ----------
+    root : pathlib.Path
+        Artifact history root.
+    run_dir : pathlib.Path
+        Current completed run whose artifact manifest was rewritten.
+
+    Returns
+    -------
+    None
+    """
+    manifest_path = run_dir / "artifact_manifest.json"
+    current_path = root / "current.json"
+    current = json.loads(current_path.read_bytes())
+    current["artifact_manifest_checksum"] = sha256_bytes(manifest_path.read_bytes())
+    current_path.write_bytes(canonical_json_bytes(current))
+
+
 class ArtifactHistoryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        """Use the small frozen public contract created by history fixtures.
+
+        Returns
+        -------
+        None
+        """
+        protocol = patch(
+            "src.app_manifest.load_scientific_protocol",
+            return_value=_TEST_PROTOCOL,
+        )
+        protocol.start()
+        self.addCleanup(protocol.stop)
+
+    def test_publication_rejects_coordinated_false_public_values(self) -> None:
+        for field in (
+            "public_manifest_checksum",
+            "vocabulary_checksum",
+            "model_dimensions",
+        ):
+            with (
+                self.subTest(field=field),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+                artifact_path = run / "artifact_manifest.json"
+                artifact = json.loads(artifact_path.read_bytes())
+                provenance_path = run / "run_manifest.json"
+                provenance = json.loads(provenance_path.read_bytes())
+                if field == "public_manifest_checksum":
+                    invented = "sha256:" + "0" * 64
+                    artifact["binding"][field] = invented
+                    provenance["dataset"]["checksums"]["manifest.json"] = invented
+                    provenance["dataset"]["public_manifest"]["checksum"] = invented
+                elif field == "vocabulary_checksum":
+                    invented = "sha256:" + "1" * 64
+                    artifact["binding"][field] = invented
+                    provenance["dataset"]["checksums"]["vocab.txt"] = invented
+                else:
+                    artifact["binding"][field]["embedding_dim"] = 1
+                artifact_path.write_bytes(canonical_json_bytes(artifact))
+                provenance_path.write_bytes(canonical_json_bytes(provenance))
+
+                with self.assertRaisesRegex(ValueError, "does not match"):
+                    publish_completed_run(root, run)
+
+                self.assertFalse((root / "current.json").exists())
+
+    def test_publication_retains_and_manifests_legitimate_writer_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            (run / "client_metrics.csv").write_text(
+                "round,client_id,loss,accuracy,samples\n",
+                encoding="utf-8",
+            )
+
+            publish_completed_run(root, run)
+
+            manifest = json.loads((run / "artifact_manifest.json").read_bytes())
+            self.assertIn("client_metrics.csv", manifest["checksums"])
+            self.assertEqual(
+                {entry.name for entry in run.iterdir()},
+                {"artifact_manifest.json", *manifest["checksums"]},
+            )
+
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "Unix sockets require POSIX")
+    def test_publication_rejects_non_regular_extra_entries(self) -> None:
+        for entry_type in ("hardlink", "symlink", "directory", "fifo", "socket"):
+            if entry_type == "fifo" and not hasattr(os, "mkfifo"):
+                continue
+            with (
+                self.subTest(entry_type=entry_type),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+                extra = run / "extra"
+                open_socket = None
+                if entry_type == "hardlink":
+                    os.link(run / "metrics.csv", extra)
+                elif entry_type == "symlink":
+                    extra.symlink_to(run / "metrics.csv")
+                elif entry_type == "directory":
+                    extra.mkdir()
+                elif entry_type == "fifo":
+                    os.mkfifo(extra)
+                else:
+                    open_socket = socket.socket(socket.AF_UNIX)
+                    open_socket.bind(str(extra))
+                self.addCleanup(open_socket.close if open_socket else lambda: None)
+
+                with self.assertRaisesRegex(ValueError, "missing or unsafe"):
+                    publish_completed_run(root, run)
+
+                self.assertFalse((root / "current.json").exists())
+
+    def test_publication_retry_rejects_missing_or_changed_public_evidence(
+        self,
+    ) -> None:
+        for filename in ("manifest.json", "vocab.txt"):
+            for mutation in ("missing", "changed"):
+                with (
+                    self.subTest(filename=filename, mutation=mutation),
+                    tempfile.TemporaryDirectory() as tmpdir,
+                ):
+                    root = Path(tmpdir)
+                    run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+                    with (
+                        patch(
+                            "src.artifact_history.write_json_atomically",
+                            side_effect=OSError("current-index failure"),
+                        ),
+                        self.assertRaisesRegex(OSError, "current-index failure"),
+                    ):
+                        publish_completed_run(root, run)
+                    evidence = run / filename
+                    if mutation == "missing":
+                        evidence.unlink()
+                    else:
+                        evidence.write_bytes(evidence.read_bytes() + b"changed")
+
+                    with self.assertRaisesRegex(
+                        ValueError, "inventory|checksum does not match"
+                    ):
+                        publish_completed_run(root, run)
+
+                    self.assertFalse((root / "current.json").exists())
+
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "Unix sockets require POSIX")
+    def test_publication_retry_rejects_every_unmanifested_entry_type(self) -> None:
+        for entry_type in (
+            "regular",
+            "hardlink",
+            "symlink",
+            "directory",
+            "fifo",
+            "socket",
+        ):
+            if entry_type == "fifo" and not hasattr(os, "mkfifo"):
+                continue
+            with (
+                self.subTest(entry_type=entry_type),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+                with (
+                    patch(
+                        "src.artifact_history.write_json_atomically",
+                        side_effect=OSError("current-index failure"),
+                    ),
+                    self.assertRaisesRegex(OSError, "current-index failure"),
+                ):
+                    publish_completed_run(root, run)
+                extra = run / "extra"
+                open_socket = None
+                if entry_type == "regular":
+                    extra.write_bytes(b"extra")
+                elif entry_type == "hardlink":
+                    os.link(run / "metrics.csv", extra)
+                elif entry_type == "symlink":
+                    extra.symlink_to(run / "metrics.csv")
+                elif entry_type == "directory":
+                    extra.mkdir()
+                elif entry_type == "fifo":
+                    os.mkfifo(extra)
+                else:
+                    open_socket = socket.socket(socket.AF_UNIX)
+                    open_socket.bind(str(extra))
+                self.addCleanup(open_socket.close if open_socket else lambda: None)
+
+                with self.assertRaisesRegex(ValueError, "inventory"):
+                    publish_completed_run(root, run)
+
+                self.assertFalse((root / "current.json").exists())
+
     def test_publish_selects_run_and_load_boundary_rejects_corruption(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -397,7 +647,7 @@ class ArtifactHistoryTests(unittest.TestCase):
                     artifact_app_manifest=second,
                 )
                 with self.assertRaisesRegex(
-                    ValueError, "public manifest does not match"
+                    ValueError, "public-manifest.*does not match"
                 ):
                     publish_completed_run(root, candidate)
 
@@ -439,7 +689,7 @@ class ArtifactHistoryTests(unittest.TestCase):
                 provenance["dataset"]["checksums"]["vocab.txt"] = "sha256:" + "0" * 64
                 provenance_path.write_bytes(canonical_json_bytes(provenance))
 
-                with self.assertRaisesRegex(ValueError, "vocabulary does not match"):
+                with self.assertRaisesRegex(ValueError, "retained public evidence"):
                     publish_completed_run(root, candidate)
 
                 if existing_current:
@@ -475,7 +725,7 @@ class ArtifactHistoryTests(unittest.TestCase):
             )
             current_path.write_bytes(canonical_json_bytes(current))
 
-            with self.assertRaisesRegex(ValueError, "public manifest does not match"):
+            with self.assertRaisesRegex(ValueError, "public-manifest.*does not match"):
                 load_current_run_snapshot(root)
 
     def test_current_snapshot_rejects_vocabulary_checksum_binding_mismatch(
@@ -502,8 +752,166 @@ class ArtifactHistoryTests(unittest.TestCase):
             )
             current_path.write_bytes(canonical_json_bytes(current))
 
-            with self.assertRaisesRegex(ValueError, "vocabulary does not match"):
+            with self.assertRaisesRegex(ValueError, "retained public evidence"):
                 load_current_run_snapshot(root)
+
+    def test_current_snapshot_rejects_coordinated_false_manifest_dimensions(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            publish_completed_run(root, run)
+            retained_manifest_path = run / "manifest.json"
+            retained_manifest = json.loads(retained_manifest_path.read_bytes())
+            retained_manifest["embedding_dim"] = 1
+            retained_manifest_bytes = canonical_json_bytes(retained_manifest)
+            retained_manifest_path.write_bytes(retained_manifest_bytes)
+
+            provenance_path = run / "run_manifest.json"
+            provenance = json.loads(provenance_path.read_bytes())
+            manifest_checksum = sha256_bytes(retained_manifest_bytes)
+            provenance["dataset"]["checksums"]["manifest.json"] = manifest_checksum
+            provenance["dataset"]["public_manifest"] = {
+                "filename": "manifest.json",
+                "size_bytes": len(retained_manifest_bytes),
+                "checksum": manifest_checksum,
+            }
+            provenance_bytes = canonical_json_bytes(provenance)
+            provenance_path.write_bytes(provenance_bytes)
+
+            artifact_path = run / "artifact_manifest.json"
+            artifact = json.loads(artifact_path.read_bytes())
+            artifact["binding"]["public_manifest_checksum"] = manifest_checksum
+            artifact["binding"]["model_dimensions"]["embedding_dim"] = 1
+            artifact["sizes"]["manifest.json"] = len(retained_manifest_bytes)
+            artifact["checksums"]["manifest.json"] = manifest_checksum
+            artifact["sizes"]["run_manifest.json"] = len(provenance_bytes)
+            artifact["checksums"]["run_manifest.json"] = sha256_bytes(provenance_bytes)
+            artifact_path.write_bytes(canonical_json_bytes(artifact))
+            rewrite_current_artifact_manifest(root, run)
+
+            with self.assertRaisesRegex(ValueError, "protocol dimensions"):
+                load_current_run_snapshot(root)
+
+    def test_current_snapshot_rejects_coordinated_false_vocabulary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            publish_completed_run(root, run)
+            retained_vocabulary = b"\n[UNK]\nevil\nbad\n"
+            vocabulary_checksum = sha256_bytes(retained_vocabulary)
+            (run / "vocab.txt").write_bytes(retained_vocabulary)
+            retained_manifest_path = run / "manifest.json"
+            retained_manifest = json.loads(retained_manifest_path.read_bytes())
+            retained_manifest["vocabulary"]["sha256"] = vocabulary_checksum[7:]
+            retained_manifest["vocabulary"]["size_bytes"] = len(retained_vocabulary)
+            retained_manifest_bytes = canonical_json_bytes(retained_manifest)
+            retained_manifest_path.write_bytes(retained_manifest_bytes)
+            manifest_checksum = sha256_bytes(retained_manifest_bytes)
+
+            provenance_path = run / "run_manifest.json"
+            provenance = json.loads(provenance_path.read_bytes())
+            provenance["dataset"]["checksums"] = {
+                "manifest.json": manifest_checksum,
+                "vocab.txt": vocabulary_checksum,
+            }
+            provenance["dataset"]["public_manifest"] = {
+                "filename": "manifest.json",
+                "size_bytes": len(retained_manifest_bytes),
+                "checksum": manifest_checksum,
+            }
+            provenance_bytes = canonical_json_bytes(provenance)
+            provenance_path.write_bytes(provenance_bytes)
+
+            artifact_path = run / "artifact_manifest.json"
+            artifact = json.loads(artifact_path.read_bytes())
+            artifact["binding"]["public_manifest_checksum"] = manifest_checksum
+            artifact["binding"]["vocabulary_checksum"] = vocabulary_checksum
+            for name, content in (
+                ("manifest.json", retained_manifest_bytes),
+                ("vocab.txt", retained_vocabulary),
+                ("run_manifest.json", provenance_bytes),
+            ):
+                artifact["sizes"][name] = len(content)
+                artifact["checksums"][name] = sha256_bytes(content)
+            artifact_path.write_bytes(canonical_json_bytes(artifact))
+            rewrite_current_artifact_manifest(root, run)
+
+            with self.assertRaisesRegex(ValueError, "frozen protocol"):
+                load_current_run_snapshot(root)
+
+    def test_completed_loaders_reject_missing_or_changed_public_evidence(self) -> None:
+        for loader_name in ("current", "historical"):
+            for filename in ("manifest.json", "vocab.txt"):
+                for mutation in ("missing", "changed"):
+                    with (
+                        self.subTest(
+                            loader=loader_name,
+                            filename=filename,
+                            mutation=mutation,
+                        ),
+                        tempfile.TemporaryDirectory() as tmpdir,
+                    ):
+                        root = Path(tmpdir)
+                        run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+                        publish_completed_run(root, run)
+                        evidence = run / filename
+                        if mutation == "missing":
+                            evidence.unlink()
+                        else:
+                            evidence.write_bytes(evidence.read_bytes() + b"changed")
+
+                        with self.assertRaisesRegex(
+                            ValueError, "inventory|checksum does not match"
+                        ):
+                            if loader_name == "current":
+                                load_current_run_snapshot(root)
+                            else:
+                                load_server_artifact_snapshot(run)
+
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "Unix sockets require POSIX")
+    def test_completed_loaders_reject_every_extra_entry_type(self) -> None:
+        for loader_name in ("current", "historical"):
+            for entry_type in (
+                "regular",
+                "hardlink",
+                "symlink",
+                "directory",
+                "fifo",
+                "socket",
+            ):
+                if entry_type == "fifo" and not hasattr(os, "mkfifo"):
+                    continue
+                with (
+                    self.subTest(loader=loader_name, entry_type=entry_type),
+                    tempfile.TemporaryDirectory() as tmpdir,
+                ):
+                    root = Path(tmpdir)
+                    run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+                    publish_completed_run(root, run)
+                    extra = run / "extra"
+                    open_socket = None
+                    if entry_type == "regular":
+                        extra.write_bytes(b"extra")
+                    elif entry_type == "hardlink":
+                        os.link(run / "metrics.csv", extra)
+                    elif entry_type == "symlink":
+                        extra.symlink_to(run / "metrics.csv")
+                    elif entry_type == "directory":
+                        extra.mkdir()
+                    elif entry_type == "fifo":
+                        os.mkfifo(extra)
+                    else:
+                        open_socket = socket.socket(socket.AF_UNIX)
+                        open_socket.bind(str(extra))
+                    self.addCleanup(open_socket.close if open_socket else lambda: None)
+
+                    with self.assertRaisesRegex(ValueError, "inventory"):
+                        if loader_name == "current":
+                            load_current_run_snapshot(root)
+                        else:
+                            load_server_artifact_snapshot(run)
 
     def test_finalization_rejects_hostile_provenance_json(self) -> None:
         for hostile_case in (

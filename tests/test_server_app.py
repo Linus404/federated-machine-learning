@@ -670,6 +670,7 @@ class MetricAggregationTests(unittest.TestCase):
             strategy.artifact_root = root
             strategy.artifact_retention_runs = 3
             strategy.final_round = 2
+            strategy.app_manifest = fake_app_manifest()
             artifact_lock = Mock()
             strategy._artifact_lock = artifact_lock
             strategy.expected_client_ids = frozenset({0, 1})
@@ -698,7 +699,9 @@ class MetricAggregationTests(unittest.TestCase):
 
             self.assertAlmostEqual(loss, 0.575)
             self.assertEqual(metrics, {"accuracy": 0.625})
-            publish.assert_called_once_with(root, run_dir)
+            publish.assert_called_once_with(
+                root, run_dir, app_manifest=strategy.app_manifest
+            )
             prune.assert_called_once_with(root, 3, active_run_dir=run_dir)
             artifact_lock.release.assert_called_once_with()
 
@@ -717,6 +720,7 @@ class MetricAggregationTests(unittest.TestCase):
                 strategy.artifact_root = root
                 strategy.artifact_retention_runs = 3
                 strategy.final_round = 1
+                strategy.app_manifest = fake_app_manifest()
                 artifact_lock = server_app.acquire_run_artifact_lock(run_dir)
                 strategy._artifact_lock = artifact_lock
                 strategy.expected_client_ids = frozenset({0})

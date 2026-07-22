@@ -550,7 +550,7 @@ def train(args: argparse.Namespace) -> tuple[Any, Any]:
                 writer.writerow(
                     {"round": epoch, "loss": epoch_loss, "accuracy": epoch_accuracy}
                 )
-        publish_completed_run(artifact_root, run_dir)
+        publish_completed_run(artifact_root, run_dir, app_manifest=manifest)
         prune_run_history(artifact_root, retention_runs, active_run_dir=run_dir)
     finally:
         lock.release()

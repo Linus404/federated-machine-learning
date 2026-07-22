@@ -15,9 +15,9 @@ adding an optional setting with an unchanged default is compatible.
 ## Artifact schemas
 
 Artifact schemas are scoped by artifact kind. Public manifests and client shards
-use schema `2`; server artifact manifests and the prepared-generation index use
-schema `3`; evaluation artifacts, run provenance, and the current-run index use
-schema `1`:
+use schema `2`; server artifact manifests use schema `4`; the prepared-generation
+index uses schema `3`; evaluation artifacts, run provenance, and the current-run
+index use schema `1`:
 
 - `artifacts/public/manifest.json` uses `schema_version: 2` and describes the
   frozen train-dataset identity, checksummed vocabulary, and model dimensions.
@@ -35,10 +35,13 @@ schema `1`:
   checksum.
 - `artifacts/evaluation/manifest.json` uses `schema_version: 1` and strictly
   versions and checksums the immutable official test-split JSONL artifact.
-- Each completed `server/runs/<run_id>` directory has schema-3
+- Each completed `server/runs/<run_id>` directory has schema-4
   `artifact_manifest.json`, which binds the Keras model and both metrics CSV
   layouts to the exact public manifest, vocabulary, and model dimensions as one
-  consistent artifact set with exact retained sizes and checksums.
+  consistent artifact set. The canonical public `manifest.json` and `vocab.txt`
+  bytes are retained and checksummed with every output. A completed directory has
+  exactly `artifact_manifest.json` plus the checksummed regular files; no other
+  entry type or unmanifested name is accepted.
 - Each run directory has an immutable schema-1 `run_manifest.json`, which versions
   run identity, configuration, environment, code, seed, and public-dataset
   provenance as one schema-checked record. Its string-encoded public-dataset
@@ -63,7 +66,7 @@ older and cannot be upgraded by editing a version field. Regenerate public schem
 `2`, client schema `2`, and the atomic prepared generation from the frozen source
 dataset. Server schema `1` artifacts are unbound to a public vocabulary and are
 also rejected; rerun local or federated training against the regenerated public
-artifacts to produce server schema `3`. Evaluation, run-provenance, and current-run
+artifacts to produce server schema `4`. Evaluation, run-provenance, and current-run
 schema `1` artifacts do not require a schema migration. Prepared-generation schema
 `1` did not bind the requested partition count and is no longer selectable. A
 pending schema-1 preparation is safely rolled back and its journal-owned candidate
@@ -74,7 +77,9 @@ Prepared-generation schema `2` did not independently bind the selected file
 inventory. Pending schema-2 preparations are rolled back rather than recovered;
 regenerate them as schema `3`. Server schema `2` completion did not retain file
 sizes or guarantee one retained byte snapshot for provenance validation and
-checksumming; rerun training to produce server schema `3`.
+checksumming. Server schema `3` did not retain canonical public evidence or reject
+unmanifested completed-run entries. Rerun training to produce server schema `4`;
+editing an older manifest cannot reconstruct the missing evidence.
 
 Artifacts are derived outputs, so regeneration into another root remains
 non-destructive:

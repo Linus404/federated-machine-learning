@@ -157,9 +157,13 @@ class LocalTrainingTests(unittest.TestCase):
 
             self.assertEqual(events, ["private-data", "manifest"])
             load_shard.assert_called_once()
-            payload = load_run_provenance_manifest(
-                resolve_current_run_dir(args.run_artifact_dir) / "run_manifest.json"
-            )
+            with patch(
+                "src.app_manifest.load_scientific_protocol",
+                return_value=protocol,
+            ):
+                payload = load_run_provenance_manifest(
+                    resolve_current_run_dir(args.run_artifact_dir) / "run_manifest.json"
+                )
             self.assertEqual(
                 payload["run_config"],
                 {
