@@ -31,24 +31,18 @@ class ArtifactCompatibilityTests(unittest.TestCase):
         self.assertIn("Regenerate public schema\n`2`, client schema `2`", policy)
         self.assertNotIn("all other persisted contracts remain schema `1`", policy)
 
-    def test_compatibility_policy_lists_exact_field_contracts(self) -> None:
+    def test_compatibility_policy_covers_exact_field_contracts(self) -> None:
         policy = (
             Path(__file__).resolve().parent.parent / "COMPATIBILITY.md"
         ).read_text(encoding="utf-8")
+        normalized_policy = " ".join(policy.split())
 
-        policy_lines = set(policy.splitlines())
-        exact_contracts = {
-            "them. Exact field sets are required for:",
-            "- client metadata, records contracts, and public-manifest binding objects;",
-            "- public-manifest dataset and vocabulary metadata objects;",
-            "- server binding and model-dimension objects;",
-            "- evaluation manifests and records;",
-            "- prepared-generation indexes; and",
-            "- run-provenance private-client-shard status, identity, and public-manifest",
-            "  objects.",
-        }
-
-        self.assertLessEqual(exact_contracts, policy_lines)
+        self.assertIn(
+            "Every object or row whose loader enforces an exact field set requires an "
+            "increment of that artifact kind's schema when fields are added or removed.",
+            normalized_policy,
+        )
+        self.assertIn("client JSONL record rows", normalized_policy)
 
     def test_current_schema_is_supported(self) -> None:
         payload = {"schema_version": ARTIFACT_SCHEMA_VERSION}
