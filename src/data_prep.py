@@ -2419,7 +2419,7 @@ def prepare_all(
         _validated_frameworks()
         dataset = load_verified_imdb_dataset()
         train = dataset["train"]
-        texts = np.asarray(train["text"])
+        texts = np.asarray(train["text"], dtype=object)
         labels = np.asarray(train["label"], dtype="int32")
         vectorizer = build_vectorizer(texts)
         protocol = load_scientific_protocol()

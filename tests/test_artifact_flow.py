@@ -764,6 +764,35 @@ def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> No
 
 
 class ArtifactFlowTests(unittest.TestCase):
+    def test_preparation_keeps_variable_length_texts_in_an_object_array(self) -> None:
+        reviews = ["brief review", "x" * 55_000]
+
+        def inspect_text_array(texts: np.ndarray) -> None:
+            self.assertEqual(texts.dtype, np.dtype(object))
+            self.assertEqual(texts.tolist(), reviews)
+            raise RuntimeError("text array inspected")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with (
+                patch("src.data_prep._validated_frameworks"),
+                patch(
+                    "src.data_prep.load_verified_imdb_dataset",
+                    return_value={
+                        "train": {"text": reviews, "label": [0, 1]},
+                        "test": [],
+                    },
+                ),
+                patch("src.data_prep.build_vectorizer", side_effect=inspect_text_array),
+                self.assertRaisesRegex(RuntimeError, "text array inspected"),
+            ):
+                prepare_all(
+                    1,
+                    root / "client",
+                    root / "public",
+                    root / "evaluation",
+                )
+
     def test_preparation_recovers_only_state_bound_stage_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             generations = Path(tmpdir) / ".prepared-generations"
