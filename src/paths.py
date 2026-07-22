@@ -5,7 +5,7 @@ import os
 import stat
 import uuid
 from pathlib import Path
-from typing import Any, BinaryIO, Mapping
+from typing import Any, BinaryIO, Callable, Mapping
 
 from src.artifact_compatibility import (
     canonical_json_bytes,
@@ -170,12 +170,45 @@ def validate_preparation_request(value: object) -> dict[str, int]:
 
 
 class RunArtifactLock:
-    """Hold an operating-system lock for one server artifact directory."""
+    """Hold an operating-system lock for one artifact namespace.
 
-    def __init__(self, path: Path, file: BinaryIO) -> None:
+    Parameters
+    ----------
+    path : pathlib.Path
+        Diagnostic path representing the locked namespace.
+    file : BinaryIO or int
+        Locked file object or retained directory descriptor owned by this instance.
+    verify : callable or None, optional
+        Complete retained-owner verification callback.
+    close_owner : callable or None, optional
+        Callback closing any retained owner chain after unlock.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        file: BinaryIO | int,
+        *,
+        verify: Callable[[], None] | None = None,
+        close_owner: Callable[[], None] | None = None,
+    ) -> None:
         self.path = path
         self._file = file
+        self._verify = verify
+        self._close_owner = close_owner
         self._released = False
+
+    def verify(self) -> None:
+        """Verify the retained lock owner remains visibly selected.
+
+        Returns
+        -------
+        None
+        """
+        if self._released:
+            raise ValueError("artifact lock has been released")
+        if self._verify is not None:
+            self._verify()
 
     def release(self) -> None:
         """Release the artifact lock.
@@ -186,19 +219,32 @@ class RunArtifactLock:
         """
         if self._released:
             return
-        if os.name == "nt":
-            import msvcrt
+        descriptor = self._file if isinstance(self._file, int) else self._file.fileno()
+        try:
+            if os.name == "nt":
+                import msvcrt
 
-            self._file.seek(0)
-            locking = msvcrt.locking  # type: ignore[attr-defined]
-            unlock_mode = msvcrt.LK_UNLCK  # type: ignore[attr-defined]
-            locking(self._file.fileno(), unlock_mode, 1)
-        else:
-            import fcntl
+                assert not isinstance(self._file, int)
+                self._file.seek(0)
+                locking = msvcrt.locking  # type: ignore[attr-defined]
+                unlock_mode = msvcrt.LK_UNLCK  # type: ignore[attr-defined]
+                locking(descriptor, unlock_mode, 1)
+            else:
+                import fcntl
 
-            fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
-        self._file.close()
-        self._released = True
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            try:
+                if isinstance(self._file, int):
+                    os.close(self._file)
+                else:
+                    self._file.close()
+            finally:
+                try:
+                    if self._close_owner is not None:
+                        self._close_owner()
+                finally:
+                    self._released = True
 
 
 def resolve_dir(value: str | Path) -> Path:

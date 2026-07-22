@@ -821,6 +821,81 @@ class ArtifactFlowTests(unittest.TestCase):
             self.assertEqual(marker.read_bytes(), b"unbound")
             self.assertEqual(state.read_bytes(), b'{"schema_version":1}\n')
 
+    def test_preparation_state_retry_selects_newest_committed_generation(self) -> None:
+        """Recover a deletion transition with its stale predecessor retained."""
+        from src import data_prep
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generations = Path(tmpdir) / ".prepared-generations"
+            generations.mkdir()
+            with RetainedDirectoryChain.open(
+                generations, check_platform=False
+            ) as chain:
+                parent = chain.directory.descriptor
+                parent_stat = os.fstat(parent)
+                nonce = "1" * 32
+                stage_name = f".prepare-{nonce}.staging"
+                reserved = data_prep._PreparationStageState(
+                    "reserved",
+                    parent_stat.st_dev,
+                    parent_stat.st_ino,
+                    nonce,
+                    stage_name,
+                )
+                reserved_record = data_prep._write_preparation_stage_state(
+                    chain, reserved, None
+                )
+                os.mkdir(stage_name, dir_fd=parent)
+                stage_descriptor = chain.open_child(
+                    stage_name, os.O_RDONLY | os.O_DIRECTORY
+                )
+                stage_stat = os.fstat(stage_descriptor)
+                os.close(stage_descriptor)
+                build = data_prep._PreparationStageState(
+                    "build",
+                    parent_stat.st_dev,
+                    parent_stat.st_ino,
+                    nonce,
+                    stage_name,
+                    stage_stat.st_dev,
+                    stage_stat.st_ino,
+                )
+                build_record = data_prep._write_preparation_stage_state(
+                    chain, build, reserved_record
+                )
+                tombstone = f".{stage_name}.{stage_stat.st_dev:x}-{stage_stat.st_ino:x}.deleting"
+                deleting = data_prep._PreparationStageState(
+                    "delete",
+                    parent_stat.st_dev,
+                    parent_stat.st_ino,
+                    nonce,
+                    stage_name,
+                    stage_stat.st_dev,
+                    stage_stat.st_ino,
+                    tombstone,
+                )
+                real_unlink = os.unlink
+
+                def fail_predecessor(name, *arguments, **kwargs):
+                    if name == build_record.name:
+                        raise OSError("injected predecessor unlink failure")
+                    return real_unlink(name, *arguments, **kwargs)
+
+                with (
+                    patch.object(data_prep.os, "unlink", side_effect=fail_predecessor),
+                    self.assertRaisesRegex(OSError, "injected"),
+                ):
+                    data_prep._write_preparation_stage_state(
+                        chain, deleting, build_record
+                    )
+
+                self.assertEqual(
+                    data_prep._read_preparation_state_at(parent).state, deleting
+                )
+                _recover_preparation_stage(chain)
+                self.assertFalse((generations / stage_name).exists())
+                self.assertIsNone(data_prep._read_preparation_state_at(parent))
+
     def test_recovery_accepts_equal_content_with_distinct_split_identities(
         self,
     ) -> None:
@@ -2702,6 +2777,10 @@ class ArtifactFlowTests(unittest.TestCase):
             }
             lock = _acquire_preparation_lock(roots)
             try:
+                visible = root / ".fml-prepare.lock"
+                visible.write_bytes(b"unowned")
+                visible.rename(root / ".fml-prepare.lock.replaced")
+                visible.write_bytes(b"replacement")
                 alternate_roots = {
                     "client": root / "other-clients",
                     "public": root / "other-public",
@@ -2735,6 +2814,53 @@ class ArtifactFlowTests(unittest.TestCase):
                     independent_lock.release()
             finally:
                 lock.release()
+
+    def test_preparation_lock_prevents_cross_process_split_lock(self) -> None:
+        """Keep a second process out after visible lock-name replacement."""
+        script = """
+import sys
+from pathlib import Path
+from src.data_prep import _acquire_preparation_lock
+
+root = Path(sys.argv[1])
+roots = {
+    "client": root / "clients",
+    "public": root / "public",
+    "evaluation": root / "evaluation",
+}
+lock = _acquire_preparation_lock(roots)
+print("locked", flush=True)
+sys.stdin.readline()
+lock.release()
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            process = subprocess.Popen(
+                [sys.executable, "-c", script, str(root)],
+                cwd=Path.cwd(),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                assert process.stdout is not None
+                self.assertEqual(process.stdout.readline().strip(), "locked")
+                visible = root / ".fml-prepare.lock"
+                visible.write_bytes(b"replacement")
+                roots = {
+                    "client": root / "clients",
+                    "public": root / "public",
+                    "evaluation": root / "evaluation",
+                }
+                with self.assertRaisesRegex(RuntimeError, "already in progress"):
+                    _acquire_preparation_lock(roots)
+            finally:
+                assert process.stdin is not None
+                process.stdin.write("release\n")
+                process.stdin.flush()
+                _, stderr = process.communicate(timeout=10)
+            self.assertEqual(process.returncode, 0, stderr)
 
 
 if __name__ == "__main__":

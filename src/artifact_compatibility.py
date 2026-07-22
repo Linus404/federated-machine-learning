@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import hmac
 import json
@@ -50,6 +52,180 @@ _SERVER_BINDING_FIELDS = {
     "model_dimensions",
 }
 _MODEL_DIMENSION_FIELDS = {"vocabulary_size", "sequence_length", "embedding_dim"}
+_AT_EMPTY_PATH = 0x1000
+_RENAME_NOREPLACE = 1
+_RENAME_EXCHANGE = 2
+
+
+def _libc_call(name: str, *arguments: object) -> None:
+    """Call one required Linux descriptor-relative filesystem primitive.
+
+    Parameters
+    ----------
+    name : str
+        Exported libc function name.
+    *arguments : object
+        Native arguments accepted by the requested function.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    RuntimeError
+        If libc or the filesystem lacks the required primitive.
+    OSError
+        If the primitive fails for an operation-specific reason.
+    """
+    try:
+        function = getattr(ctypes.CDLL(None, use_errno=True), name)
+    except AttributeError as error:
+        raise RuntimeError(f"Linux {name} support is required") from error
+    if function(*arguments) == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP}:
+        raise RuntimeError(f"Linux {name} support is required")
+    raise OSError(error_number, os.strerror(error_number))
+
+
+def rename_noreplace_at(
+    source_descriptor: int,
+    source_name: str,
+    destination_descriptor: int,
+    destination_name: str,
+) -> None:
+    """Atomically rename one entry only when the destination is absent.
+
+    Parameters
+    ----------
+    source_descriptor : int
+        Retained source-directory descriptor.
+    source_name : str
+        Direct source child name.
+    destination_descriptor : int
+        Retained destination-directory descriptor.
+    destination_name : str
+        Direct destination child name.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    FileExistsError
+        If any entry already owns the destination name.
+    RuntimeError
+        If ``renameat2(RENAME_NOREPLACE)`` is unavailable.
+    OSError
+        If the atomic rename otherwise fails.
+    """
+    RetainedDirectoryChain._require_child_name(source_name)
+    RetainedDirectoryChain._require_child_name(destination_name)
+    try:
+        _libc_call(
+            "renameat2",
+            source_descriptor,
+            os.fsencode(source_name),
+            destination_descriptor,
+            os.fsencode(destination_name),
+            _RENAME_NOREPLACE,
+        )
+    except OSError as error:
+        if error.errno in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise FileExistsError(
+                error.errno, error.strerror, destination_name
+            ) from error
+        raise
+
+
+def rename_exchange_at(
+    first_descriptor: int,
+    first_name: str,
+    second_descriptor: int,
+    second_name: str,
+) -> None:
+    """Atomically exchange two descriptor-relative entries.
+
+    Parameters
+    ----------
+    first_descriptor : int
+        Retained directory descriptor owning the first entry.
+    first_name : str
+        Direct first child name.
+    second_descriptor : int
+        Retained directory descriptor owning the second entry.
+    second_name : str
+        Direct second child name.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    RuntimeError
+        If ``renameat2(RENAME_EXCHANGE)`` is unavailable.
+    OSError
+        If the atomic exchange otherwise fails.
+    """
+    RetainedDirectoryChain._require_child_name(first_name)
+    RetainedDirectoryChain._require_child_name(second_name)
+    _libc_call(
+        "renameat2",
+        first_descriptor,
+        os.fsencode(first_name),
+        second_descriptor,
+        os.fsencode(second_name),
+        _RENAME_EXCHANGE,
+    )
+
+
+def link_unnamed_file_at(
+    source_descriptor: int, destination_descriptor: int, destination_name: str
+) -> None:
+    """Link one fully written unnamed file into a retained directory.
+
+    Parameters
+    ----------
+    source_descriptor : int
+        Open ``O_TMPFILE`` descriptor.
+    destination_descriptor : int
+        Retained destination-directory descriptor.
+    destination_name : str
+        Absent direct child name to install.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    FileExistsError
+        If the destination already exists.
+    RuntimeError
+        If ``linkat(AT_EMPTY_PATH)`` is unavailable.
+    OSError
+        If the link otherwise fails.
+    """
+    RetainedDirectoryChain._require_child_name(destination_name)
+    try:
+        _libc_call(
+            "linkat",
+            source_descriptor,
+            b"",
+            destination_descriptor,
+            os.fsencode(destination_name),
+            _AT_EMPTY_PATH,
+        )
+    except OSError as error:
+        if error.errno == errno.EEXIST:
+            raise FileExistsError(
+                error.errno, error.strerror, destination_name
+            ) from error
+        raise
 
 
 @dataclass(frozen=True)

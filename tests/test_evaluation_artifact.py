@@ -287,6 +287,7 @@ os._exit(72)
             parked = replaced_path.parent / f"parked-{replaced_component}"
             parent_identity = (parent.stat().st_dev, parent.stat().st_ino)
             real_rename = os.rename
+            real_rename_noreplace = evaluation_artifact.rename_noreplace_at
             real_fsync = os.fsync
             real_inventory = evaluation_artifact._verify_evaluation_inventory
             replaced = False
@@ -301,15 +302,30 @@ os._exit(72)
                 parent.mkdir(parents=True)
                 (replaced_path / "unrelated").write_bytes(b"replacement")
 
-            def replace_around_rename(source, destination, **kwargs):
+            def replace_around_rename(
+                source_descriptor,
+                source,
+                destination_descriptor,
+                destination,
+            ):
                 if destination == "evaluation":
                     if boundary == "before rename":
                         replace_ancestor()
-                    result = real_rename(source, destination, **kwargs)
+                    result = real_rename_noreplace(
+                        source_descriptor,
+                        source,
+                        destination_descriptor,
+                        destination,
+                    )
                     if boundary == "after rename":
                         replace_ancestor()
                     return result
-                return real_rename(source, destination, **kwargs)
+                return real_rename_noreplace(
+                    source_descriptor,
+                    source,
+                    destination_descriptor,
+                    destination,
+                )
 
             def replace_during_fsync(descriptor):
                 result = real_fsync(descriptor)
@@ -337,8 +353,8 @@ os._exit(72)
                     return_value=None,
                 ),
                 patch.object(
-                    evaluation_artifact.os,
-                    "rename",
+                    evaluation_artifact,
+                    "rename_noreplace_at",
                     side_effect=replace_around_rename,
                 ),
                 patch.object(
@@ -458,11 +474,22 @@ os._exit(72)
                 output = root / "evaluation"
                 parked = root / "parked-owned-staging"
                 real_rename = os.rename
+                real_rename_noreplace = evaluation_artifact.rename_noreplace_at
 
-                def substitute(source, destination, **kwargs):
+                def substitute(
+                    source_descriptor,
+                    source,
+                    destination_descriptor,
+                    destination,
+                ):
                     source_path = root / str(source)
                     if destination == "evaluation" and str(source).endswith(".staging"):
-                        real_rename(source, parked.name, **kwargs)
+                        real_rename(
+                            source,
+                            parked.name,
+                            src_dir_fd=source_descriptor,
+                            dst_dir_fd=source_descriptor,
+                        )
                         if entry_type == "valid directory":
                             import shutil
 
@@ -473,8 +500,18 @@ os._exit(72)
                             source_path.symlink_to("missing")
                         else:
                             source_path.mkdir()
-                        return real_rename(source, destination, **kwargs)
-                    return real_rename(source, destination, **kwargs)
+                        return real_rename_noreplace(
+                            source_descriptor,
+                            source,
+                            destination_descriptor,
+                            destination,
+                        )
+                    return real_rename_noreplace(
+                        source_descriptor,
+                        source,
+                        destination_descriptor,
+                        destination,
+                    )
 
                 with (
                     patch.object(
@@ -483,7 +520,9 @@ os._exit(72)
                         return_value=None,
                     ),
                     patch.object(
-                        evaluation_artifact.os, "rename", side_effect=substitute
+                        evaluation_artifact,
+                        "rename_noreplace_at",
+                        side_effect=substitute,
                     ),
                     self.assertRaisesRegex(ValueError, "destination changed"),
                 ):
@@ -604,6 +643,140 @@ os._exit(72)
             with self.assertRaisesRegex(FileExistsError, "refusing replacement"):
                 publish_evaluation_artifact(self.rows, symlink, protocol=self.protocol)
 
+    def test_publication_preserves_late_destination_collisions(self) -> None:
+        """Use atomic no-replace for every destination entry type."""
+        from src import evaluation_artifact
+
+        for entry_type in ("file", "directory", "symlink"):
+            with (
+                self.subTest(entry_type=entry_type),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                output = root / "evaluation"
+                real_rename = evaluation_artifact.rename_noreplace_at
+
+                def collide(*arguments):
+                    if entry_type == "file":
+                        output.write_bytes(b"late file")
+                    elif entry_type == "directory":
+                        output.mkdir()
+                    else:
+                        output.symlink_to("late-target")
+                    return real_rename(*arguments)
+
+                with (
+                    patch.object(
+                        evaluation_artifact,
+                        "rename_noreplace_at",
+                        side_effect=collide,
+                    ),
+                    self.assertRaises(FileExistsError),
+                ):
+                    publish_evaluation_artifact(
+                        self.rows, output, protocol=self.protocol
+                    )
+
+                if entry_type == "file":
+                    self.assertEqual(output.read_bytes(), b"late file")
+                elif entry_type == "directory":
+                    self.assertEqual(list(output.iterdir()), [])
+                else:
+                    self.assertEqual(os.readlink(output), "late-target")
+
+    def test_publication_fails_closed_without_renameat2(self) -> None:
+        """Leave no public output when atomic no-replace is unavailable."""
+        from src import evaluation_artifact
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "evaluation"
+            with (
+                patch.object(
+                    evaluation_artifact,
+                    "rename_noreplace_at",
+                    side_effect=RuntimeError("renameat2 unavailable"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "renameat2 unavailable"),
+            ):
+                publish_evaluation_artifact(self.rows, output, protocol=self.protocol)
+            self.assertFalse(output.exists())
+            self.assertEqual(
+                publish_evaluation_artifact(self.rows, output, protocol=self.protocol),
+                output,
+            )
+
+    def test_evaluation_lock_survives_visible_lock_name_replacement(self) -> None:
+        """Lock the retained namespace owner rather than a replaceable child."""
+        from src import evaluation_artifact
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "evaluation"
+            first_parent, name = evaluation_artifact._open_new_artifact_parent(output)
+            with first_parent.chain:
+                first = evaluation_artifact._acquire_evaluation_lock(
+                    first_parent.descriptor, name
+                )
+                visible = Path(tmpdir) / ".evaluation.run.lock"
+                visible.write_bytes(b"unowned")
+                visible.rename(Path(tmpdir) / ".evaluation.run.lock.replaced")
+                visible.write_bytes(b"replacement")
+                second_parent, second_name = (
+                    evaluation_artifact._open_new_artifact_parent(output)
+                )
+                with second_parent.chain:
+                    with self.assertRaisesRegex(RuntimeError, "already in progress"):
+                        evaluation_artifact._acquire_evaluation_lock(
+                            second_parent.descriptor, second_name
+                        )
+                first.release()
+                replacement = evaluation_artifact._acquire_evaluation_lock(
+                    first_parent.descriptor, name
+                )
+                replacement.release()
+
+    def test_evaluation_lock_prevents_cross_process_split_lock(self) -> None:
+        """Keep a second process out after visible lock-name replacement."""
+        from src import evaluation_artifact
+
+        script = """
+import sys
+from src import evaluation_artifact
+
+parent, name = evaluation_artifact._open_new_artifact_parent(sys.argv[1])
+with parent.chain:
+    lock = evaluation_artifact._acquire_evaluation_lock(parent.descriptor, name)
+    print("locked", flush=True)
+    sys.stdin.readline()
+    lock.release()
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "evaluation"
+            process = subprocess.Popen(
+                [sys.executable, "-c", script, str(output)],
+                cwd=Path.cwd(),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                assert process.stdout is not None
+                self.assertEqual(process.stdout.readline().strip(), "locked")
+                visible = Path(tmpdir) / ".evaluation.run.lock"
+                visible.write_bytes(b"replacement")
+                parent, name = evaluation_artifact._open_new_artifact_parent(output)
+                with parent.chain:
+                    with self.assertRaisesRegex(RuntimeError, "already in progress"):
+                        evaluation_artifact._acquire_evaluation_lock(
+                            parent.descriptor, name
+                        )
+            finally:
+                assert process.stdin is not None
+                process.stdin.write("release\n")
+                process.stdin.flush()
+                _, stderr = process.communicate(timeout=10)
+            self.assertEqual(process.returncode, 0, stderr)
+
     def test_publication_preserves_unbound_crash_residue(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -656,6 +829,154 @@ os._exit(72)
             self.assertFalse(stage.exists())
             self.assertFalse(state_path.exists())
             self.assertEqual((unbound / "partial").read_bytes(), b"unbound")
+
+    def test_ownership_transition_retains_a_recoverable_generation(self) -> None:
+        """Recover across every successor commit and predecessor retire boundary."""
+        from src import evaluation_artifact
+
+        for boundary in (
+            "write",
+            "file fsync",
+            "link",
+            "owner fsync",
+            "unlink predecessor",
+            "retirement fsync",
+        ):
+            with (
+                self.subTest(boundary=boundary),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                output = Path(tmpdir) / "evaluation"
+                parent, output_name = evaluation_artifact._open_new_artifact_parent(
+                    output
+                )
+                with parent.chain:
+                    parent_stat = os.fstat(parent.descriptor)
+                    nonce = "1" * 32
+                    stage_name = f".evaluation.{nonce}.staging"
+                    reserved = evaluation_artifact._EvaluationOwnershipState(
+                        "reserved",
+                        parent_stat.st_dev,
+                        parent_stat.st_ino,
+                        output_name,
+                        nonce,
+                        stage_name,
+                    )
+                    reserved_record = evaluation_artifact._write_evaluation_state(
+                        parent, reserved, None
+                    )
+                    os.mkdir(stage_name, dir_fd=parent.descriptor)
+                    stage_descriptor = parent.chain.open_child(
+                        stage_name, os.O_RDONLY | os.O_DIRECTORY
+                    )
+                    stage_stat = os.fstat(stage_descriptor)
+                    os.close(stage_descriptor)
+                    build = evaluation_artifact._EvaluationOwnershipState(
+                        "build",
+                        parent_stat.st_dev,
+                        parent_stat.st_ino,
+                        output_name,
+                        nonce,
+                        stage_name,
+                        stage_stat.st_dev,
+                        stage_stat.st_ino,
+                    )
+                    build_record = evaluation_artifact._write_evaluation_state(
+                        parent, build, reserved_record
+                    )
+                    install = evaluation_artifact._EvaluationOwnershipState(
+                        "install",
+                        parent_stat.st_dev,
+                        parent_stat.st_ino,
+                        output_name,
+                        nonce,
+                        stage_name,
+                        stage_stat.st_dev,
+                        stage_stat.st_ino,
+                        stage_name,
+                    )
+                    real_write = os.write
+                    real_fsync = os.fsync
+                    real_link = evaluation_artifact.link_unnamed_file_at
+                    real_unlink = os.unlink
+                    failed = False
+                    owner_syncs = 0
+
+                    def fail_write(descriptor, content):
+                        nonlocal failed
+                        if boundary == "write" and not failed:
+                            failed = True
+                            raise OSError("injected state write failure")
+                        return real_write(descriptor, content)
+
+                    def fail_fsync(descriptor):
+                        nonlocal failed, owner_syncs
+                        if descriptor == parent.descriptor:
+                            owner_syncs += 1
+                            should_fail = (
+                                boundary == "owner fsync" and owner_syncs == 1
+                            ) or (boundary == "retirement fsync" and owner_syncs == 2)
+                        else:
+                            should_fail = boundary == "file fsync"
+                        if should_fail and not failed:
+                            failed = True
+                            raise OSError("injected state fsync failure")
+                        return real_fsync(descriptor)
+
+                    def fail_link(*arguments):
+                        nonlocal failed
+                        if boundary == "link" and not failed:
+                            failed = True
+                            raise OSError("injected state link failure")
+                        return real_link(*arguments)
+
+                    def fail_unlink(name, *arguments, **kwargs):
+                        nonlocal failed
+                        if (
+                            boundary == "unlink predecessor"
+                            and name == build_record.name
+                            and not failed
+                        ):
+                            failed = True
+                            raise OSError("injected predecessor unlink failure")
+                        return real_unlink(name, *arguments, **kwargs)
+
+                    with (
+                        patch.object(
+                            evaluation_artifact.os, "write", side_effect=fail_write
+                        ),
+                        patch.object(
+                            evaluation_artifact.os, "fsync", side_effect=fail_fsync
+                        ),
+                        patch.object(
+                            evaluation_artifact,
+                            "link_unnamed_file_at",
+                            side_effect=fail_link,
+                        ),
+                        patch.object(
+                            evaluation_artifact.os,
+                            "unlink",
+                            side_effect=fail_unlink,
+                        ),
+                        self.assertRaisesRegex(OSError, "injected"),
+                    ):
+                        evaluation_artifact._write_evaluation_state(
+                            parent, install, build_record
+                        )
+
+                    self.assertIsNotNone(
+                        evaluation_artifact._load_evaluation_state(
+                            parent.descriptor, output_name
+                        )
+                    )
+                    evaluation_artifact._recover_evaluation_state(parent, output_name)
+                    self.assertFalse(Path(tmpdir, stage_name).exists())
+                    self.assertFalse(
+                        any(
+                            name.startswith(".evaluation.publication.state")
+                            for name in os.listdir(parent.descriptor)
+                        )
+                    )
 
     def test_publication_rejects_corrupt_state_and_preserves_residues(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

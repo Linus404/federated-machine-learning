@@ -1933,6 +1933,7 @@ class ArtifactHistoryTests(unittest.TestCase):
                 real_fchmod = os.fchmod
                 real_fsync = os.fsync
                 real_rename = os.rename
+                real_exchange = artifact_history.rename_exchange_at
                 sync_files_calls = 0
 
                 def is_pointer_temporary(descriptor: int) -> bool:
@@ -1981,6 +1982,11 @@ class ArtifactHistoryTests(unittest.TestCase):
                         raise OSError("injected pointer-rename failure")
                     return real_rename(source, destination, **kwargs)
 
+                def fail_exchange(*arguments):
+                    if failure == "pointer rename" and arguments[3] == "current.json":
+                        raise OSError("injected pointer-rename failure")
+                    return real_exchange(*arguments)
+
                 with (
                     patch.object(
                         artifact_history,
@@ -2007,6 +2013,11 @@ class ArtifactHistoryTests(unittest.TestCase):
                     patch.object(os, "fchmod", side_effect=fail_fchmod),
                     patch.object(os, "fsync", side_effect=fail_fsync),
                     patch.object(os, "rename", side_effect=fail_rename),
+                    patch.object(
+                        artifact_history,
+                        "rename_exchange_at",
+                        side_effect=fail_exchange,
+                    ),
                     self.assertRaisesRegex(OSError, "injected"),
                 ):
                     publish_completed_run(root, candidate)
@@ -2132,6 +2143,7 @@ with patch("src.app_manifest.load_scientific_protocol", return_value=_TEST_PROTO
                     real_fchmod = os.fchmod
                     real_fsync = os.fsync
                     real_rename = os.rename
+                    real_exchange = artifact_history.rename_exchange_at
 
                     def fail_write(descriptor, content):
                         if failure == "write":
@@ -2159,6 +2171,11 @@ with patch("src.app_manifest.load_scientific_protocol", return_value=_TEST_PROTO
                             raise OSError("injected state-rename failure")
                         return real_rename(source, destination, **kwargs)
 
+                    def fail_exchange(*arguments):
+                        if failure == "rename":
+                            raise OSError("injected state-rename failure")
+                        return real_exchange(*arguments)
+
                     with (
                         patch.object(
                             artifact_history, "_write_all", side_effect=fail_write
@@ -2166,6 +2183,11 @@ with patch("src.app_manifest.load_scientific_protocol", return_value=_TEST_PROTO
                         patch.object(os, "fchmod", side_effect=fail_fchmod),
                         patch.object(os, "fsync", side_effect=fail_fsync),
                         patch.object(os, "rename", side_effect=fail_rename),
+                        patch.object(
+                            artifact_history,
+                            "rename_exchange_at",
+                            side_effect=fail_exchange,
+                        ),
                         self.assertRaisesRegex(OSError, "injected"),
                     ):
                         artifact_history._record_finalization_state(
@@ -2276,7 +2298,10 @@ with patch("src.app_manifest.load_scientific_protocol", return_value=_TEST_PROTO
                         side_effect=(collision_id, success_id),
                     ):
                         artifact_history._replace_bytes_at(
-                            descriptor, "target", b"replacement"
+                            descriptor,
+                            "target",
+                            b"replacement",
+                            expected=None,
                         )
                 finally:
                     os.close(descriptor)
@@ -2296,7 +2321,10 @@ with patch("src.app_manifest.load_scientific_protocol", return_value=_TEST_PROTO
                     self.assertRaises(FileExistsError),
                 ):
                     artifact_history._replace_bytes_at(
-                        descriptor, "target", b"replacement"
+                        descriptor,
+                        "target",
+                        b"replacement",
+                        expected=None,
                     )
             finally:
                 os.close(descriptor)
@@ -2316,11 +2344,22 @@ with patch("src.app_manifest.load_scientific_protocol", return_value=_TEST_PROTO
                 parked = root / "parked-owned-temp"
                 descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
                 real_rename = os.rename
+                real_rename_noreplace = artifact_history.rename_noreplace_at
 
-                def substitute(source, destination, **kwargs):
+                def substitute(
+                    source_descriptor,
+                    source,
+                    destination_descriptor,
+                    destination,
+                ):
                     source_path = root / str(source)
                     if destination == "target":
-                        real_rename(source, parked.name, **kwargs)
+                        real_rename(
+                            source,
+                            parked.name,
+                            src_dir_fd=source_descriptor,
+                            dst_dir_fd=source_descriptor,
+                        )
                         if entry_type == "valid file":
                             source_path.write_bytes(b"prior pointer")
                         elif entry_type == "file":
@@ -2329,15 +2368,27 @@ with patch("src.app_manifest.load_scientific_protocol", return_value=_TEST_PROTO
                             source_path.symlink_to("missing")
                         else:
                             source_path.mkdir()
-                    return real_rename(source, destination, **kwargs)
+                    return real_rename_noreplace(
+                        source_descriptor,
+                        source,
+                        destination_descriptor,
+                        destination,
+                    )
 
                 try:
                     with (
-                        patch.object(os, "rename", side_effect=substitute),
+                        patch.object(
+                            artifact_history,
+                            "rename_noreplace_at",
+                            side_effect=substitute,
+                        ),
                         self.assertRaises(ValueError),
                     ):
                         artifact_history._replace_bytes_at(
-                            descriptor, "target", b"candidate"
+                            descriptor,
+                            "target",
+                            b"candidate",
+                            expected=None,
                         )
                 finally:
                     os.close(descriptor)
@@ -2352,6 +2403,91 @@ with patch("src.app_manifest.load_scientific_protocol", return_value=_TEST_PROTO
                     self.assertTrue(target.is_symlink())
                 else:
                     self.assertTrue(target.is_dir())
+
+    def test_replace_bytes_preserves_late_unexpected_targets(self) -> None:
+        """Restore any entry atomically displaced after expected-state capture."""
+        from src import artifact_history
+
+        for entry_type in ("file", "symlink", "hardlink"):
+            with (
+                self.subTest(entry_type=entry_type),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                target = root / "target"
+                parked = root / "expected-parked"
+                target.write_bytes(b"expected")
+                descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+                real_exchange = artifact_history.rename_exchange_at
+                substituted = False
+
+                def substitute(*arguments):
+                    nonlocal substituted
+                    if substituted:
+                        return real_exchange(*arguments)
+                    substituted = True
+                    target.rename(parked)
+                    if entry_type == "file":
+                        target.write_bytes(b"unexpected")
+                    elif entry_type == "symlink":
+                        target.symlink_to("unexpected-target")
+                    else:
+                        source = root / "unexpected-source"
+                        source.write_bytes(b"unexpected")
+                        os.link(source, target)
+                    return real_exchange(*arguments)
+
+                try:
+                    with (
+                        patch.object(
+                            artifact_history,
+                            "rename_exchange_at",
+                            side_effect=substitute,
+                        ),
+                        self.assertRaises(ValueError),
+                    ):
+                        artifact_history._replace_bytes_at(
+                            descriptor,
+                            "target",
+                            b"candidate",
+                            expected=b"expected",
+                        )
+                finally:
+                    os.close(descriptor)
+
+                self.assertEqual(parked.read_bytes(), b"expected")
+                if entry_type == "symlink":
+                    self.assertEqual(os.readlink(target), "unexpected-target")
+                else:
+                    self.assertEqual(target.read_bytes(), b"unexpected")
+
+    def test_replace_bytes_fails_closed_without_renameat2(self) -> None:
+        """Keep the exact prior target when atomic exchange is unavailable."""
+        from src import artifact_history
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            target = root / "target"
+            target.write_bytes(b"expected")
+            descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with (
+                    patch.object(
+                        artifact_history,
+                        "rename_exchange_at",
+                        side_effect=RuntimeError("renameat2 unavailable"),
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "renameat2 unavailable"),
+                ):
+                    artifact_history._replace_bytes_at(
+                        descriptor,
+                        "target",
+                        b"candidate",
+                        expected=b"expected",
+                    )
+            finally:
+                os.close(descriptor)
+            self.assertEqual(target.read_bytes(), b"expected")
 
     def test_root_replacement_at_complete_transition_never_returns_success(
         self,

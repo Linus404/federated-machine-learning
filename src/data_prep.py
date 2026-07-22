@@ -26,6 +26,7 @@ from src.artifact_compatibility import (
     PUBLIC_ARTIFACT_SCHEMA_VERSION,
     RetainedDirectoryChain,
     canonical_json_bytes,
+    link_unnamed_file_at,
     read_regular_file,
     require_secure_artifact_platform,
     sha256_bytes,
@@ -75,8 +76,12 @@ _PREPARATION_STAGE_STATE_FIELDS = {
     "device",
     "inode",
     "tombstone_name",
+    "generation",
 }
-_STAGE_STATE_TEMPORARY_NAME_ATTEMPTS = 128
+_LEGACY_PREPARATION_STAGE_STATE_FIELDS = _PREPARATION_STAGE_STATE_FIELDS - {
+    "generation"
+}
+_STAGE_STATE_GENERATION_WIDTH = 20
 
 
 @dataclass(frozen=True)
@@ -111,6 +116,31 @@ class _PreparationStageState:
             "inode": self.inode,
             "tombstone_name": self.tombstone_name,
         }
+
+
+@dataclass(frozen=True)
+class _PreparationStateRecord:
+    """Retain one committed generation of preparation ownership state.
+
+    Parameters
+    ----------
+    state : _PreparationStageState
+        Parsed ownership transition.
+    document : bytes
+        Exact canonical state bytes.
+    identity : tuple of int
+        Device and inode of the committed record.
+    name : str
+        Descriptor-relative generation filename.
+    generation : int
+        Monotonic generation selected from the filename and document.
+    """
+
+    state: _PreparationStageState
+    document: bytes
+    identity: tuple[int, int]
+    name: str
+    generation: int
 
 
 def _validate_absolute_output_ancestors(
@@ -339,38 +369,37 @@ def _acquire_preparation_lock(roots: Mapping[str, Path]) -> RunArtifactLock:
     RuntimeError
         If another process is preparing the same roots.
     ValueError
-        If the lock path is not a single-link regular file.
+        If the retained lock-owner chain is unsafe or replaced.
     """
     lock_path = roots["client"].parent / PREPARATION_LOCK_FILENAME
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    chain = RetainedDirectoryChain.open(
+        lock_path.parent,
+        error_message="preparation lock owner changed",
+        check_platform=False,
+    )
+    descriptor = os.dup(chain.directory.descriptor)
     try:
-        descriptor = os.open(lock_path, flags, 0o600)
+        import fcntl
+
+        chain.verify()
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        chain.verify()
     except OSError as error:
-        raise ValueError("preparation lock path is unsafe") from error
-    file_stat = os.fstat(descriptor)
-    if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
         os.close(descriptor)
-        raise ValueError("preparation lock path is unsafe")
-    file = os.fdopen(descriptor, "a+b")
-    try:
-        if os.name == "nt":
-            import msvcrt
-
-            if file.seek(0, os.SEEK_END) == 0:
-                file.write(b"\0")
-                file.flush()
-            file.seek(0)
-            msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
-        else:
-            import fcntl
-
-            fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as error:
-        file.close()
+        chain.close()
         raise RuntimeError(
             "Another artifact preparation is already in progress"
         ) from error
-    return RunArtifactLock(lock_path, file)
+    except BaseException:
+        os.close(descriptor)
+        chain.close()
+        raise
+    return RunArtifactLock(
+        lock_path,
+        descriptor,
+        verify=chain.verify,
+        close_owner=chain.close,
+    )
 
 
 def _fsync_directory(path: Path) -> None:
@@ -415,29 +444,47 @@ def _fsync_directory_tree(root: Path) -> None:
         _fsync_directory(directory)
 
 
-def _read_preparation_state_at(
-    parent_descriptor: int,
-) -> tuple[bytes, tuple[int, int]] | None:
-    """Read the stable private preparation-stage state.
+def _preparation_state_name(generation: int) -> str:
+    """Return one sequence-numbered preparation-state name.
+
+    Parameters
+    ----------
+    generation : int
+        Nonnegative committed state generation.
+
+    Returns
+    -------
+    str
+        Descriptor-relative state filename.
+    """
+    return (
+        f"{_PREPARATION_STAGE_STATE_FILENAME}."
+        f"{generation:0{_STAGE_STATE_GENERATION_WIDTH}d}"
+    )
+
+
+def _read_preparation_record_at(
+    parent_descriptor: int, name: str
+) -> tuple[bytes, tuple[int, int]]:
+    """Read one stable private preparation-stage state generation.
 
     Parameters
     ----------
     parent_descriptor : int
         Retained prepared-generations descriptor.
+    name : str
+        Direct committed state-generation name.
 
     Returns
     -------
-    tuple of bytes and tuple of int or None
-        Exact state bytes and identity, or ``None`` when absent.
+    tuple of bytes and tuple of int
+        Exact state bytes and identity.
     """
-    try:
-        descriptor = os.open(
-            _PREPARATION_STAGE_STATE_FILENAME,
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-            dir_fd=parent_descriptor,
-        )
-    except FileNotFoundError:
-        return None
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+        dir_fd=parent_descriptor,
+    )
     try:
         before = os.fstat(descriptor)
         if (
@@ -462,7 +509,9 @@ def _read_preparation_state_at(
         os.close(descriptor)
 
 
-def _parse_preparation_stage_state(document: bytes) -> _PreparationStageState:
+def _parse_preparation_stage_state(
+    document: bytes,
+) -> tuple[_PreparationStageState, int]:
     """Validate one canonical preparation-stage ownership record.
 
     Parameters
@@ -472,13 +521,15 @@ def _parse_preparation_stage_state(document: bytes) -> _PreparationStageState:
 
     Returns
     -------
-    _PreparationStageState
-        Strict validated state.
+    tuple of _PreparationStageState and int
+        Strict validated state and committed generation.
     """
     payload = strict_json_loads(document, source="preparation stage state")
+    fields = set(payload) if isinstance(payload, dict) else set()
+    legacy = fields == _LEGACY_PREPARATION_STAGE_STATE_FIELDS
     if (
         not isinstance(payload, dict)
-        or set(payload) != _PREPARATION_STAGE_STATE_FIELDS
+        or (fields != _PREPARATION_STAGE_STATE_FIELDS and not legacy)
         or payload["schema_version"] != _PREPARATION_STAGE_STATE_SCHEMA_VERSION
         or canonical_json_bytes(payload) != document
         or payload["operation"] not in {"reserved", "build", "delete"}
@@ -490,6 +541,10 @@ def _parse_preparation_stage_state(document: bytes) -> _PreparationStageState:
         or len(payload["nonce"]) != 32
         or any(character not in "0123456789abcdef" for character in payload["nonce"])
         or payload["stage_name"] != f".prepare-{payload['nonce']}.staging"
+        or (
+            not legacy
+            and (type(payload["generation"]) is not int or payload["generation"] < 0)
+        )
     ):
         raise ValueError("preparation stage state is unsafe")
     operation = payload["operation"]
@@ -512,23 +567,101 @@ def _parse_preparation_stage_state(document: bytes) -> _PreparationStageState:
             )
     if not valid_phase:
         raise ValueError("preparation stage state is unsafe")
-    return _PreparationStageState(
-        operation,
-        payload["parent_device"],
-        payload["parent_inode"],
-        payload["nonce"],
-        payload["stage_name"],
-        device,
-        inode,
-        tombstone,
+    return (
+        _PreparationStageState(
+            operation,
+            payload["parent_device"],
+            payload["parent_inode"],
+            payload["nonce"],
+            payload["stage_name"],
+            device,
+            inode,
+            tombstone,
+        ),
+        0 if legacy else payload["generation"],
     )
+
+
+def _read_preparation_state_at(
+    parent_descriptor: int,
+) -> _PreparationStateRecord | None:
+    """Select the newest strictly valid preparation-state generation.
+
+    Parameters
+    ----------
+    parent_descriptor : int
+        Retained prepared-generations descriptor.
+
+    Returns
+    -------
+    _PreparationStateRecord or None
+        Newest committed generation, or ``None`` when absent.
+    """
+    prefix = f"{_PREPARATION_STAGE_STATE_FILENAME}."
+    records: list[_PreparationStateRecord] = []
+    for name in os.listdir(parent_descriptor):
+        if name == _PREPARATION_STAGE_STATE_FILENAME:
+            document, identity = _read_preparation_record_at(parent_descriptor, name)
+            state, generation = _parse_preparation_stage_state(document)
+            if generation != 0:
+                raise ValueError("preparation stage state is unsafe")
+            records.append(
+                _PreparationStateRecord(state, document, identity, name, generation)
+            )
+            continue
+        if not name.startswith(prefix):
+            continue
+        suffix = name[len(prefix) :]
+        if (
+            len(suffix) != _STAGE_STATE_GENERATION_WIDTH
+            or not suffix.isascii()
+            or not suffix.isdigit()
+        ):
+            raise ValueError("preparation stage state is unsafe")
+        document, identity = _read_preparation_record_at(parent_descriptor, name)
+        state, generation = _parse_preparation_stage_state(document)
+        if generation != int(suffix) or name != _preparation_state_name(generation):
+            raise ValueError("preparation stage state is unsafe")
+        records.append(
+            _PreparationStateRecord(state, document, identity, name, generation)
+        )
+    if not records:
+        return None
+    records.sort(key=lambda candidate: candidate.generation)
+    if len({candidate.generation for candidate in records}) != len(records):
+        raise ValueError("preparation stage state is ambiguous")
+    newest = records[-1]
+    lineage = (
+        newest.state.parent_device,
+        newest.state.parent_inode,
+        newest.state.nonce,
+        newest.state.stage_name,
+    )
+    if any(
+        (
+            candidate.state.parent_device,
+            candidate.state.parent_inode,
+            candidate.state.nonce,
+            candidate.state.stage_name,
+        )
+        != lineage
+        for candidate in records[:-1]
+    ):
+        raise ValueError("preparation stage state is ambiguous")
+    for candidate in records:
+        if _read_preparation_record_at(parent_descriptor, candidate.name) != (
+            candidate.document,
+            candidate.identity,
+        ):
+            raise ValueError("preparation stage state changed while retained")
+    return newest
 
 
 def _write_preparation_stage_state(
     chain: RetainedDirectoryChain,
     state: _PreparationStageState,
-    previous: tuple[bytes, tuple[int, int]] | None,
-) -> tuple[bytes, tuple[int, int]]:
+    previous: _PreparationStateRecord | None,
+) -> _PreparationStateRecord:
     """Install and durably flush one stage-ownership transition.
 
     Parameters
@@ -537,13 +670,13 @@ def _write_preparation_stage_state(
         Retained chain through the prepared-generations directory.
     state : _PreparationStageState
         New exact ownership state.
-    previous : tuple of bytes and identity or None
-        Exact prior bytes and identity, or ``None`` for exclusive creation.
+    previous : _PreparationStateRecord or None
+        Exact prior committed generation, or ``None`` for exclusive creation.
 
     Returns
     -------
-    tuple of bytes and tuple of int
-        Canonical installed bytes and state-file identity.
+    _PreparationStateRecord
+        Newly committed state generation.
     """
     chain.verify()
     parent_descriptor = chain.directory.descriptor
@@ -553,24 +686,22 @@ def _write_preparation_stage_state(
         state.parent_inode,
     ):
         raise ValueError("preparation stage state selects another parent")
-    document = canonical_json_bytes(state.payload())
-    descriptor: int | None = None
-    temporary = ""
-    for _ in range(_STAGE_STATE_TEMPORARY_NAME_ATTEMPTS):
-        candidate = f"..prepare-stage.{uuid.uuid4().hex}.tmp"
-        try:
-            descriptor = os.open(
-                candidate,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                0o600,
-                dir_fd=parent_descriptor,
-            )
-        except FileExistsError:
-            continue
-        temporary = candidate
-        break
-    if descriptor is None:
-        raise FileExistsError("could not allocate preparation stage state")
+    if _read_preparation_state_at(parent_descriptor) != previous:
+        raise ValueError("preparation stage state changed while retained")
+    generation = 0 if previous is None else previous.generation + 1
+    if generation >= 10**_STAGE_STATE_GENERATION_WIDTH:
+        raise ValueError("preparation stage state generation is exhausted")
+    document = canonical_json_bytes({**state.payload(), "generation": generation})
+    name = _preparation_state_name(generation)
+    try:
+        descriptor = os.open(
+            ".",
+            os.O_RDWR | os.O_TMPFILE | os.O_CLOEXEC,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+    except OSError as error:
+        raise RuntimeError("Linux O_TMPFILE support is required") from error
     try:
         written = 0
         while written < len(document):
@@ -580,36 +711,59 @@ def _write_preparation_stage_state(
             written += count
         os.fsync(descriptor)
         chain.verify()
-        if previous is not None:
-            if _read_preparation_state_at(parent_descriptor) != previous:
-                raise ValueError("preparation stage state changed while retained")
-            os.unlink(_PREPARATION_STAGE_STATE_FILENAME, dir_fd=parent_descriptor)
-        os.link(
-            temporary,
-            _PREPARATION_STAGE_STATE_FILENAME,
-            src_dir_fd=parent_descriptor,
-            dst_dir_fd=parent_descriptor,
-            follow_symlinks=False,
-        )
-        os.unlink(temporary, dir_fd=parent_descriptor)
-        temporary = ""
+        link_unnamed_file_at(descriptor, parent_descriptor, name)
         os.fsync(parent_descriptor)
         chain.verify()
-        record = _read_preparation_state_at(parent_descriptor)
-        if record is None or record[0] != document:
+        installed_document, installed_identity = _read_preparation_record_at(
+            parent_descriptor, name
+        )
+        installed = _PreparationStateRecord(
+            state, document, installed_identity, name, generation
+        )
+        if (
+            installed_document != document
+            or _read_preparation_state_at(parent_descriptor) != installed
+        ):
             raise ValueError("preparation stage state changed while retained")
-        return record
+        prefix = f"{_PREPARATION_STAGE_STATE_FILENAME}."
+        retired = False
+        for candidate_name in os.listdir(parent_descriptor):
+            if candidate_name == name or (
+                candidate_name != _PREPARATION_STAGE_STATE_FILENAME
+                and not candidate_name.startswith(prefix)
+            ):
+                continue
+            suffix = candidate_name[len(prefix) :]
+            if candidate_name != _PREPARATION_STAGE_STATE_FILENAME and (
+                len(suffix) != _STAGE_STATE_GENERATION_WIDTH or not suffix.isdigit()
+            ):
+                continue
+            candidate_document, candidate_identity = _read_preparation_record_at(
+                parent_descriptor, candidate_name
+            )
+            candidate_state, candidate_generation = _parse_preparation_stage_state(
+                candidate_document
+            )
+            if (
+                candidate_generation >= generation
+                or candidate_state.nonce != state.nonce
+                or candidate_state.stage_name != state.stage_name
+                or candidate_identity
+                != _read_preparation_record_at(parent_descriptor, candidate_name)[1]
+            ):
+                raise ValueError("preparation stage state is ambiguous")
+            os.unlink(candidate_name, dir_fd=parent_descriptor)
+            retired = True
+        if retired:
+            os.fsync(parent_descriptor)
+            chain.verify()
+        return installed
     finally:
         os.close(descriptor)
-        if temporary:
-            try:
-                os.unlink(temporary, dir_fd=parent_descriptor)
-            except FileNotFoundError:
-                pass
 
 
 def _remove_preparation_stage_state(
-    chain: RetainedDirectoryChain, record: tuple[bytes, tuple[int, int]]
+    chain: RetainedDirectoryChain, record: _PreparationStateRecord
 ) -> None:
     """Durably remove only the exact stage-ownership record.
 
@@ -617,8 +771,8 @@ def _remove_preparation_stage_state(
     ----------
     chain : RetainedDirectoryChain
         Retained prepared-generations chain.
-    record : tuple of bytes and identity
-        Exact state bytes and identity authorized for removal.
+    record : _PreparationStateRecord
+        Exact newest state generation authorized for removal.
 
     Returns
     -------
@@ -628,7 +782,20 @@ def _remove_preparation_stage_state(
     descriptor = chain.directory.descriptor
     if _read_preparation_state_at(descriptor) != record:
         raise ValueError("preparation stage state changed while retained")
-    os.unlink(_PREPARATION_STAGE_STATE_FILENAME, dir_fd=descriptor)
+    prefix = f"{_PREPARATION_STAGE_STATE_FILENAME}."
+    names = sorted(
+        name
+        for name in os.listdir(descriptor)
+        if name == _PREPARATION_STAGE_STATE_FILENAME
+        or (
+            name.startswith(prefix)
+            and len(name[len(prefix) :]) == _STAGE_STATE_GENERATION_WIDTH
+            and name[len(prefix) :].isdigit()
+        )
+    )
+    for name in names:
+        _read_preparation_record_at(descriptor, name)
+        os.unlink(name, dir_fd=descriptor)
     os.fsync(descriptor)
     chain.verify()
 
@@ -678,7 +845,7 @@ def _recover_preparation_stage(chain: RetainedDirectoryChain) -> None:
     record = _read_preparation_state_at(parent_descriptor)
     if record is None:
         return
-    state = _parse_preparation_stage_state(record[0])
+    state = record.state
     current = os.fstat(parent_descriptor)
     if (current.st_dev, current.st_ino) != (
         state.parent_device,
@@ -2127,6 +2294,7 @@ def prepare_all(
     stages: dict[str, Path] = {}
     generation_chain: RetainedDirectoryChain | None = None
     try:
+        lock.verify()
         parent = next(iter({root.parent for root in roots.values()}))
         generations = parent / PREPARED_GENERATIONS_DIRECTORY
         if generations.is_symlink() or (
@@ -2134,6 +2302,7 @@ def prepare_all(
         ):
             raise ValueError("prepared generations root must be a regular directory")
         generations.mkdir(mode=0o755, exist_ok=True)
+        lock.verify()
         generation_chain = RetainedDirectoryChain.open(
             generations,
             error_message="prepared generations directory changed during preparation",
@@ -2141,8 +2310,10 @@ def prepare_all(
         )
         if _recover_prepared_migration(roots, request):
             _recover_preparation_stage(generation_chain)
+            lock.verify()
             return
         _recover_preparation_stage(generation_chain)
+        lock.verify()
         parent_descriptor = generation_chain.directory.descriptor
         parent_stat = os.fstat(parent_descriptor)
         nonce = uuid.uuid4().hex
@@ -2234,8 +2405,11 @@ def prepare_all(
             generation_chain, stage_name, stage_state
         )
         os.close(verification_descriptor)
+        lock.verify()
         _publish_prepared_roots(roots, stages, request)
+        lock.verify()
         _recover_preparation_stage(generation_chain)
+        lock.verify()
         stages = {}
     finally:
         try:

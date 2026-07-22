@@ -32,6 +32,8 @@ from src.artifact_compatibility import (
     canonical_json_bytes,
     load_server_artifact_snapshot,
     read_regular_file,
+    rename_exchange_at,
+    rename_noreplace_at,
     require_secure_artifact_platform,
     server_artifact_binding,
     sha256_bytes,
@@ -1364,6 +1366,7 @@ def _replace_bytes_at(
     name: str,
     content: bytes,
     *,
+    expected: bytes | None,
     mode: int = 0o644,
     retain: bool = False,
     chain: RetainedDirectoryChain | None = None,
@@ -1378,6 +1381,9 @@ def _replace_bytes_at(
         Direct child destination name.
     content : bytes
         Exact replacement bytes.
+    expected : bytes or None
+        Exact prior single-link regular-file bytes, or ``None`` when the target
+        must be absent.
     mode : int, optional
         Exact permissions installed on the replacement file.
     retain : bool, optional
@@ -1441,14 +1447,59 @@ def _replace_bytes_at(
         )
         _require_retained_file_entry(root_descriptor, temporary, retained, content)
         verify_chain()
-        os.rename(
-            temporary,
-            name,
-            src_dir_fd=root_descriptor,
-            dst_dir_fd=root_descriptor,
-        )
+        previous: _RetainedFile | None = None
+        exchanged = False
+        if expected is None:
+            rename_noreplace_at(root_descriptor, temporary, root_descriptor, name)
+            temporary = None
+            os.fsync(root_descriptor)
+            verify_chain()
+        else:
+            try:
+                previous = _open_retained_file(root_descriptor, name)
+            except (OSError, ValueError) as error:
+                raise ValueError("atomic replacement target changed") from error
+            if previous.snapshot.content != expected:
+                os.close(previous.descriptor)
+                raise ValueError("atomic replacement target changed")
+            try:
+                _require_retained_file_entry(root_descriptor, name, previous, expected)
+                verify_chain()
+                rename_exchange_at(root_descriptor, temporary, root_descriptor, name)
+                exchanged = True
+                verify_chain()
+                _require_retained_file_entry(
+                    root_descriptor, temporary, previous, expected
+                )
+                _require_retained_file_entry(root_descriptor, name, retained, content)
+                os.fsync(root_descriptor)
+                verify_chain()
+                if not _unlink_retained_file_entry(
+                    root_descriptor, temporary, previous, expected
+                ):
+                    raise ValueError("atomic replacement target changed")
+                temporary = None
+                os.fsync(root_descriptor)
+                verify_chain()
+            except BaseException:
+                if exchanged and temporary is not None:
+                    try:
+                        if _retained_file_entry_matches(
+                            root_descriptor, name, retained, content
+                        ):
+                            rename_exchange_at(
+                                root_descriptor,
+                                temporary,
+                                root_descriptor,
+                                name,
+                            )
+                            os.fsync(root_descriptor)
+                    except (OSError, RuntimeError, ValueError):
+                        pass
+                raise
+            finally:
+                os.close(previous.descriptor)
         verify_chain()
-        temporary = None
         captured, file_stat = _read_descriptor_bytes(descriptor)
         retained = _RetainedFile(
             descriptor,
@@ -1719,6 +1770,7 @@ def _record_finalization_state(
         root.descriptor,
         name,
         document,
+        expected=None if previous_record is None else previous_record[1],
         mode=0o600,
         retain=True,
         chain=chain,
@@ -1749,6 +1801,7 @@ def _record_finalization_state(
                     root.descriptor,
                     name,
                     previous_record[1],
+                    expected=document,
                     mode=0o600,
                     chain=chain,
                 )
@@ -1810,6 +1863,7 @@ def _rollback_current_index(
             descriptors.root.descriptor,
             CURRENT_RUN_FILENAME,
             previous_bytes,
+            expected=candidate_bytes,
             chain=descriptors.chain,
         )
     _sync_visible_directory(descriptors.root, descriptors.chain)
@@ -1846,6 +1900,7 @@ def _write_current_index_at(
         descriptors.root.descriptor,
         CURRENT_RUN_FILENAME,
         candidate_bytes,
+        expected=previous_bytes,
         retain=True,
         chain=descriptors.chain,
     )
@@ -2258,6 +2313,7 @@ def publish_completed_run(
                                 descriptors.run.descriptor,
                                 SERVER_ARTIFACT_MANIFEST_FILENAME,
                                 finalized_manifest,
+                                expected=existing_manifest_bytes,
                                 retain=True,
                                 chain=descriptors.chain,
                             )
@@ -2278,6 +2334,7 @@ def publish_completed_run(
                             descriptors.run.descriptor,
                             SERVER_ARTIFACT_MANIFEST_FILENAME,
                             finalized_manifest,
+                            expected=None,
                             retain=True,
                             chain=descriptors.chain,
                         )
@@ -2519,6 +2576,7 @@ def _record_prune_state(
         root.descriptor,
         _prune_state_name(state.run_id),
         document,
+        expected=None,
         mode=0o600,
         chain=chain,
     )
@@ -2579,6 +2637,7 @@ def _remove_prune_state(
                     root.descriptor,
                     name,
                     document,
+                    expected=None,
                     mode=0o600,
                     chain=chain,
                 )
@@ -2841,6 +2900,7 @@ def _remove_finalization_state(
                     root.descriptor,
                     name,
                     document,
+                    expected=None,
                     mode=0o600,
                     chain=chain,
                 )
