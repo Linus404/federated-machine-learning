@@ -608,6 +608,54 @@ class MetricAggregationTests(unittest.TestCase):
             prune.assert_called_once_with(root, 3, active_run_dir=run_dir)
             artifact_lock.release.assert_called_once_with()
 
+    def test_final_publication_failures_release_real_writer_lock(self) -> None:
+        for error in (OSError("publication failed"), KeyboardInterrupt()):
+            with (
+                self.subTest(error=type(error).__name__),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                run_dir = root / "runs" / "11111111-1111-4111-8111-111111111111"
+                strategy = server_app.SentimentServer.__new__(
+                    server_app.SentimentServer
+                )
+                strategy.artifact_dir = run_dir
+                strategy.artifact_root = root
+                strategy.artifact_retention_runs = 3
+                strategy.final_round = 1
+                artifact_lock = server_app.acquire_run_artifact_lock(run_dir)
+                strategy._artifact_lock = artifact_lock
+                strategy.expected_client_ids = frozenset({0})
+                strategy.accept_failures = False
+                strategy.evaluate_metrics_aggregation_fn = server_app.weighted_average
+                result = (
+                    Mock(),
+                    SimpleNamespace(
+                        loss=0.4,
+                        num_examples=2,
+                        metrics={"accuracy": 0.75, "client_id": 0},
+                    ),
+                )
+
+                with (
+                    patch.object(
+                        artifact_lock, "release", wraps=artifact_lock.release
+                    ) as release,
+                    patch.object(
+                        server_app, "publish_completed_run", side_effect=error
+                    ),
+                    patch.object(server_app, "prune_run_history") as prune,
+                    self.assertRaises(type(error)) as raised,
+                ):
+                    strategy.aggregate_evaluate(1, [result], [])
+
+                self.assertIs(raised.exception, error)
+                release.assert_called_once_with()
+                prune.assert_not_called()
+                self.assertFalse((root / "current.json").exists())
+                replacement_lock = server_app.acquire_run_artifact_lock(run_dir)
+                replacement_lock.release()
+
     def test_final_evaluation_rejects_hostile_results_without_publication(
         self,
     ) -> None:

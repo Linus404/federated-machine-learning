@@ -524,7 +524,7 @@ class SentimentServer(FedProx):
                     self.artifact_retention_runs,
                     active_run_dir=self.artifact_dir,
                 )
-        except Exception:
+        except BaseException:
             self._release_artifact_lock()
             raise
         if server_round == self.final_round:
