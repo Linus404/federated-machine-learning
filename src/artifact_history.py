@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hmac
 import os
 import shutil
@@ -45,6 +47,8 @@ CURRENT_RUN_FILENAME = "current.json"
 DEFAULT_ARTIFACT_RETENTION_RUNS = 10
 _PUBLICATION_PENDING = "pending"
 _PUBLICATION_COMPLETE = "complete"
+_FINALIZATION_STATE_SCHEMA_VERSION = 1
+_TEMPORARY_NAME_ATTEMPTS = 128
 
 
 @dataclass(frozen=True)
@@ -466,109 +470,88 @@ def _sync_retained_directory(directory: _RetainedDirectory) -> None:
 
 
 @dataclass(frozen=True)
-class _FinalizationLock:
-    """Hold the per-run lock descriptor and durable publication state."""
+class _PointerBinding:
+    """Bind exact current-pointer bytes to their validated identity."""
 
-    descriptor: int
+    run_id: str
+    artifact_manifest_checksum: str
+    content: bytes
 
-    def state(self) -> tuple[str, str] | None:
-        """Read the publication state stored in the lock file.
-
-        Returns
-        -------
-        tuple of str and str or None
-            State name and artifact-manifest checksum, or ``None`` when no
-            publication attempt has reached pointer replacement.
-        """
-        os.lseek(self.descriptor, 0, os.SEEK_SET)
-        document = os.read(self.descriptor, 256)
-        if not document:
-            return None
-        try:
-            state, checksum = document.decode("ascii").rstrip("\n").split(":", 1)
-        except (UnicodeDecodeError, ValueError) as error:
-            raise ValueError("run finalization state is unsafe") from error
-        checksum = f"sha256:{checksum}"
-        if state not in {_PUBLICATION_PENDING, _PUBLICATION_COMPLETE} or not (
-            len(checksum) == 71
-            and all(character in "0123456789abcdef" for character in checksum[7:])
-        ):
-            raise ValueError("run finalization state is unsafe")
-        return state, checksum
-
-    def record(self, state: str, checksum: str) -> None:
-        """Durably record one publication state transition.
-
-        Parameters
-        ----------
-        state : str
-            ``pending`` before pointer replacement or ``complete`` after every
-            required durability barrier.
-        checksum : str
-            Exact artifact-manifest checksum bound by the pointer.
+    def payload(self) -> Mapping[str, str]:
+        """Return the exact-schema JSON representation.
 
         Returns
         -------
-        None
+        collections.abc.Mapping
+            Canonical pointer binding payload.
         """
-        if state not in {_PUBLICATION_PENDING, _PUBLICATION_COMPLETE}:
-            raise ValueError("run finalization state is unsafe")
-        document = f"{state}:{checksum.removeprefix('sha256:')}\n".encode("ascii")
-        os.ftruncate(self.descriptor, 0)
-        os.lseek(self.descriptor, 0, os.SEEK_SET)
-        _write_all(self.descriptor, document)
-        os.fsync(self.descriptor)
+        return {
+            "run_id": self.run_id,
+            "artifact_manifest_checksum": self.artifact_manifest_checksum,
+            "bytes_base64": base64.b64encode(self.content).decode("ascii"),
+            "bytes_checksum": sha256_bytes(self.content),
+        }
+
+
+@dataclass(frozen=True)
+class _FinalizationState:
+    """Durably bind one publication attempt to old and new pointer bytes."""
+
+    status: str
+    candidate: _PointerBinding
+    previous: _PointerBinding | None
+
+    def payload(self) -> Mapping[str, Any]:
+        """Return the exact-schema JSON representation.
+
+        Returns
+        -------
+        collections.abc.Mapping
+            Canonical finalization-state payload.
+        """
+        return {
+            "schema_version": _FINALIZATION_STATE_SCHEMA_VERSION,
+            "state": self.status,
+            "candidate_pointer": self.candidate.payload(),
+            "previous_pointer": (
+                None if self.previous is None else self.previous.payload()
+            ),
+        }
+
+    def completed(self) -> _FinalizationState:
+        """Return the corresponding completed publication state.
+
+        Returns
+        -------
+        _FinalizationState
+            State with the same exact pointer bindings and ``complete`` status.
+        """
+        return _FinalizationState(_PUBLICATION_COMPLETE, self.candidate, self.previous)
 
 
 @contextmanager
 def _finalization_lock(
-    root_descriptor: int, run_id: str
-) -> Iterator[_FinalizationLock]:
-    """Serialize finalization attempts for one run across threads and processes.
+    root_descriptor: int,
+) -> Iterator[None]:
+    """Serialize every current-pointer finalization on the retained root inode.
 
     Parameters
     ----------
     root_descriptor : int
         Retained no-follow artifact-root descriptor.
-    run_id : str
-        Run identity used to isolate unrelated finalizations.
-
     Yields
     ------
-    _FinalizationLock
-        Locked descriptor and publication-state access.
-
-    Raises
-    ------
-    ValueError
-        If the lock path is not a contained single-link regular file.
+    None
     """
-    name = f".{run_id}.finalize.lock"
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(name, flags, 0o600, dir_fd=root_descriptor)
-    except OSError as error:
-        raise ValueError("run finalization lock is unsafe") from error
-    try:
-        file_stat = os.fstat(descriptor)
-        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
-            raise ValueError("run finalization lock is unsafe")
-        if os.name == "nt":
-            import msvcrt
+    if os.name == "nt":
+        raise RuntimeError("secure artifact finalization requires Linux")
+    import fcntl
 
-            if os.lseek(descriptor, 0, os.SEEK_END) == 0:
-                os.write(descriptor, b"\0")
-            os.lseek(descriptor, 0, os.SEEK_SET)
-            locking = msvcrt.locking  # type: ignore[attr-defined]
-            lock_mode = msvcrt.LK_LOCK  # type: ignore[attr-defined]
-            locking(descriptor, lock_mode, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-        yield _FinalizationLock(descriptor)
+    fcntl.flock(root_descriptor, fcntl.LOCK_EX)
+    try:
+        yield
     finally:
-        os.close(descriptor)
+        fcntl.flock(root_descriptor, fcntl.LOCK_UN)
 
 
 def _history_paths(artifact_root: str | Path) -> tuple[Path, Path]:
@@ -756,6 +739,181 @@ def _load_current_index_at(
     )
 
 
+def _pointer_binding(
+    current_record: tuple[Mapping[str, Any], bytes],
+) -> _PointerBinding:
+    """Bind a validated current-pointer record to its exact bytes.
+
+    Parameters
+    ----------
+    current_record : tuple of mapping and bytes
+        Validated current-pointer identity and exact serialized bytes.
+
+    Returns
+    -------
+    _PointerBinding
+        Exact pointer binding suitable for durable finalization state.
+    """
+    current, content = current_record
+    return _PointerBinding(
+        str(current["run_id"]),
+        str(current["artifact_manifest_checksum"]),
+        content,
+    )
+
+
+def _parse_pointer_binding(payload: object) -> _PointerBinding:
+    """Validate one exact-schema pointer binding from finalization state.
+
+    Parameters
+    ----------
+    payload : object
+        Decoded candidate or previous pointer binding.
+
+    Returns
+    -------
+    _PointerBinding
+        Validated identity, checksums, and exact pointer bytes.
+
+    Raises
+    ------
+    ValueError
+        If the binding schema, encoding, checksum, or identity is invalid.
+    """
+    expected_keys = {
+        "run_id",
+        "artifact_manifest_checksum",
+        "bytes_base64",
+        "bytes_checksum",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != expected_keys:
+        raise ValueError("run finalization state is unsafe")
+    encoded = payload["bytes_base64"]
+    if not isinstance(encoded, str):
+        raise ValueError("run finalization state is unsafe")
+    try:
+        content = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error) as error:
+        raise ValueError("run finalization state is unsafe") from error
+    if base64.b64encode(content).decode("ascii") != encoded:
+        raise ValueError("run finalization state is unsafe")
+    current = _validate_current_index(content, source="run finalization state pointer")
+    if (
+        payload["run_id"] != current["run_id"]
+        or payload["artifact_manifest_checksum"]
+        != current["artifact_manifest_checksum"]
+        or payload["bytes_checksum"] != sha256_bytes(content)
+    ):
+        raise ValueError("run finalization state is unsafe")
+    return _PointerBinding(
+        str(current["run_id"]),
+        str(current["artifact_manifest_checksum"]),
+        content,
+    )
+
+
+def _parse_finalization_state(document: bytes) -> _FinalizationState:
+    """Parse strict canonical finalization state with its exact schema.
+
+    Parameters
+    ----------
+    document : bytes
+        Exact state-file bytes.
+
+    Returns
+    -------
+    _FinalizationState
+        Validated durable publication state.
+
+    Raises
+    ------
+    ValueError
+        If syntax, canonical encoding, schema, or pointer bindings are invalid.
+    """
+    payload = strict_json_loads(document, source="run finalization state")
+    expected_keys = {
+        "schema_version",
+        "state",
+        "candidate_pointer",
+        "previous_pointer",
+    }
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != expected_keys
+        or type(payload["schema_version"]) is not int
+        or payload["schema_version"] != _FINALIZATION_STATE_SCHEMA_VERSION
+        or not isinstance(payload["state"], str)
+        or payload["state"] not in {_PUBLICATION_PENDING, _PUBLICATION_COMPLETE}
+        or canonical_json_bytes(payload) != document
+    ):
+        raise ValueError("run finalization state is unsafe")
+    previous_payload = payload["previous_pointer"]
+    previous = (
+        None if previous_payload is None else _parse_pointer_binding(previous_payload)
+    )
+    return _FinalizationState(
+        str(payload["state"]),
+        _parse_pointer_binding(payload["candidate_pointer"]),
+        previous,
+    )
+
+
+def _finalization_state_name(run_id: str) -> str:
+    """Return the direct-child state filename for one canonical run UUID.
+
+    Parameters
+    ----------
+    run_id : str
+        Canonical run identity.
+
+    Returns
+    -------
+    str
+        Per-run finalization-state filename.
+    """
+    return f".{run_id}.finalize.state"
+
+
+def _load_finalization_state_at(
+    root_descriptor: int, run_id: str
+) -> tuple[_FinalizationState, bytes] | None:
+    """Load a no-follow, single-link, private finalization-state file.
+
+    Parameters
+    ----------
+    root_descriptor : int
+        Retained artifact-root descriptor.
+    run_id : str
+        Canonical run identity.
+
+    Returns
+    -------
+    tuple of _FinalizationState and bytes or None
+        Validated state and exact bytes, or ``None`` when absent.
+
+    Raises
+    ------
+    ValueError
+        If the state entry or serialized state is unsafe.
+    """
+    name = _finalization_state_name(run_id)
+    try:
+        retained = _open_retained_file(root_descriptor, name)
+    except ValueError as error:
+        try:
+            os.stat(name, dir_fd=root_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        raise ValueError("run finalization state is unsafe") from error
+    try:
+        if stat.S_IMODE(os.fstat(retained.descriptor).st_mode) != 0o600:
+            raise ValueError("run finalization state is unsafe")
+        document = retained.snapshot.content
+        return _parse_finalization_state(document), document
+    finally:
+        os.close(retained.descriptor)
+
+
 def _write_all(descriptor: int, content: bytes) -> None:
     """Write all bytes to one descriptor.
 
@@ -778,7 +936,13 @@ def _write_all(descriptor: int, content: bytes) -> None:
         written += count
 
 
-def _replace_bytes_at(root_descriptor: int, name: str, content: bytes) -> None:
+def _replace_bytes_at(
+    root_descriptor: int,
+    name: str,
+    content: bytes,
+    *,
+    mode: int = 0o644,
+) -> None:
     """Atomically replace one file descriptor-relatively.
 
     Parameters
@@ -789,39 +953,104 @@ def _replace_bytes_at(root_descriptor: int, name: str, content: bytes) -> None:
         Direct child destination name.
     content : bytes
         Exact replacement bytes.
+    mode : int, optional
+        Exact permissions installed on the replacement file.
 
     Returns
     -------
     None
     """
-    temporary = f".{name}.{uuid.uuid4().hex}.tmp"
-    descriptor = -1
+    descriptor: int | None = None
+    temporary: str | None = None
+    for _ in range(_TEMPORARY_NAME_ATTEMPTS):
+        candidate = f".{name}.{uuid.uuid4().hex}.tmp"
+        try:
+            descriptor = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                mode,
+                dir_fd=root_descriptor,
+            )
+        except FileExistsError:
+            continue
+        temporary = candidate
+        break
+    if descriptor is None or temporary is None:
+        raise FileExistsError("could not allocate an exclusive temporary file")
     try:
-        descriptor = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600,
-            dir_fd=root_descriptor,
-        )
         _write_all(descriptor, content)
-        os.fchmod(descriptor, 0o644)
+        os.fchmod(descriptor, mode)
         os.fsync(descriptor)
         os.close(descriptor)
-        descriptor = -1
+        descriptor = None
         os.rename(
             temporary,
             name,
             src_dir_fd=root_descriptor,
             dst_dir_fd=root_descriptor,
         )
+        temporary = None
     except BaseException:
-        if descriptor >= 0:
+        if descriptor is not None:
             os.close(descriptor)
-        try:
-            os.unlink(temporary, dir_fd=root_descriptor)
-        except FileNotFoundError:
-            pass
+        if temporary is not None:
+            try:
+                os.unlink(temporary, dir_fd=root_descriptor)
+            except FileNotFoundError:
+                pass
         raise
+
+
+def _record_finalization_state(
+    root: _RetainedDirectory,
+    run_id: str,
+    state: _FinalizationState,
+) -> tuple[_FinalizationState, bytes]:
+    """Atomically replace and durably flush one finalization-state transition.
+
+    Parameters
+    ----------
+    root : _RetainedDirectory
+        Retained artifact root that owns the state file.
+    run_id : str
+        Canonical run identity.
+    state : _FinalizationState
+        Exact pending or complete state to persist.
+
+    Returns
+    -------
+    tuple of _FinalizationState and bytes
+        Persisted state and exact canonical bytes.
+
+    Raises
+    ------
+    ValueError
+        If existing or newly persisted state is unsafe.
+    OSError
+        If writing or a durability barrier fails.
+    """
+    name = _finalization_state_name(run_id)
+    previous_record = _load_finalization_state_at(root.descriptor, run_id)
+    document = canonical_json_bytes(state.payload())
+    _replace_bytes_at(root.descriptor, name, document, mode=0o600)
+    try:
+        _sync_retained_directory(root)
+        persisted = _load_finalization_state_at(root.descriptor, run_id)
+        if persisted != (state, document):
+            raise ValueError("run finalization state changed during finalization")
+    except BaseException:
+        if previous_record is None:
+            os.unlink(name, dir_fd=root.descriptor)
+        else:
+            _replace_bytes_at(
+                root.descriptor,
+                name,
+                previous_record[1],
+                mode=0o600,
+            )
+        _sync_retained_directory(root)
+        raise
+    return state, document
 
 
 def _rollback_current_index(
@@ -1019,11 +1248,8 @@ def publish_completed_run(
     with _retain_history_descriptors(
         root, expected_parent, resolved_run_dir
     ) as descriptors:
-        with _finalization_lock(
-            descriptors.root.descriptor, resolved_run_dir.name
-        ) as finalization_lock:
+        with _finalization_lock(descriptors.root.descriptor):
             _verify_history_descriptors(descriptors)
-            current_record = _load_current_index_at(root, descriptors.root.descriptor)
 
             from src.app_manifest import validate_app_manifest_bytes
 
@@ -1156,18 +1382,52 @@ def publish_completed_run(
                             "run_id": resolved_run_dir.name,
                             "artifact_manifest_checksum": checksum,
                         }
-                        state = finalization_lock.state()
-                        if was_complete:
-                            if state != (_PUBLICATION_PENDING, checksum):
+                        candidate = _PointerBinding(
+                            resolved_run_dir.name,
+                            checksum,
+                            canonical_json_bytes(index),
+                        )
+                        state_record = _load_finalization_state_at(
+                            descriptors.root.descriptor, resolved_run_dir.name
+                        )
+                        if state_record is not None:
+                            state = state_record[0]
+                            if state.status == _PUBLICATION_COMPLETE:
                                 raise ValueError(
                                     "completed run cannot be finalized again"
                                 )
-                        elif state is None:
-                            finalization_lock.record(_PUBLICATION_PENDING, checksum)
-                            _sync_retained_directory(descriptors.root)
-                            state = (_PUBLICATION_PENDING, checksum)
-                        elif state != (_PUBLICATION_PENDING, checksum):
-                            raise ValueError("run finalization state is unsafe")
+                            if state.candidate != candidate:
+                                raise ValueError("run finalization state is unsafe")
+                        else:
+                            state = None
+
+                        current_record = _load_current_index_at(
+                            root, descriptors.root.descriptor
+                        )
+                        current_bytes = (
+                            None if current_record is None else current_record[1]
+                        )
+                        if state is None:
+                            if current_bytes == candidate.content:
+                                raise ValueError(
+                                    "completed run cannot be finalized again"
+                                )
+                            previous = (
+                                None
+                                if current_record is None
+                                else _pointer_binding(current_record)
+                            )
+                            state = _FinalizationState(
+                                _PUBLICATION_PENDING, candidate, previous
+                            )
+                            _record_finalization_state(
+                                descriptors.root, resolved_run_dir.name, state
+                            )
+                        elif current_bytes not in {
+                            candidate.content,
+                            None if state.previous is None else state.previous.content,
+                        }:
+                            raise ValueError("completed run cannot be finalized again")
                         _sync_retained_files(completed_inventory)
                         _sync_retained_directory(descriptors.run)
                         _sync_retained_directory(descriptors.runs)
@@ -1178,47 +1438,46 @@ def publish_completed_run(
                             expected_content,
                         )
 
-                        if current_record is not None:
-                            current, current_bytes = current_record
-                            exact_current = (
-                                current["run_id"] == resolved_run_dir.name
-                                and current["artifact_manifest_checksum"] == checksum
+                        current_record = _load_current_index_at(
+                            root, descriptors.root.descriptor
+                        )
+                        current_bytes = (
+                            None if current_record is None else current_record[1]
+                        )
+                        previous_bytes = (
+                            None if state.previous is None else state.previous.content
+                        )
+                        if current_bytes not in {candidate.content, previous_bytes}:
+                            raise ValueError(
+                                "current-run index changed during finalization"
                             )
-                            if exact_current and state == (
-                                _PUBLICATION_PENDING,
-                                checksum,
-                            ):
-                                _sync_retained_directory(descriptors.root)
-                                _verify_history_descriptors(descriptors)
-                                _verify_run_inventory(
-                                    descriptors.run.descriptor,
-                                    completed_inventory,
-                                    expected_content,
-                                )
-                                recovered = _load_current_index_at(
-                                    root, descriptors.root.descriptor
-                                )
-                                if recovered != current_record:
-                                    raise ValueError(
-                                        "current-run index changed during finalization"
-                                    )
-                                finalization_lock.record(
-                                    _PUBLICATION_COMPLETE, checksum
-                                )
-                                return root / CURRENT_RUN_FILENAME
-                            if was_complete:
+                        if current_bytes == candidate.content:
+                            _sync_retained_directory(descriptors.root)
+                            _verify_history_descriptors(descriptors)
+                            _verify_run_inventory(
+                                descriptors.run.descriptor,
+                                completed_inventory,
+                                expected_content,
+                            )
+                            recovered = _load_current_index_at(
+                                root, descriptors.root.descriptor
+                            )
+                            if recovered is None or recovered[1] != candidate.content:
                                 raise ValueError(
-                                    "completed run cannot be finalized again"
+                                    "current-run index changed during finalization"
                                 )
+                            _record_finalization_state(
+                                descriptors.root,
+                                resolved_run_dir.name,
+                                state.completed(),
+                            )
+                            return root / CURRENT_RUN_FILENAME
 
                         _verify_history_descriptors(descriptors)
                         _verify_run_inventory(
                             descriptors.run.descriptor,
                             completed_inventory,
                             expected_content,
-                        )
-                        previous_bytes = (
-                            None if current_record is None else current_record[1]
                         )
                         pointer = _write_current_index_at(
                             root, descriptors, index, previous_bytes
@@ -1233,7 +1492,11 @@ def publish_completed_run(
                         except ValueError:
                             _rollback_current_index(descriptors, previous_bytes)
                             raise
-                        finalization_lock.record(_PUBLICATION_COMPLETE, checksum)
+                        _record_finalization_state(
+                            descriptors.root,
+                            resolved_run_dir.name,
+                            state.completed(),
+                        )
                         return pointer
                     finally:
                         os.close(retained_manifest.descriptor)

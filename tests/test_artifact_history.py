@@ -1,11 +1,16 @@
+import base64
 import hashlib
 import json
 import os
 import socket
+import stat
+import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
@@ -1485,6 +1490,440 @@ class ArtifactHistoryTests(unittest.TestCase):
 
                 with self.assertRaisesRegex(ValueError, "cannot be finalized again"):
                     publish_completed_run(root, run)
+
+    def test_pending_retry_restores_publication_over_exact_previous_pointer(
+        self,
+    ) -> None:
+        from src import artifact_history
+
+        for failure in (
+            "completed files",
+            "run directory",
+            "runs directory",
+            "pointer write",
+            "pointer permissions",
+            "pointer file fsync",
+            "pointer rename",
+        ):
+            with (
+                self.subTest(failure=failure),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                previous = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+                candidate = create_run(root, RUN_IDS[1], "2026-01-02T00:00:00Z")
+                publish_completed_run(root, previous)
+                previous_bytes = (root / "current.json").read_bytes()
+                run_identity = (candidate.stat().st_dev, candidate.stat().st_ino)
+                runs_identity = (
+                    (root / "runs").stat().st_dev,
+                    (root / "runs").stat().st_ino,
+                )
+                real_sync_files = artifact_history._sync_retained_files
+                real_sync_directory = artifact_history._sync_retained_directory
+                real_write_all = artifact_history._write_all
+                real_fchmod = os.fchmod
+                real_fsync = os.fsync
+                real_rename = os.rename
+                sync_files_calls = 0
+
+                def is_pointer_temporary(descriptor: int) -> bool:
+                    return ".current.json." in os.readlink(
+                        f"/proc/self/fd/{descriptor}"
+                    )
+
+                def fail_sync_files(inventory):
+                    nonlocal sync_files_calls
+                    sync_files_calls += 1
+                    if failure == "completed files" and sync_files_calls == 2:
+                        raise OSError("injected completed-files failure")
+                    return real_sync_files(inventory)
+
+                def fail_sync_directory(directory):
+                    identity = (directory.device, directory.inode)
+                    if failure == "run directory" and identity == run_identity:
+                        raise OSError("injected run-directory failure")
+                    if failure == "runs directory" and identity == runs_identity:
+                        raise OSError("injected runs-directory failure")
+                    return real_sync_directory(directory)
+
+                def fail_write(descriptor, content):
+                    if failure == "pointer write" and is_pointer_temporary(descriptor):
+                        raise OSError("injected pointer-write failure")
+                    return real_write_all(descriptor, content)
+
+                def fail_fchmod(descriptor, mode):
+                    if failure == "pointer permissions" and is_pointer_temporary(
+                        descriptor
+                    ):
+                        raise OSError("injected pointer-permissions failure")
+                    return real_fchmod(descriptor, mode)
+
+                def fail_fsync(descriptor):
+                    if (
+                        failure == "pointer file fsync"
+                        and stat.S_ISREG(os.fstat(descriptor).st_mode)
+                        and is_pointer_temporary(descriptor)
+                    ):
+                        raise OSError("injected pointer-fsync failure")
+                    return real_fsync(descriptor)
+
+                def fail_rename(source, destination, **kwargs):
+                    if failure == "pointer rename" and destination == "current.json":
+                        raise OSError("injected pointer-rename failure")
+                    return real_rename(source, destination, **kwargs)
+
+                with (
+                    patch.object(
+                        artifact_history,
+                        "require_secure_artifact_platform",
+                        return_value=None,
+                    ),
+                    patch(
+                        "src.artifact_compatibility.require_secure_artifact_platform",
+                        return_value=None,
+                    ),
+                    patch.object(
+                        artifact_history,
+                        "_sync_retained_files",
+                        side_effect=fail_sync_files,
+                    ),
+                    patch.object(
+                        artifact_history,
+                        "_sync_retained_directory",
+                        side_effect=fail_sync_directory,
+                    ),
+                    patch.object(
+                        artifact_history, "_write_all", side_effect=fail_write
+                    ),
+                    patch.object(os, "fchmod", side_effect=fail_fchmod),
+                    patch.object(os, "fsync", side_effect=fail_fsync),
+                    patch.object(os, "rename", side_effect=fail_rename),
+                    self.assertRaisesRegex(OSError, "injected"),
+                ):
+                    publish_completed_run(root, candidate)
+
+                self.assertEqual((root / "current.json").read_bytes(), previous_bytes)
+                state_path = root / f".{RUN_IDS[1]}.finalize.state"
+                state = json.loads(state_path.read_bytes())
+                previous_binding = state["previous_pointer"]
+                self.assertEqual(state["state"], "pending")
+                self.assertEqual(previous_binding["run_id"], RUN_IDS[0])
+                self.assertEqual(
+                    previous_binding["bytes_base64"],
+                    base64.b64encode(previous_bytes).decode("ascii"),
+                )
+                self.assertEqual(
+                    previous_binding["bytes_checksum"], sha256_bytes(previous_bytes)
+                )
+
+                publish_completed_run(root, candidate)
+                self.assertEqual(resolve_current_run_dir(root), candidate.resolve())
+                with self.assertRaisesRegex(ValueError, "cannot be finalized again"):
+                    publish_completed_run(root, candidate)
+
+    def test_pending_publication_recovers_in_a_new_process(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            previous = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            candidate = create_run(root, RUN_IDS[1], "2026-01-02T00:00:00Z")
+            publish_completed_run(root, previous)
+
+            with (
+                patch(
+                    "src.artifact_history._write_current_index_at",
+                    side_effect=OSError("injected pointer failure"),
+                ),
+                self.assertRaisesRegex(OSError, "pointer failure"),
+            ):
+                publish_completed_run(root, candidate)
+
+            script = """
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+from src.app_manifest import load_app_manifest
+from src.artifact_history import publish_completed_run
+from tests.test_artifact_history import _TEST_PROTOCOL
+
+root = Path(sys.argv[1])
+run = Path(sys.argv[2])
+with patch("src.app_manifest.load_scientific_protocol", return_value=_TEST_PROTOCOL):
+    manifest = load_app_manifest(
+        public_artifact_dir=root / f"public-{run.name}",
+        protocol=_TEST_PROTOCOL,
+    )
+    publish_completed_run(root, run, app_manifest=manifest)
+"""
+            retry = subprocess.run(
+                [sys.executable, "-c", script, str(root), str(candidate)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            self.assertEqual(retry.returncode, 0, retry.stderr)
+            self.assertEqual(resolve_current_run_dir(root), candidate.resolve())
+            with self.assertRaisesRegex(ValueError, "cannot be finalized again"):
+                publish_completed_run(root, candidate)
+
+    def test_pending_retry_rejects_divergent_pointer_and_preserves_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            previous = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            candidate = create_run(root, RUN_IDS[1], "2026-01-02T00:00:00Z")
+            divergent = create_run(root, RUN_IDS[2], "2026-01-03T00:00:00Z")
+            publish_completed_run(root, previous)
+            with (
+                patch(
+                    "src.artifact_history._write_current_index_at",
+                    side_effect=OSError("injected pointer failure"),
+                ),
+                self.assertRaises(OSError),
+            ):
+                publish_completed_run(root, candidate)
+            publish_completed_run(root, divergent)
+            divergent_bytes = (root / "current.json").read_bytes()
+
+            with self.assertRaisesRegex(ValueError, "cannot be finalized again"):
+                publish_completed_run(root, candidate)
+            self.assertEqual((root / "current.json").read_bytes(), divergent_bytes)
+
+    def test_atomic_state_failures_preserve_exact_pending_state(self) -> None:
+        from src import artifact_history
+
+        for failure in ("write", "permissions", "file fsync", "rename", "root fsync"):
+            with (
+                self.subTest(failure=failure),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                root.mkdir(exist_ok=True)
+                index = {
+                    "schema_version": 1,
+                    "run_id": RUN_IDS[0],
+                    "artifact_manifest_checksum": "sha256:" + "1" * 64,
+                }
+                candidate = artifact_history._PointerBinding(
+                    RUN_IDS[0],
+                    "sha256:" + "1" * 64,
+                    canonical_json_bytes(index),
+                )
+                pending = artifact_history._FinalizationState(
+                    "pending", candidate, None
+                )
+                retained_root = artifact_history._open_retained_directory(root)
+                try:
+                    artifact_history._record_finalization_state(
+                        retained_root, RUN_IDS[0], pending
+                    )
+                    state_path = root / f".{RUN_IDS[0]}.finalize.state"
+                    pending_bytes = state_path.read_bytes()
+                    real_write_all = artifact_history._write_all
+                    real_fchmod = os.fchmod
+                    real_fsync = os.fsync
+                    real_rename = os.rename
+
+                    def fail_write(descriptor, content):
+                        if failure == "write":
+                            raise OSError("injected state-write failure")
+                        return real_write_all(descriptor, content)
+
+                    def fail_fchmod(descriptor, mode):
+                        if failure == "permissions":
+                            raise OSError("injected state-permissions failure")
+                        return real_fchmod(descriptor, mode)
+
+                    def fail_fsync(descriptor):
+                        is_root = (
+                            os.fstat(descriptor).st_ino == retained_root.inode
+                            and os.fstat(descriptor).st_dev == retained_root.device
+                        )
+                        if failure == "file fsync" and not is_root:
+                            raise OSError("injected state-file-fsync failure")
+                        if failure == "root fsync" and is_root:
+                            raise OSError("injected state-root-fsync failure")
+                        return real_fsync(descriptor)
+
+                    def fail_rename(source, destination, **kwargs):
+                        if failure == "rename":
+                            raise OSError("injected state-rename failure")
+                        return real_rename(source, destination, **kwargs)
+
+                    with (
+                        patch.object(
+                            artifact_history, "_write_all", side_effect=fail_write
+                        ),
+                        patch.object(os, "fchmod", side_effect=fail_fchmod),
+                        patch.object(os, "fsync", side_effect=fail_fsync),
+                        patch.object(os, "rename", side_effect=fail_rename),
+                        self.assertRaisesRegex(OSError, "injected"),
+                    ):
+                        artifact_history._record_finalization_state(
+                            retained_root, RUN_IDS[0], pending.completed()
+                        )
+
+                    self.assertEqual(state_path.read_bytes(), pending_bytes)
+                    self.assertEqual(state_path.stat().st_mode & 0o777, 0o600)
+                    self.assertEqual(
+                        [path for path in root.iterdir() if path != state_path], []
+                    )
+                finally:
+                    os.close(retained_root.descriptor)
+
+    def test_finalization_state_requires_canonical_private_regular_file(self) -> None:
+        from src import artifact_history
+
+        for mutation in (
+            "noncanonical",
+            "extra field",
+            "wrong checksum",
+            "permissions",
+            "symlink",
+            "directory",
+            "hard link",
+        ):
+            with (
+                self.subTest(mutation=mutation),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                index = {
+                    "schema_version": 1,
+                    "run_id": RUN_IDS[0],
+                    "artifact_manifest_checksum": "sha256:" + "1" * 64,
+                }
+                candidate = artifact_history._PointerBinding(
+                    RUN_IDS[0],
+                    "sha256:" + "1" * 64,
+                    canonical_json_bytes(index),
+                )
+                pending = artifact_history._FinalizationState(
+                    "pending", candidate, None
+                )
+                retained_root = artifact_history._open_retained_directory(root)
+                state_path = root / f".{RUN_IDS[0]}.finalize.state"
+                try:
+                    artifact_history._record_finalization_state(
+                        retained_root, RUN_IDS[0], pending
+                    )
+                    payload = json.loads(state_path.read_bytes())
+                    if mutation == "noncanonical":
+                        state_path.write_text(json.dumps(payload), encoding="utf-8")
+                    elif mutation == "extra field":
+                        payload["unexpected"] = True
+                        state_path.write_bytes(canonical_json_bytes(payload))
+                    elif mutation == "wrong checksum":
+                        payload["candidate_pointer"]["bytes_checksum"] = (
+                            "sha256:" + "0" * 64
+                        )
+                        state_path.write_bytes(canonical_json_bytes(payload))
+                    elif mutation == "permissions":
+                        state_path.chmod(0o644)
+                    else:
+                        state_path.unlink()
+                        if mutation == "symlink":
+                            state_path.symlink_to("missing-state")
+                        elif mutation == "directory":
+                            state_path.mkdir()
+                        else:
+                            source = root / "state-source"
+                            source.write_bytes(canonical_json_bytes(payload))
+                            source.chmod(0o600)
+                            os.link(source, state_path)
+
+                    with self.assertRaisesRegex(
+                        ValueError, "run finalization state is unsafe"
+                    ):
+                        artifact_history._load_finalization_state_at(
+                            retained_root.descriptor, RUN_IDS[0]
+                        )
+                finally:
+                    os.close(retained_root.descriptor)
+
+    def test_replace_bytes_never_removes_unowned_name_collisions(self) -> None:
+        from src import artifact_history
+
+        collision_id = uuid.UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        success_id = uuid.UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+        for entry_type in ("file", "symlink", "directory"):
+            with (
+                self.subTest(entry_type=entry_type),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                collision = root / f".target.{collision_id.hex}.tmp"
+                if entry_type == "file":
+                    collision.write_bytes(b"owned elsewhere")
+                elif entry_type == "symlink":
+                    collision.symlink_to("missing")
+                else:
+                    collision.mkdir()
+                descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    with patch.object(
+                        artifact_history.uuid,
+                        "uuid4",
+                        side_effect=(collision_id, success_id),
+                    ):
+                        artifact_history._replace_bytes_at(
+                            descriptor, "target", b"replacement"
+                        )
+                finally:
+                    os.close(descriptor)
+                self.assertTrue(collision.exists() or collision.is_symlink())
+                self.assertEqual((root / "target").read_bytes(), b"replacement")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            collision = root / f".target.{collision_id.hex}.tmp"
+            collision.write_bytes(b"owned elsewhere")
+            descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with (
+                    patch.object(
+                        artifact_history.uuid, "uuid4", return_value=collision_id
+                    ),
+                    self.assertRaises(FileExistsError),
+                ):
+                    artifact_history._replace_bytes_at(
+                        descriptor, "target", b"replacement"
+                    )
+            finally:
+                os.close(descriptor)
+            self.assertEqual(collision.read_bytes(), b"owned elsewhere")
+            self.assertFalse((root / "target").exists())
+
+    def test_replaced_legacy_lock_entry_cannot_split_root_serialization(self) -> None:
+        from src import artifact_history
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            first_descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            second_descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            legacy_lock = root / f".{RUN_IDS[0]}.finalize.lock"
+            legacy_lock.write_bytes(b"old")
+            acquired = threading.Event()
+
+            def acquire_second() -> None:
+                with artifact_history._finalization_lock(second_descriptor):
+                    acquired.set()
+
+            try:
+                with artifact_history._finalization_lock(first_descriptor):
+                    parked = root / "parked-lock"
+                    legacy_lock.rename(parked)
+                    legacy_lock.write_bytes(b"replacement")
+                    thread = threading.Thread(target=acquire_second)
+                    thread.start()
+                    self.assertFalse(acquired.wait(timeout=0.1))
+                self.assertTrue(acquired.wait(timeout=1))
+                thread.join(timeout=1)
+                self.assertFalse(thread.is_alive())
+            finally:
+                os.close(first_descriptor)
+                os.close(second_descriptor)
 
     def test_finalization_closes_retained_descriptors_after_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

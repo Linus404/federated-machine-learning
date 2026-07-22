@@ -59,9 +59,16 @@ Publication retains no-follow descriptors and filesystem identities for the root
 canonical `runs/` directory, selected run, and captured files. It flushes the
 retained files, completed run directory, and `runs/` directory, revalidates the exact
 entry inventory, identities, and bytes, replaces `current.json` descriptor-relatively,
-and finally flushes the retained artifact root. An exact matching pointer left by a
-failed final root flush may be recovered once by repeating full validation and every
-barrier; successful publication and recovery still reject later refinalization.
+and finally flushes the retained artifact root. Finalizers serialize on that retained
+root inode rather than a replaceable lock entry. Before the final barriers, a private,
+strict-canonical state file is atomically replaced and flushed with the exact candidate
+pointer plus the exact previous pointer identity, bytes, and checksum, or its absence.
+A restart accepts only those two recorded pointer states: it retries publication from
+the exact previous pointer or completes recovery from the exact candidate. Any other
+pointer is rejected. State transitions use exclusive temporary files, file and root
+flushes, and atomic descriptor-relative replacement, so a failed transition cannot
+truncate the prior durable state. Successful publication and one-time recovery still
+reject later refinalization.
 
 Each consumer accepts only its artifact kind's current schema. Missing,
 non-integer, older, and newer versions are rejected before the artifact is used.

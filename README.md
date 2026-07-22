@@ -180,13 +180,17 @@ describes what ServerApp reads at runtime.
 
 Completed-run publication retains no-follow descriptors and filesystem identities
 for the artifact root, canonical `runs/` directory, selected run, and every captured
-file. It flushes those retained file and directory descriptors, then revalidates the
-entire entry inventory, identities, and bytes immediately before replacing
-`current.json` descriptor-relatively under the retained root. A failed pre-pointer
-durability barrier leaves the run unselected and can be retried safely. If the final
-artifact-root flush fails after replacement, one exact retry may revalidate and
-repeat every barrier for the already matching pointer; later retries remain rejected.
-No publication call reports success unless every required barrier completes.
+file. Finalizers lock the retained root inode, so replacing a visible lock pathname
+cannot split serialization across same-run or different-run publishers. Before the
+final barriers, an atomically replaced private state file records the exact candidate
+pointer and the exact previous pointer identity, bytes, and checksum, or absence. It
+is written through an exclusive temporary file, flushed, renamed descriptor-relatively,
+and followed by a retained-root flush without truncating prior durable state. A retry
+accepts only the recorded previous pointer, from which it republishes, or the exact
+candidate pointer, from which it completes recovery after full revalidation and every
+barrier. Divergent pointers are rejected, and successful publication or one-time
+recovery rejects later retries. No publication call reports success unless every
+required barrier completes.
 
 `artifact-retention-runs` defaults to `10`. Retention orders validated run
 manifests by `(created_at, run_id)`, keeps the newest configured count, and never
