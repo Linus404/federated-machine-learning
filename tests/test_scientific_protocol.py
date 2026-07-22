@@ -10,6 +10,7 @@ import tomllib
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import numpy as np
 
@@ -489,6 +490,82 @@ def registered_cells(protocol: dict[str, Any]) -> list[dict[str, Any]]:
     return cells
 
 
+def paired_contrast_pairs(
+    protocol: dict[str, Any], contrast: dict[str, Any]
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Expand one registered paired contrast into candidate-baseline cells.
+
+    Args:
+        protocol: Parsed scientific protocol.
+        contrast: One statistics.paired_contrasts entry.
+
+    Returns:
+        Candidate and mapped baseline cells in canonical cell order.
+    """
+    all_cells = registered_cells(protocol)
+    registered_ids = {
+        canonical_cell_id(registered_cell) for registered_cell in all_cells
+    }
+    pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for candidate in all_cells:
+        if candidate["matrix_kind"] != contrast["candidate_matrix"]:
+            continue
+        if any(
+            candidate[field] in excluded_values
+            for field, excluded_values in contrast["candidate_exclude"].items()
+        ):
+            continue
+        baseline = {
+            "matrix_kind": contrast["baseline_matrix"],
+            **{field: candidate[field] for field in contrast["preserve_fields"]},
+            **contrast["set_fields"],
+        }
+        for field in contrast["clear_fields"]:
+            baseline[field] = None
+        if set(baseline) != set(candidate):
+            raise ValueError(f"incomplete baseline mapping for {contrast['name']}")
+        if canonical_cell_id(baseline) not in registered_ids:
+            raise ValueError(f"unregistered baseline for {contrast['name']}")
+        pairs.append((candidate, baseline))
+    return pairs
+
+
+def iterative_huber_aggregate(
+    client_vectors: np.ndarray,
+    sample_weights: np.ndarray,
+    threshold: float,
+    epsilon: float,
+    iterations: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Execute the registered iterative Huber aggregation.
+
+    Args:
+        client_vectors: Finite flattened post-fit model parameter vectors.
+        sample_weights: Positive fitted-row counts in client order.
+        threshold: Registered Huber residual threshold.
+        epsilon: Registered zero-residual denominator floor.
+        iterations: Exact number of iteratively reweighted updates.
+
+    Returns:
+        Initial sample-weighted mean and final aggregate.
+    """
+    vectors = np.asarray(client_vectors, dtype=np.float32)
+    weights = np.asarray(sample_weights, dtype=np.float64)
+    weights /= weights.sum()
+    estimate = np.average(vectors, axis=0, weights=weights)
+    initial = estimate.copy()
+    for _ in range(iterations):
+        residuals = np.linalg.norm(estimate - vectors, axis=1)
+        effective = weights * np.where(
+            residuals <= threshold,
+            1.0,
+            threshold / (residuals + epsilon),
+        )
+        effective /= effective.sum()
+        estimate = np.average(vectors, axis=0, weights=effective)
+    return initial, estimate
+
+
 class ScientificProtocolTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -764,6 +841,13 @@ class ScientificProtocolTests(unittest.TestCase):
         self.assertIn("Never call adapt again", preprocessing["adaptation_lifecycle"])
         self.assertIn("first_500", preprocessing["truncation"])
         self.assertIn("token_id_0", preprocessing["padding"])
+        self.assertEqual(preprocessing["layer_dtype"], "string")
+        self.assertEqual(preprocessing["output_dtype"], "int64")
+        self.assertIn(
+            "ASCII U+0041 through U+005A", preprocessing["lowercase_semantics"]
+        )
+        self.assertIn("U+0009 through U+000D", preprocessing["tokenization"])
+        self.assertIn("Non-ASCII whitespace", preprocessing["tokenization"])
 
         probe = r"""
 import hashlib
@@ -777,6 +861,7 @@ import numpy as np
 import tensorflow as tf
 
 config = json.loads(sys.argv[1])
+model_config = json.loads(sys.argv[2])
 tf.config.experimental.enable_op_determinism()
 namespace = {"keras": keras, "re": re, "string": string, "tf": tf}
 exec(config["standardize_python"], namespace)
@@ -785,6 +870,30 @@ texts = ["<b>Alpha</b> beta!", "beta, GAMMA", "can't stop", "café alpha"]
 vectorizer.adapt(tf.data.Dataset.from_tensor_slices(texts).batch(2))
 vocabulary = vectorizer.get_vocabulary()
 token_ids = vectorizer(tf.constant(["<i>ALPHA</i> unknown!!!"]))[0, :5]
+standardized_cases = [
+    namespace["protocol_standardize"](tf.constant(case["input"])).numpy().decode("utf-8")
+    for case in config["golden_cases"]
+]
+tokenized_cases = [
+    [token.decode("utf-8") for token in tf.strings.split([text]).flat_values.numpy()]
+    for text in standardized_cases
+]
+
+golden = model_config["loss_golden_probe"]
+logits = tf.constant(golden["logits"], dtype=tf.float32)[:, None]
+labels = tf.constant(golden["labels"], dtype=tf.float32)[:, None]
+probabilities = keras.layers.Activation("sigmoid")(logits)
+bce_arguments = {
+    "from_logits": model_config["loss_from_logits"],
+    "label_smoothing": model_config["loss_label_smoothing"],
+    "axis": model_config["loss_axis"],
+}
+bce_elementwise = keras.losses.BinaryCrossentropy(
+    **bce_arguments, reduction="none"
+)(labels, probabilities)
+bce_reduced = keras.losses.BinaryCrossentropy(
+    **bce_arguments, reduction=model_config["loss_reduction"]
+)(labels, probabilities)
 
 def dropout_sequence():
     layer = keras.layers.Dropout(0.3, seed=54321)
@@ -822,8 +931,17 @@ second_masks = dropout_sequence()
 print(json.dumps({
     "tensorflow_version": tf.__version__,
     "keras_version": keras.__version__,
+    "numpy_version": np.__version__,
     "vocabulary": vocabulary,
     "token_ids": token_ids.numpy().tolist(),
+    "vectorizer_layer_dtype": vectorizer.dtype,
+    "vectorizer_output_dtype": vectorizer(tf.constant(["alpha"])).dtype.name,
+    "standardized_cases": standardized_cases,
+    "tokenized_cases": tokenized_cases,
+    "bce_probabilities": probabilities.numpy().ravel().tolist(),
+    "bce_elementwise": bce_elementwise.numpy().tolist(),
+    "bce_reduced": float(bce_reduced.numpy()),
+    "bce_has_attached_logits": hasattr(probabilities, "_keras_logits"),
     "dropout_rebuild_equal": all(
         np.array_equal(left, right)
         for left, right in zip(first_masks, second_masks, strict=True)
@@ -836,7 +954,13 @@ print(json.dumps({
         environment.update(framework["execution_environment_before_import"])
         environment["CUDA_VISIBLE_DEVICES"] = ""
         completed = subprocess.run(
-            [sys.executable, "-c", probe, json.dumps(preprocessing)],
+            [
+                sys.executable,
+                "-c",
+                probe,
+                json.dumps(preprocessing),
+                json.dumps(self.protocol["model"]),
+            ],
             check=True,
             capture_output=True,
             text=True,
@@ -845,11 +969,32 @@ print(json.dumps({
         result = json.loads(completed.stdout)
         self.assertEqual(result["tensorflow_version"], framework["tensorflow_version"])
         self.assertEqual(result["keras_version"], framework["keras_version"])
+        self.assertEqual(result["numpy_version"], framework["numpy_version"])
         self.assertEqual(
             result["vocabulary"],
             ["", "[UNK]", "beta", "alpha", "stop", "gamma", "cant", "café"],
         )
         self.assertEqual(result["token_ids"], [3, 1, 0, 0, 0])
+        self.assertEqual(result["vectorizer_layer_dtype"], preprocessing["layer_dtype"])
+        self.assertEqual(
+            result["vectorizer_output_dtype"], preprocessing["output_dtype"]
+        )
+        self.assertEqual(
+            result["standardized_cases"],
+            [case["standardized"] for case in preprocessing["golden_cases"]],
+        )
+        self.assertEqual(
+            result["tokenized_cases"],
+            [case["tokens"] for case in preprocessing["golden_cases"]],
+        )
+        golden = self.protocol["model"]["loss_golden_probe"]
+        self.assertTrue(self.protocol["model"]["loss_logit_recovery_required"])
+        self.assertTrue(result["bce_has_attached_logits"])
+        self.assertEqual(result["bce_probabilities"], golden["sigmoid_probabilities"])
+        np.testing.assert_allclose(
+            result["bce_elementwise"], golden["elementwise_losses"], rtol=0, atol=0
+        )
+        self.assertEqual(result["bce_reduced"], golden["sum_over_batch_size_loss"])
         self.assertTrue(result["dropout_rebuild_equal"])
         self.assertTrue(result["dropout_calls_differ"])
         self.assertEqual(result["training_hashes"][0], result["training_hashes"][1])
@@ -1365,6 +1510,60 @@ print(json.dumps({
                 500,
             )
 
+    def test_excluded_dirichlet_point_one_64_exhausts_every_seed(self) -> None:
+        scale = self.protocol["matrix"]["scale"]
+        partitioning = self.protocol["partitioning"]
+        self.assertEqual(scale["excluded_partition"], "dirichlet_0.1")
+        self.assertEqual(scale["excluded_client_scale"], 64)
+        self.assertEqual(scale["excluded_seeds"], self.protocol["seeding"]["seeds"])
+        self.assertEqual(
+            scale["exclusion_attempt_range"],
+            [partitioning["first_attempt"], partitioning["last_attempt"]],
+        )
+        protocol_generator = generator
+        for seed in scale["excluded_seeds"]:
+            attempts: list[int] = []
+
+            def tracked_generator(
+                protocol: dict[str, Any],
+                master_seed: int,
+                namespace: str,
+                attempt: int = 0,
+            ) -> np.random.Generator:
+                """Record and execute one partition generator construction.
+
+                Args:
+                    protocol: Parsed scientific protocol.
+                    master_seed: Registered experiment seed.
+                    namespace: Fully expanded RNG namespace.
+                    attempt: Zero-based retry attempt.
+
+                Returns:
+                    A fresh NumPy generator for the registered seed material.
+                """
+                attempts.append(attempt)
+                return protocol_generator(protocol, master_seed, namespace, attempt)
+
+            with (
+                self.subTest(seed=seed),
+                patch(f"{__name__}.generator", side_effect=tracked_generator),
+                self.assertRaisesRegex(
+                    ValueError,
+                    rf"no accepted dirichlet_0\.1/64 partition for seed {seed}",
+                ),
+            ):
+                dirichlet_partition(
+                    self.protocol,
+                    self.labels,
+                    seed,
+                    scale["excluded_partition"],
+                    0.1,
+                    scale["excluded_client_scale"],
+                )
+            np.testing.assert_array_equal(
+                np.bincount(attempts, minlength=10000), np.full(10000, 2)
+            )
+
     def test_partition_and_client_selection_algorithms_are_closed(self) -> None:
         partitioning = self.protocol["partitioning"]
         self.assertEqual(
@@ -1451,14 +1650,72 @@ print(json.dumps({
                 "fedtrimmedavg",
             },
         )
-        self.assertEqual(strategies["fedprox"]["mu"], 0.1)
+        fedprox = strategies["fedprox"]
+        self.assertEqual(fedprox["mu"], 0.1)
+        self.assertIn("keras.ops.convert_to_tensor", fedprox["reference"])
+        self.assertIn("weight.numpy().copy()", fedprox["reference"])
+        self.assertIn("sum_over_batch_size", fedprox["data_loss"])
+        self.assertIn("keras.ops.sum", fedprox["proximal_term"])
+        self.assertIn("left-fold", fedprox["proximal_term"])
+        self.assertIn(
+            "not divided or multiplied by batch size", fedprox["local_objective"]
+        )
+        self.assertIn("fitted training rows", fedprox["aggregation_sample_weight"])
+        self.assertIn("ascending client_id order", fedprox["aggregation"])
+        fedprox_golden = fedprox["golden_probe"]
+        data_loss = float(np.mean(fedprox_golden["batch_example_losses"]))
+        squared_distance = sum(
+            np.sum(
+                (
+                    np.asarray(current, dtype=np.float32)
+                    - np.asarray(reference, dtype=np.float32)
+                )
+                ** 2
+            )
+            for current, reference in zip(
+                fedprox_golden["current_trainable_variables"],
+                fedprox_golden["reference_trainable_variables"],
+                strict=True,
+            )
+        )
+        proximal_term = fedprox["mu"] / 2.0 * squared_distance
+        self.assertEqual(data_loss, fedprox_golden["data_loss"])
+        self.assertEqual(proximal_term, fedprox_golden["proximal_term"])
+        self.assertEqual(data_loss + proximal_term, fedprox_golden["local_objective"])
+
+        huber = strategies["fedprox_huber"]
         self.assertEqual(
             (
-                strategies["fedprox_huber"]["threshold"],
-                strategies["fedprox_huber"]["iterations"],
-                strategies["fedprox_huber"]["epsilon"],
+                huber["threshold"],
+                huber["iterations"],
+                huber["epsilon"],
             ),
             (10.0, 10, 1e-8),
+        )
+        self.assertIn("model.weights order", huber["client_vector"])
+        self.assertIn("float32", huber["client_vector"])
+        self.assertIn("positive integer", huber["sample_weight"])
+        self.assertIn("divide", huber["sample_weight"])
+        self.assertIn("numpy.linalg.norm", huber["residual_norm"])
+        self.assertIn("residual_i+epsilon", huber["epsilon_rule"])
+        self.assertIn("residual_i <= threshold", huber["epsilon_rule"])
+        self.assertIn("exactly 10 updates", huber["update"])
+        huber_golden = huber["golden_probe"]
+        initial, aggregate = iterative_huber_aggregate(
+            np.asarray(huber_golden["client_vectors"]),
+            np.asarray(huber_golden["sample_weights"]),
+            huber["threshold"],
+            huber["epsilon"],
+            huber["iterations"],
+        )
+        np.testing.assert_allclose(
+            initial, huber_golden["initial_estimate"], rtol=0, atol=0
+        )
+        np.testing.assert_allclose(
+            aggregate,
+            huber_golden["estimate_after_10_updates"],
+            rtol=0,
+            atol=1e-15,
         )
 
         beta = strategies["fedtrimmedavg"]["beta"]
@@ -1498,6 +1755,88 @@ print(json.dumps({
         self.assertEqual(statistics["confidence_interval"], 0.95)
         self.assertEqual(statistics["t_critical"], 2.776)
         self.assertTrue(statistics["paired_deltas"])
+        self.assertEqual(statistics["paired_delta_dtype"], "float64")
+        self.assertEqual(
+            statistics["paired_delta_operation"], "candidate_minus_baseline"
+        )
+        self.assertIn("candidate_value", statistics["paired_delta_formula"])
+        self.assertIn("baseline_value", statistics["paired_delta_formula"])
+        self.assertIn("never reverse", statistics["paired_delta_formula"])
+
+    def test_paired_baseline_pair_sets_are_exact_and_registered(self) -> None:
+        matrix = self.protocol["matrix"]
+        contrasts = {
+            contrast["name"]: contrast
+            for contrast in self.protocol["statistics"]["paired_contrasts"]
+        }
+        expected_by_matrix = {
+            "primary_federated": [
+                "primary_strategy_vs_fedavg",
+                "primary_partition_vs_iid",
+            ],
+            "centralized": [],
+            "local_only": ["local_partition_vs_iid"],
+            "scale": ["scale_vs_4_clients"],
+            "robustness": ["robustness_vs_no_attack"],
+            "membership_inference": ["membership_fedavg_vs_centralized"],
+            "update_leakage": [],
+        }
+        for matrix_kind, names in expected_by_matrix.items():
+            self.assertEqual(matrix[matrix_kind]["paired_contrasts"], names)
+            if not names:
+                self.assertEqual(
+                    matrix[matrix_kind]["paired_delta_policy"],
+                    "none_because_no_registered_factor_has_multiple_levels",
+                )
+        self.assertEqual(
+            set(contrasts), set(itertools.chain(*expected_by_matrix.values()))
+        )
+
+        expected_pair_counts = {
+            "primary_strategy_vs_fedavg": 80,
+            "primary_partition_vs_iid": 75,
+            "local_partition_vs_iid": 15,
+            "scale_vs_4_clients": 70,
+            "robustness_vs_no_attack": 80,
+            "membership_fedavg_vs_centralized": 5,
+        }
+        for name, expected_count in expected_pair_counts.items():
+            contrast = contrasts[name]
+            pairs = paired_contrast_pairs(self.protocol, contrast)
+            self.assertEqual(len(pairs), expected_count)
+            self.assertTrue(contrast["metrics"])
+            for candidate, baseline in pairs:
+                self.assertEqual(candidate["seed"], baseline["seed"])
+                candidate_value = float(candidate["seed"] + 1)
+                baseline_value = float(baseline["seed"] - 1)
+                self.assertEqual(candidate_value - baseline_value, 2.0)
+
+        strategy_pair = paired_contrast_pairs(
+            self.protocol, contrasts["primary_strategy_vs_fedavg"]
+        )[0]
+        self.assertEqual(strategy_pair[1]["strategy"], "fedavg")
+        partition_pair = paired_contrast_pairs(
+            self.protocol, contrasts["primary_partition_vs_iid"]
+        )[0]
+        self.assertEqual(partition_pair[1]["partition"], "iid_stratified")
+        self.assertIsNone(partition_pair[1]["alpha"])
+        scale_pair = paired_contrast_pairs(
+            self.protocol, contrasts["scale_vs_4_clients"]
+        )[0]
+        self.assertEqual(
+            (scale_pair[1]["matrix_kind"], scale_pair[1]["client_scale"]),
+            ("primary_federated", 4),
+        )
+        robustness_pair = paired_contrast_pairs(
+            self.protocol, contrasts["robustness_vs_no_attack"]
+        )[0]
+        self.assertEqual(robustness_pair[1]["matrix_kind"], "primary_federated")
+        self.assertIsNone(robustness_pair[1]["threat"])
+        membership_pair = paired_contrast_pairs(
+            self.protocol, contrasts["membership_fedavg_vs_centralized"]
+        )[0]
+        self.assertEqual(membership_pair[1]["strategy"], "centralized")
+        self.assertIsNone(membership_pair[1]["partition"])
 
     def test_privacy_analyses_have_exact_candidates_labels_and_scores(self) -> None:
         privacy = self.protocol["privacy"]

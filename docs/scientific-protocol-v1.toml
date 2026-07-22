@@ -187,21 +187,32 @@ loss_label_smoothing = 0.0
 loss_axis = -1
 loss_reduction = "sum_over_batch_size"
 loss_probability_clip = 1e-7
-loss_definition = "For each float32 example with sentiment label y in {0,1} and sigmoid probability p, Keras clips p to [1e-7, 1-1e-7], computes -(y*ln(p)+(1-y)*ln(1-p)), averages over the one-element output axis, then sum_over_batch_size averages examples in the batch."
+loss_logit_recovery_required = true
+loss_definition = "The registered sigmoid output tensor must be passed directly to keras.losses.BinaryCrossentropy. In Keras 3.14.0 with the TensorFlow 2.20.0 backend, the Sigmoid layer attaches its pre-activation float32 logits; BinaryCrossentropy(from_logits=False) recovers those logits and evaluates tf.nn.sigmoid_cross_entropy_with_logits, averages the one-element output axis, then sum_over_batch_size averages examples in the batch. Never detach, copy, cast, serialize, or reconstruct probabilities before training loss evaluation because doing so loses the attached logits and changes saturated-edge loss semantics."
+loss_probability_fallback = "loss_probability_clip=1e-7 documents Keras's fallback only when no attached logits exist; that fallback is not the registered model-training path."
+
+[model.loss_golden_probe]
+dtype = "float32"
+logits = [100.0, -100.0, 0.0]
+labels = [0.0, 1.0, 1.0]
+sigmoid_probabilities = [1.0, 0.0, 0.5]
+elementwise_losses = [100.0, 100.0, 0.6931471824645996]
+sum_over_batch_size_loss = 66.89771270751953
 
 [preprocessing]
 input_dtype = "tf.string"
 unicode_normalization = "none"
 html_removal = "tf.strings.regex_replace(text, '<[^>]+>', ' ') using TensorFlow RE2 semantics"
 lowercase = "tf.strings.lower"
+lowercase_semantics = "Under TensorFlow 2.20.0, tf.strings.lower maps ASCII U+0041 through U+005A to U+0061 through U+007A and preserves every non-ASCII UTF-8 code point exactly; no Unicode case folding or normalization occurs."
 punctuation_characters = '''!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~'''
 punctuation_handling = "Delete every ASCII string.punctuation code point with tf.strings.regex_replace; do not replace punctuation with whitespace."
-standardization_order = ["html_removal", "unicode_lowercase", "ascii_punctuation_deletion"]
+standardization_order = ["html_removal", "ascii_lowercase", "ascii_punctuation_deletion"]
 standardize_python = '''def protocol_standardize(text):
     text = tf.strings.regex_replace(text, "<[^>]+>", " ")
     text = tf.strings.lower(text)
     return tf.strings.regex_replace(text, "[" + re.escape(string.punctuation) + "]", "")'''
-tokenization = "keras.layers.TextVectorization split='whitespace', which delegates to tf.strings.split on Unicode whitespace after standardization"
+tokenization = "keras.layers.TextVectorization split='whitespace' delegates to tf.strings.split with sep=None. Under TensorFlow 2.20.0, only maximal nonempty runs of ASCII HT, LF, VT, FF, CR, and SPACE (U+0009 through U+000D and U+0020) delimit tokens; leading and trailing delimiters and empty tokens are discarded. Non-ASCII whitespace, including U+00A0, U+2003, U+2028, and U+2029, remains inside tokens."
 max_tokens = 20000
 reserved_tokens = ["", "[UNK]"]
 padding_token_id = 0
@@ -213,8 +224,9 @@ output_mode = "int"
 output_sequence_length = 500
 truncation = "post_retain_the_first_500_tokens"
 padding = "post_append_token_id_0_to_length_500"
-output_dtype = "int32"
-vectorizer_python = '''keras.layers.TextVectorization(max_tokens=20000, standardize=protocol_standardize, split="whitespace", output_mode="int", output_sequence_length=500, pad_to_max_tokens=False, dtype="int32")'''
+layer_dtype = "string"
+output_dtype = "int64"
+vectorizer_python = '''keras.layers.TextVectorization(max_tokens=20000, standardize=protocol_standardize, split="whitespace", output_mode="int", output_sequence_length=500, pad_to_max_tokens=False)'''
 adaptation_split = "official_train_entire_25000_rows_labels_ignored_test_and_unsupervised_excluded"
 adaptation_order = "ascending_zero_based_official_train_row_index"
 adaptation_batch_size = 256
@@ -227,11 +239,24 @@ vocabulary_size = 20000
 vocabulary_sha256 = "021e9f054e1b1ad4622fdb87d6d98f17337d202cc35faefdcfd8ae15a3887b9b"
 vocabulary_verification = "Hard-fail before the first cell unless both get_vocabulary length and serialized SHA-256 equal vocabulary_size and vocabulary_sha256."
 
+[[preprocessing.golden_cases]]
+name = "ascii_lowercase_unicode_preservation"
+input = "<b>AZ</b>\tÄÖÜ ẞ Σ İ CAFÉ!"
+standardized = " az \tÄÖÜ ẞ Σ İ cafÉ"
+tokens = ["az", "ÄÖÜ", "ẞ", "Σ", "İ", "cafÉ"]
+
+[[preprocessing.golden_cases]]
+name = "exact_ascii_whitespace"
+input = " A\tB\nC\rD\fE\u000bF  G\u00a0H\u2003I\u2028J\u2029K "
+standardized = " a\tb\nc\rd\fe\u000bf  g\u00a0h\u2003i\u2028j\u2029k "
+tokens = ["a", "b", "c", "d", "e", "f", "g\u00a0h\u2003i\u2028j\u2029k"]
+
 [framework]
 tensorflow_version = "2.20.0"
 keras_version = "3.14.0"
+numpy_version = "2.4.4"
 keras_backend = "tensorflow"
-version_check = "Hard-fail before preprocessing or training unless tensorflow.__version__ and keras.__version__ exactly match the registered versions."
+version_check = "Hard-fail before preprocessing, partitioning, or training unless tensorflow.__version__, keras.__version__, and numpy.__version__ exactly match the registered versions."
 execution_environment_before_import = { KERAS_BACKEND = "tensorflow", TF_ENABLE_ONEDNN_OPTS = "0", TF_DETERMINISTIC_OPS = "1", PYTHONHASHSEED = "0" }
 deterministic_ops_api = "tf.config.experimental.enable_op_determinism()"
 seed_api = "keras.utils.set_random_seed(tensorflow_seed)"
@@ -297,6 +322,21 @@ kind = "sample_weighted_mean"
 [strategies.fedprox]
 kind = "sample_weighted_mean_with_proximal_objective"
 mu = 0.1
+reference = "Immediately after loading round-start global model weights, create one immutable TensorFlow constant per model.trainable_weights entry in that order using keras.ops.convert_to_tensor(weight.numpy().copy()); create these before the first local optimizer step and reuse the same constants for every batch in that client's one local epoch."
+data_loss = "Construct keras.losses.BinaryCrossentropy() with its Keras 3.14.0 defaults, which equal the registered from_logits, label_smoothing, axis, and sum_over_batch_size reduction. For each batch, evaluate it on the registered labels and attached-logit sigmoid output with no sample weights."
+proximal_term = "In TensorFlow float32 and model.trainable_weights order, form one scalar term per variable with keras.ops.sum(keras.ops.square(local_weight-reference_weight)), then left-fold addition from the first term through the last and multiply by mu/2. Include every trainable scalar exactly once and no non-trainable variable."
+local_objective = "data_loss + proximal_term; differentiate this scalar once with respect to model.trainable_variables and apply one Adam update per batch. The proximal term is one batch-level scalar and is not divided or multiplied by batch size."
+client_update = "After the local epoch, each client submits post-fit trainable and non-trainable model weights minus corresponding round-start global weights in model.weights order."
+aggregation_sample_weight = "The integer number of that client's fitted training rows supplied to the optimizer, excluding validation rows; retries do not change this weight."
+aggregation = "For every weight tensor independently in its native float32 shape, compute sum(client_sample_weight * client_update) / sum(client_sample_weight) in ascending client_id order, then add the result to the corresponding round-start global weight."
+
+[strategies.fedprox.golden_probe]
+batch_example_losses = [0.2, 0.8]
+current_trainable_variables = [[1.0, 2.0], [3.0]]
+reference_trainable_variables = [[0.0, 2.0], [1.0]]
+data_loss = 0.5
+proximal_term = 0.25
+local_objective = 0.75
 
 [strategies.fedprox_huber]
 kind = "fedprox_with_iterative_huber_aggregation"
@@ -304,6 +344,21 @@ mu = 0.1
 threshold = 10.0
 iterations = 10
 epsilon = 1e-8
+local_objective = "Exactly strategies.fedprox, including its immutable round-start reference, float32 proximal sum reduction, batch-level placement, and Adam update."
+client_vector = "For each client in ascending client_id order, apply any registered threat to its model delta, add the submitted delta to the common round-start global model, flatten each resulting post-fit model weight with numpy.ndarray.flatten() in default C order, and concatenate weights in model.weights order. Registered inputs are float32. All clients must have identical finite vector lengths or the cell hard-fails."
+sample_weight = "Convert each positive integer strategies.fedprox aggregation_sample_weight to float64, divide the vector of weights by its float64 sum once, and retain these normalized base weights for every iteration."
+initialization = "Set estimate_0 = numpy.average(client_vectors, axis=0, weights=normalized_base_weights). Float32 client vectors and float64 weights produce a float64 estimate."
+residual_norm = "At iteration t, residual_i = numpy.linalg.norm(estimate_t - client_vector_i) with no ord argument, the float64 Euclidean norm over the complete flattened vector."
+epsilon_rule = "If residual_i <= threshold, set scale_i=1.0 without using epsilon; otherwise set scale_i=threshold/(residual_i+epsilon) exactly."
+huber_weight = "Set effective_weight_i = sample_weight_i * scale_i."
+update = "For t=0 through 9, normalize effective weights by their sum, then set estimate_(t+1) = numpy.average(client_vectors, axis=0, weights=normalized_effective_weights), preserving ascending client_id order in float64. Execute exactly 10 updates with no early stopping. Hard-fail on non-finite values or a non-positive effective-weight sum."
+reconstruction = "After iteration 10, split the float64 estimate_10 at the original model-weight element counts and reshape each part in C order to its reference model.weights shape without a dtype cast; serialize those arrays as the aggregated global parameters."
+
+[strategies.fedprox_huber.golden_probe]
+client_vectors = [[0.0, 0.0], [30.0, 0.0], [0.0, 40.0]]
+sample_weights = [2, 1, 1]
+initial_estimate = [7.5, 10.0]
+estimate_after_10_updates = [4.335034175752573, 4.163210734443747]
 
 [strategies.fedmedian]
 kind = "coordinate_wise_median"
@@ -470,7 +525,69 @@ t_critical = 2.776
 variance_ddof = 1
 paired_deltas = true
 paired_by = "seed"
-paired_delta_baselines = ["fedavg", "iid_stratified", "4_clients", "no_attack"]
+paired_delta_dtype = "float64"
+paired_delta_operation = "candidate_minus_baseline"
+paired_delta_formula = "For every registered contrast, paired metric, candidate cell c, and master seed s, delta(c,s,metric)=float64(candidate_value(c,s,metric))-float64(baseline_value(mapped_baseline(c),s,metric)). Compute the five raw deltas before the registered mean, sample variance, sample standard deviation, or confidence interval; never reverse the subtraction."
+
+[[statistics.paired_contrasts]]
+name = "primary_strategy_vs_fedavg"
+candidate_matrix = "primary_federated"
+candidate_exclude = { strategy = ["fedavg"] }
+baseline_matrix = "primary_federated"
+preserve_fields = ["partition", "alpha", "client_scale", "seed", "threat"]
+set_fields = { strategy = "fedavg" }
+clear_fields = []
+metrics = ["accuracy", "precision", "recall", "f1", "roc_auc", "convergence_round", "communication_bytes", "client_training_time_ns"]
+
+[[statistics.paired_contrasts]]
+name = "primary_partition_vs_iid"
+candidate_matrix = "primary_federated"
+candidate_exclude = { partition = ["iid_stratified"] }
+baseline_matrix = "primary_federated"
+preserve_fields = ["strategy", "client_scale", "seed", "threat"]
+set_fields = { partition = "iid_stratified" }
+clear_fields = ["alpha"]
+metrics = ["accuracy", "precision", "recall", "f1", "roc_auc", "convergence_round", "communication_bytes", "client_training_time_ns"]
+
+[[statistics.paired_contrasts]]
+name = "local_partition_vs_iid"
+candidate_matrix = "local_only"
+candidate_exclude = { partition = ["iid_stratified"] }
+baseline_matrix = "local_only"
+preserve_fields = ["strategy", "client_scale", "seed", "threat"]
+set_fields = { partition = "iid_stratified" }
+clear_fields = ["alpha"]
+metrics = ["accuracy", "precision", "recall", "f1", "roc_auc", "training_time_ns"]
+
+[[statistics.paired_contrasts]]
+name = "scale_vs_4_clients"
+candidate_matrix = "scale"
+candidate_exclude = {}
+baseline_matrix = "primary_federated"
+preserve_fields = ["strategy", "partition", "alpha", "seed", "threat"]
+set_fields = { client_scale = 4 }
+clear_fields = []
+metrics = ["accuracy", "precision", "recall", "f1", "roc_auc", "convergence_round", "communication_bytes", "client_training_time_ns"]
+
+[[statistics.paired_contrasts]]
+name = "robustness_vs_no_attack"
+candidate_matrix = "robustness"
+candidate_exclude = {}
+baseline_matrix = "primary_federated"
+preserve_fields = ["strategy", "partition", "alpha", "client_scale", "seed"]
+set_fields = {}
+clear_fields = ["threat"]
+metrics = ["accuracy", "precision", "recall", "f1", "roc_auc", "convergence_round", "communication_bytes", "client_training_time_ns"]
+
+[[statistics.paired_contrasts]]
+name = "membership_fedavg_vs_centralized"
+candidate_matrix = "membership_inference"
+candidate_exclude = { strategy = ["centralized"] }
+baseline_matrix = "membership_inference"
+preserve_fields = ["seed", "threat"]
+set_fields = { strategy = "centralized" }
+clear_fields = ["partition", "alpha", "client_scale"]
+metrics = ["roc_auc", "max_tpr_minus_fpr", "tpr_at_1_percent_fpr"]
 
 [matrix.primary_federated]
 strategies = ["fedavg", "fedprox", "fedprox_huber", "fedmedian", "fedtrimmedavg"]
@@ -478,11 +595,14 @@ partitions = ["iid_stratified", "dirichlet_1.0", "dirichlet_0.5", "dirichlet_0.1
 seeds = 5
 client_scale = 4
 cells = 100
+paired_contrasts = ["primary_strategy_vs_fedavg", "primary_partition_vs_iid"]
 
 [matrix.centralized]
 strategies = ["centralized"]
 seeds = 5
 cells = 5
+paired_contrasts = []
+paired_delta_policy = "none_because_no_registered_factor_has_multiple_levels"
 
 [matrix.local_only]
 strategies = ["local_only"]
@@ -492,6 +612,7 @@ client_scale = 4
 cells = 20
 training_invocations_per_cell = 4
 training_invocations = 80
+paired_contrasts = ["local_partition_vs_iid"]
 
 [matrix.scale]
 strategies = ["fedavg", "fedprox_huber"]
@@ -499,7 +620,12 @@ seeds = 5
 client_scales = [16, 64]
 partitions_by_client_scale = { "16" = ["iid_stratified", "dirichlet_1.0", "dirichlet_0.5", "dirichlet_0.1"], "64" = ["iid_stratified", "dirichlet_1.0", "dirichlet_0.5"] }
 excluded_cells = "dirichlet_0.1 at 64 clients is not registered because no master seed satisfies minimum_samples_per_client within attempts 0 through 9999"
+excluded_partition = "dirichlet_0.1"
+excluded_client_scale = 64
+excluded_seeds = [67, 101, 211, 307, 401]
+exclusion_attempt_range = [0, 9999]
 cells = 70
+paired_contrasts = ["scale_vs_4_clients"]
 
 [matrix.robustness]
 strategies = ["fedavg", "fedprox_huber", "fedmedian", "fedtrimmedavg"]
@@ -509,6 +635,7 @@ seeds = 5
 client_scale = 4
 partition = "dirichlet_0.5"
 cells = 80
+paired_contrasts = ["robustness_vs_no_attack"]
 
 [matrix.membership_inference]
 models = ["centralized", "fedavg"]
@@ -518,6 +645,7 @@ fedavg_model_source = "matrix.primary_federated_fedavg_dirichlet_0.5_4_clients_s
 fedavg_client_scale = 4
 fedavg_partition = "dirichlet_0.5"
 cells = 10
+paired_contrasts = ["membership_fedavg_vs_centralized"]
 
 [matrix.update_leakage]
 models = ["fedavg"]
@@ -526,6 +654,8 @@ fedavg_model_source = "matrix.primary_federated_fedavg_dirichlet_0.5_4_clients_s
 client_scale = 4
 partition = "dirichlet_0.5"
 cells = 5
+paired_contrasts = []
+paired_delta_policy = "none_because_no_registered_factor_has_multiple_levels"
 
 [matrix.totals]
 maximum_cells = 290
