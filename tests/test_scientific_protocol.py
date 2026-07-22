@@ -2,7 +2,10 @@ import hashlib
 import itertools
 import json
 import math
+import os
 import re
+import subprocess
+import sys
 import tomllib
 import unittest
 from pathlib import Path
@@ -285,6 +288,79 @@ def privacy_sample(
     return np.concatenate(selected)
 
 
+def privacy_binary_crossentropy(
+    labels: np.ndarray,
+    probabilities: np.ndarray,
+    clip_minimum: float,
+    clip_maximum: float,
+) -> np.ndarray:
+    """Compute the registered unreduced privacy binary cross-entropy.
+
+    Args:
+        labels: Binary membership labels.
+        probabilities: Predicted positive-class probabilities.
+        clip_minimum: Inclusive lower probability bound.
+        clip_maximum: Inclusive upper probability bound.
+
+    Returns:
+        Float64 loss for each input pair.
+    """
+    y = np.asarray(labels, dtype=np.float64)
+    probability = np.asarray(probabilities, dtype=np.float64)
+    clipped = np.clip(probability, clip_minimum, clip_maximum)
+    return -(y * np.log(clipped) + (1.0 - y) * np.log1p(-clipped))
+
+
+def privacy_roc(
+    labels: np.ndarray, scores: np.ndarray, target_fpr: float
+) -> dict[str, Any]:
+    """Compute the registered tie-aware privacy ROC summaries.
+
+    Args:
+        labels: Binary membership labels with members encoded as one.
+        scores: Finite attack scores where larger means more likely member.
+        target_fpr: False-positive rate used for interpolated TPR reporting.
+
+    Returns:
+        Thresholds, ROC points, AUC, maximum advantage, and target-FPR TPR.
+
+    Raises:
+        ValueError: If shapes differ, values are invalid, or a class is absent.
+    """
+    y = np.asarray(labels, dtype=np.int64)
+    score = np.asarray(scores, dtype=np.float64)
+    if y.shape != score.shape or y.ndim != 1:
+        raise ValueError("privacy labels and scores must be same-length vectors")
+    if not np.all(np.isfinite(score)) or not np.all(np.isin(y, [0, 1])):
+        raise ValueError("privacy labels must be binary and scores must be finite")
+    positives = int(np.count_nonzero(y == 1))
+    negatives = int(np.count_nonzero(y == 0))
+    if positives == 0 or negatives == 0:
+        raise ValueError("privacy ROC requires both membership classes")
+
+    thresholds = np.concatenate(([np.inf], np.unique(score)[::-1]))
+    fpr = np.empty(thresholds.size, dtype=np.float64)
+    tpr = np.empty(thresholds.size, dtype=np.float64)
+    for index, threshold in enumerate(thresholds):
+        predicted_positive = score >= threshold
+        tpr[index] = np.count_nonzero(predicted_positive & (y == 1)) / positives
+        fpr[index] = np.count_nonzero(predicted_positive & (y == 0)) / negatives
+
+    advantage = tpr - fpr
+    best_index = int(np.argmax(advantage))
+    distinct_fpr = np.unique(fpr)
+    maximum_tpr = np.asarray([tpr[fpr == value].max() for value in distinct_fpr])
+    return {
+        "thresholds": thresholds,
+        "fpr": fpr,
+        "tpr": tpr,
+        "roc_auc": float(np.trapezoid(tpr, fpr)),
+        "max_tpr_minus_fpr": float(advantage[best_index]),
+        "max_threshold": float(thresholds[best_index]),
+        "tpr_at_target_fpr": float(np.interp(target_fpr, distinct_fpr, maximum_tpr)),
+    }
+
+
 def canonical_cell_id(cell: dict[str, Any]) -> str:
     """Serialize one matrix cell as its canonical identifier.
 
@@ -364,10 +440,10 @@ def registered_cells(protocol: dict[str, Any]) -> list[dict[str, Any]]:
     scale = matrix["scale"]
     cells.extend(
         cell("scale", strategy, partition, client_scale, seed)
-        for strategy, partition, client_scale, seed in itertools.product(
+        for client_scale in scale["client_scales"]
+        for strategy, partition, seed in itertools.product(
             scale["strategies"],
-            scale["partitions"],
-            scale["client_scales"],
+            scale["partitions_by_client_scale"][str(client_scale)],
             seeds,
         )
     )
@@ -618,6 +694,17 @@ class ScientificProtocolTests(unittest.TestCase):
         self.assertTrue(model["embedding_trainable"])
         self.assertEqual(model["padding_token_id"], 0)
         self.assertFalse(model["convolution_use_bias"])
+        self.assertEqual(model["loss"], "keras.losses.BinaryCrossentropy")
+        self.assertEqual(
+            (
+                model["loss_from_logits"],
+                model["loss_label_smoothing"],
+                model["loss_axis"],
+                model["loss_reduction"],
+                model["loss_probability_clip"],
+            ),
+            (False, 0.0, -1, "sum_over_batch_size", 1e-7),
+        )
 
         training = self.protocol["training"]
         self.assertEqual(
@@ -641,6 +728,141 @@ class ScientificProtocolTests(unittest.TestCase):
         self.assertFalse(training["early_stopping"])
         self.assertFalse(training["update_noise"])
 
+    def test_preprocessing_and_framework_reproducibility_are_executable(self) -> None:
+        preprocessing = self.protocol["preprocessing"]
+        framework = self.protocol["framework"]
+        self.assertEqual(preprocessing["reserved_tokens"], ["", "[UNK]"])
+        self.assertEqual(
+            (
+                preprocessing["padding_token_id"],
+                preprocessing["oov_token_id"],
+                preprocessing["oov_buckets"],
+                preprocessing["learned_token_limit"],
+            ),
+            (0, 1, 1, 19998),
+        )
+        self.assertEqual(
+            (
+                preprocessing["max_tokens"],
+                preprocessing["output_sequence_length"],
+                preprocessing["vocabulary_size"],
+            ),
+            (20000, 500, 20000),
+        )
+        self.assertEqual(
+            preprocessing["punctuation_characters"],
+            r"""!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~""",
+        )
+        self.assertEqual(
+            preprocessing["vocabulary_sha256"],
+            "021e9f054e1b1ad4622fdb87d6d98f17337d202cc35faefdcfd8ae15a3887b9b",
+        )
+        self.assertRegex(preprocessing["vocabulary_sha256"], r"^[0-9a-f]{64}$")
+        self.assertIn(
+            "official_train_entire_25000_rows", preprocessing["adaptation_split"]
+        )
+        self.assertIn("Never call adapt again", preprocessing["adaptation_lifecycle"])
+        self.assertIn("first_500", preprocessing["truncation"])
+        self.assertIn("token_id_0", preprocessing["padding"])
+
+        probe = r"""
+import hashlib
+import json
+import re
+import string
+import sys
+
+import keras
+import numpy as np
+import tensorflow as tf
+
+config = json.loads(sys.argv[1])
+tf.config.experimental.enable_op_determinism()
+namespace = {"keras": keras, "re": re, "string": string, "tf": tf}
+exec(config["standardize_python"], namespace)
+vectorizer = eval(config["vectorizer_python"], namespace)
+texts = ["<b>Alpha</b> beta!", "beta, GAMMA", "can't stop", "café alpha"]
+vectorizer.adapt(tf.data.Dataset.from_tensor_slices(texts).batch(2))
+vocabulary = vectorizer.get_vocabulary()
+token_ids = vectorizer(tf.constant(["<i>ALPHA</i> unknown!!!"]))[0, :5]
+
+def dropout_sequence():
+    layer = keras.layers.Dropout(0.3, seed=54321)
+    inputs = tf.ones((4, 8), dtype=tf.float32)
+    return [layer(inputs, training=True).numpy(), layer(inputs, training=True).numpy()]
+
+def training_hash():
+    keras.backend.clear_session()
+    keras.utils.set_random_seed(12345)
+    inputs = keras.Input(shape=(4,), dtype="float32")
+    hidden = keras.layers.Dense(5, activation="relu")(inputs)
+    hidden = keras.layers.Dropout(0.3, seed=54321)(hidden)
+    outputs = keras.layers.Dense(1, activation="sigmoid")(hidden)
+    model = keras.Model(inputs, outputs)
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=0.001),
+        loss=keras.losses.BinaryCrossentropy(
+            from_logits=False,
+            label_smoothing=0.0,
+            axis=-1,
+            reduction="sum_over_batch_size",
+        ),
+    )
+    x = np.arange(32, dtype=np.float32).reshape(8, 4) / 31.0
+    y = np.asarray([[0], [1], [0], [1], [1], [0], [1], [0]], dtype=np.float32)
+    for _ in range(2):
+        model.train_on_batch(x, y)
+    digest = hashlib.sha256()
+    for weight in model.weights:
+        digest.update(np.asarray(weight).tobytes(order="C"))
+    return digest.hexdigest()
+
+first_masks = dropout_sequence()
+second_masks = dropout_sequence()
+print(json.dumps({
+    "tensorflow_version": tf.__version__,
+    "keras_version": keras.__version__,
+    "vocabulary": vocabulary,
+    "token_ids": token_ids.numpy().tolist(),
+    "dropout_rebuild_equal": all(
+        np.array_equal(left, right)
+        for left, right in zip(first_masks, second_masks, strict=True)
+    ),
+    "dropout_calls_differ": not np.array_equal(first_masks[0], first_masks[1]),
+    "training_hashes": [training_hash(), training_hash()],
+}))
+"""
+        environment = os.environ.copy()
+        environment.update(framework["execution_environment_before_import"])
+        environment["CUDA_VISIBLE_DEVICES"] = ""
+        completed = subprocess.run(
+            [sys.executable, "-c", probe, json.dumps(preprocessing)],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["tensorflow_version"], framework["tensorflow_version"])
+        self.assertEqual(result["keras_version"], framework["keras_version"])
+        self.assertEqual(
+            result["vocabulary"],
+            ["", "[UNK]", "beta", "alpha", "stop", "gamma", "cant", "café"],
+        )
+        self.assertEqual(result["token_ids"], [3, 1, 0, 0, 0])
+        self.assertTrue(result["dropout_rebuild_equal"])
+        self.assertTrue(result["dropout_calls_differ"])
+        self.assertEqual(result["training_hashes"][0], result["training_hashes"][1])
+        self.assertEqual(
+            framework["deterministic_ops_api"],
+            "tf.config.experimental.enable_op_determinism()",
+        )
+        self.assertEqual(
+            framework["seed_api"], "keras.utils.set_random_seed(tensorflow_seed)"
+        )
+        self.assertIn("Dropout(seed=seed)", framework["dropout"]["seed_argument"])
+        self.assertIn("never reset", self.protocol["training"]["dropout_rng"])
+
     def test_seed_derivation_and_rng_namespaces_are_executable_and_exact(self) -> None:
         seeding = self.protocol["seeding"]
         self.assertEqual(seeding["hash_algorithm"], "sha256")
@@ -653,6 +875,12 @@ class ScientificProtocolTests(unittest.TestCase):
         )
         self.assertEqual(seeding["default_attempt"], 0)
         self.assertTrue(seeding["namespace_reuse_forbidden"])
+        tensorflow_seed_namespace = {"derived_uint64": 2147483647}
+        exec(seeding["tensorflow_seed_python"], {}, tensorflow_seed_namespace)
+        self.assertEqual(tensorflow_seed_namespace["seed"], 1)
+        tensorflow_seed_namespace = {"derived_uint64": 2147483648}
+        exec(seeding["tensorflow_seed_python"], {}, tensorflow_seed_namespace)
+        self.assertEqual(tensorflow_seed_namespace["seed"], 1)
         self.assertEqual(
             set(seeding["application"]),
             {
@@ -716,7 +944,7 @@ class ScientificProtocolTests(unittest.TestCase):
                 "validation": "validation/{partition_name}/{client_scale}/round--1/epoch--1/client-{client_id}/label-{label}",
                 "model_initialization": "model/{cell_id}/round--1/epoch--1/client-{client_id}",
                 "training_order": "training/{cell_id}/round-{round_index}/epoch-{epoch_index}/client-{client_id}",
-                "dropout": "dropout/{cell_id}/round-{round_index}/epoch-{epoch_index}/client-{client_id}",
+                "dropout": "dropout/{cell_id}/round-{round_index}/epoch--1/client-{client_id}",
                 "malicious_order": "malicious-order/dirichlet_0.5/4/round--1/epoch--1/client--1",
                 "membership_member": "privacy/membership/{cell_id}/member/round--1/epoch--1/client--1/label-{label}",
                 "membership_nonmember": "privacy/membership/{cell_id}/nonmember/round--1/epoch--1/client--1/label-{label}",
@@ -874,7 +1102,6 @@ class ScientificProtocolTests(unittest.TestCase):
             ("dirichlet_0.1", 16): [4664, 167, 1148, 41, 547],
             ("dirichlet_1.0", 64): [1, 0, 1, 0, 0],
             ("dirichlet_0.5", 64): [66, 209, 172, 113, 316],
-            ("dirichlet_0.1", 64): [None, None, None, None, None],
         }
         actual_attempts = {
             (partition_name, client_scale): [
@@ -904,16 +1131,7 @@ class ScientificProtocolTests(unittest.TestCase):
                     client_scale,
                 )
             ]
-            if result is None:
-                self.assertEqual(
-                    (
-                        registered_cell["matrix_kind"],
-                        partition_name,
-                        client_scale,
-                    ),
-                    ("scale", "dirichlet_0.1", 64),
-                )
-                continue
+            self.assertIsNotNone(result)
             attempt, shards = result
             self.assertGreaterEqual(
                 attempt, self.protocol["partitioning"]["first_attempt"]
@@ -1174,6 +1392,9 @@ class ScientificProtocolTests(unittest.TestCase):
         self.assertEqual(
             clients["fit_participation"], "all_registered_clients_every_round"
         )
+        self.assertEqual(clients["evaluation_participation"], "none")
+        self.assertIn("server evaluates", clients["evaluation_execution"])
+        self.assertIn("no evaluate request", clients["evaluation_execution"])
         self.assertEqual(clients["order"], "ascending_numeric_client_id")
         malicious = self.protocol["selection"]["malicious"]
         self.assertIn("first k IDs", malicious["algorithm"])
@@ -1351,6 +1572,64 @@ class ScientificProtocolTests(unittest.TestCase):
         self.assertEqual(leakage["zero_norm_score"], 0.0)
         self.assertIn("larger_means_more_likely", leakage["score_direction"])
 
+    def test_privacy_bce_and_roc_golden_vectors_are_exact(self) -> None:
+        bce = self.protocol["privacy"]["binary_crossentropy"]
+        self.assertEqual(bce["dtype"], "float64")
+        self.assertEqual(bce["reduction"], "none")
+        for vector in bce["golden_vectors"]:
+            actual = privacy_binary_crossentropy(
+                np.asarray(vector["labels"]),
+                np.asarray(vector["probabilities"]),
+                bce["clip_minimum"],
+                bce["clip_maximum"],
+            )
+            np.testing.assert_allclose(
+                actual,
+                vector["losses"],
+                rtol=0.0,
+                atol=1e-15,
+            )
+
+        metric = self.protocol["privacy"]["metrics"]
+        self.assertEqual(metric["target_fpr"], 0.01)
+        self.assertIn("score >= t", metric["thresholds"])
+        self.assertIn("all equal-score records atomically", metric["thresholds"])
+        self.assertIn("numpy.trapezoid", metric["roc_auc"])
+        self.assertIn("numpy.interp", metric["tpr_at_1_percent_fpr"])
+        for vector in metric["golden_vectors"]:
+            actual = privacy_roc(
+                np.asarray(vector["labels"]),
+                np.asarray(vector["scores"]),
+                metric["target_fpr"],
+            )
+            expected_thresholds = np.asarray(
+                [
+                    np.inf if threshold == "inf" else float(threshold)
+                    for threshold in vector["thresholds"]
+                ]
+            )
+            np.testing.assert_array_equal(actual["thresholds"], expected_thresholds)
+            np.testing.assert_allclose(actual["fpr"], vector["fpr"], rtol=0, atol=0)
+            np.testing.assert_allclose(actual["tpr"], vector["tpr"], rtol=0, atol=0)
+            self.assertAlmostEqual(actual["roc_auc"], vector["roc_auc"], places=15)
+            self.assertAlmostEqual(
+                actual["max_tpr_minus_fpr"],
+                vector["max_tpr_minus_fpr"],
+                places=15,
+            )
+            expected_max_threshold = (
+                np.inf if vector["max_threshold"] == "inf" else vector["max_threshold"]
+            )
+            self.assertEqual(actual["max_threshold"], expected_max_threshold)
+            self.assertAlmostEqual(
+                actual["tpr_at_target_fpr"],
+                vector["tpr_at_1_percent_fpr"],
+                places=15,
+            )
+
+        with self.assertRaisesRegex(ValueError, "both membership classes"):
+            privacy_roc(np.asarray([1, 1]), np.asarray([0.2, 0.1]), 0.01)
+
     def test_system_measurement_boundaries_and_retry_rules_are_exact(self) -> None:
         system = self.protocol["metrics"]["system"]
         self.assertIn("registered validation accuracy", system["convergence"])
@@ -1362,14 +1641,14 @@ class ScientificProtocolTests(unittest.TestCase):
         )
         self.assertEqual(
             system["reported_federated"],
-            ["convergence_round", "communication_bytes", "client_training_time"],
+            ["convergence_round", "communication_bytes", "client_training_time_ns"],
         )
         self.assertIn(
             "never report convergence_round", system["centralized_local_only_curves"]
         )
         self.assertEqual(
             system["reported_centralized_local_only"],
-            ["epoch_validation_curve", "client_training_time"],
+            ["epoch_validation_curve", "training_time_ns"],
         )
         self.assertEqual(
             system["convergence_evaluation_data"],
@@ -1380,10 +1659,23 @@ class ScientificProtocolTests(unittest.TestCase):
         self.assertEqual(system["client_fit_timer"], "time.perf_counter_ns")
         self.assertIn("immediately_before", system["client_fit_timer_start"])
         self.assertIn("immediately_after", system["client_fit_timer_stop"])
-        self.assertIn(
-            "sum_all_attempt_durations", system["client_fit_timer_retry_rule"]
-        )
+        self.assertIn("every attempt duration", system["client_fit_timer_retry_rule"])
         self.assertEqual(system["client_fit_timer_report_unit"], "nanoseconds")
+        self.assertIn(
+            "sum client fit attempt durations", system["federated_round_reduction"]
+        )
+        self.assertIn(
+            "Sum the 20 federated round totals", system["federated_run_reduction"]
+        )
+        self.assertIn(
+            "sum of the four model totals", system["local_only_model_reduction"]
+        )
+        self.assertIn("client_fit_timer_start", system["local_only_timer_boundaries"])
+        self.assertIn("single model.fit call", system["centralized_timer_start"])
+        self.assertIn(
+            "every initial and retried", system["centralized_retry_reduction"]
+        )
+        self.assertIn("Never sum timing across seeds", system["statistics_reduction"])
         self.assertEqual(system["communication_flower_version"], "1.32.1")
         self.assertEqual(
             system["communication_directions"],
@@ -1400,6 +1692,11 @@ class ScientificProtocolTests(unittest.TestCase):
             "every initial attempt and retry", system["communication_retry_rule"]
         )
         self.assertIn("never double-count", system["communication_retry_rule"])
+        self.assertEqual(
+            system["communication_included_messages"],
+            ["fit_request", "fit_response"],
+        )
+        self.assertIn("none", system["communication_evaluation_messages"])
         self.assertIn("transport_framing", system["communication_excluded_bytes"])
         self.assertEqual(
             system["communication_reporting"],
@@ -1434,10 +1731,26 @@ class ScientificProtocolTests(unittest.TestCase):
         self.assertEqual(
             scale["cells"],
             len(scale["strategies"])
-            * len(scale["partitions"])
             * scale["seeds"]
-            * len(scale["client_scales"]),
+            * sum(
+                len(scale["partitions_by_client_scale"][str(client_scale)])
+                for client_scale in scale["client_scales"]
+            ),
         )
+        self.assertEqual(
+            scale["partitions_by_client_scale"],
+            {
+                "16": [
+                    "iid_stratified",
+                    "dirichlet_1.0",
+                    "dirichlet_0.5",
+                    "dirichlet_0.1",
+                ],
+                "64": ["iid_stratified", "dirichlet_1.0", "dirichlet_0.5"],
+            },
+        )
+        self.assertIn("not registered", scale["excluded_cells"])
+        self.assertNotIn("dirichlet_0.1", scale["partitions_by_client_scale"]["64"])
         self.assertEqual(
             robustness["cells"],
             len(robustness["strategies"])
@@ -1472,7 +1785,7 @@ class ScientificProtocolTests(unittest.TestCase):
                 totals["maximum_training_invocations"],
                 totals["training_invocation_retry_reserve"],
             ),
-            (300, 345, 360, 15),
+            (290, 335, 350, 15),
         )
         self.assertTrue(matrix["totals"]["privacy_analyses_reuse_trained_models"])
         self.assertIn(
@@ -1493,7 +1806,7 @@ class ScientificProtocolTests(unittest.TestCase):
                 budget["maximum_training_invocations"],
                 budget["training_invocation_retry_reserve"],
             ),
-            (300, 345, 360, 15),
+            (290, 335, 350, 15),
         )
         self.assertEqual(
             (budget["maximum_gpu_hours"], budget["maximum_cpu_hours"]), (500, 5000)
