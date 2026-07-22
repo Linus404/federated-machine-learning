@@ -2075,6 +2075,153 @@ with patch("src.app_manifest.load_scientific_protocol", return_value=_TEST_PROTO
                 self.assertTrue(oldest.is_dir())
                 self.assertTrue(state_path.exists())
 
+    def test_pruning_recovers_state_after_run_deletion_failures(self) -> None:
+        """Retry state cleanup when deletion crossed a failed durability step."""
+        from src import artifact_history
+
+        for failure in ("runs fsync", "state cleanup"):
+            with (
+                self.subTest(failure=failure),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                oldest = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+                current = create_run(root, RUN_IDS[1], "2026-01-02T00:00:00Z")
+                publish_completed_run(root, oldest)
+                publish_completed_run(root, current)
+                state_path = root / f".{RUN_IDS[0]}.finalize.state"
+                runs_identity = (
+                    (root / "runs").stat().st_dev,
+                    (root / "runs").stat().st_ino,
+                )
+                root_identity = (root.stat().st_dev, root.stat().st_ino)
+                real_sync = artifact_history._sync_retained_directory
+                failed = False
+
+                def fail_sync(directory):
+                    nonlocal failed
+                    if (
+                        failure == "runs fsync"
+                        and (directory.device, directory.inode) == runs_identity
+                        and not failed
+                    ):
+                        failed = True
+                        raise OSError("injected runs-directory fsync failure")
+                    if (
+                        failure == "state cleanup"
+                        and (directory.device, directory.inode) == root_identity
+                        and not state_path.exists()
+                        and not failed
+                    ):
+                        failed = True
+                        raise OSError("injected state-cleanup failure")
+                    return real_sync(directory)
+
+                with (
+                    patch.object(
+                        artifact_history,
+                        "_sync_retained_directory",
+                        side_effect=fail_sync,
+                    ),
+                    self.assertRaisesRegex(OSError, "injected"),
+                ):
+                    prune_run_history(root, 1)
+
+                self.assertFalse(oldest.exists())
+                self.assertTrue(state_path.is_file())
+                self.assertEqual(prune_run_history(root, 1), [])
+                self.assertFalse(state_path.exists())
+
+    def test_pruning_cleans_only_safe_state_for_absent_runs(self) -> None:
+        """Clean complete and obsolete pending state but retain recovery evidence."""
+        from src import artifact_history
+
+        for state_kind in ("obsolete pending", "recoverable pending", "unsafe"):
+            with (
+                self.subTest(state_kind=state_kind),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                previous = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+                candidate = create_run(root, RUN_IDS[1], "2026-01-02T00:00:00Z")
+                publish_completed_run(root, previous)
+                with (
+                    patch.object(
+                        artifact_history,
+                        "_write_current_index_at",
+                        side_effect=OSError("injected pointer failure"),
+                    ),
+                    self.assertRaisesRegex(OSError, "pointer failure"),
+                ):
+                    publish_completed_run(root, candidate)
+                state_path = root / f".{RUN_IDS[1]}.finalize.state"
+                if state_kind == "obsolete pending":
+                    replacement = create_run(root, RUN_IDS[2], "2026-01-03T00:00:00Z")
+                    publish_completed_run(root, replacement)
+                elif state_kind == "unsafe":
+                    state_path.write_bytes(b"not-json")
+                artifact_history.shutil.rmtree(candidate)
+
+                self.assertEqual(prune_run_history(root, 3), [])
+                self.assertEqual(state_path.exists(), state_kind != "obsolete pending")
+
+    def test_pruning_orphan_recovery_serializes_concurrent_publication(self) -> None:
+        """Hold the root lock through orphan discovery and durable state removal."""
+        from src import artifact_history
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            previous = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            orphan = create_run(root, RUN_IDS[1], "2026-01-02T00:00:00Z")
+            replacement = create_run(root, RUN_IDS[2], "2026-01-03T00:00:00Z")
+            concurrent_id = "44444444-4444-4444-8444-444444444444"
+            concurrent = create_run(root, concurrent_id, "2026-01-04T00:00:00Z")
+            publish_completed_run(root, previous)
+            with (
+                patch.object(
+                    artifact_history,
+                    "_write_current_index_at",
+                    side_effect=OSError("injected pointer failure"),
+                ),
+                self.assertRaises(OSError),
+            ):
+                publish_completed_run(root, orphan)
+            publish_completed_run(root, replacement)
+            artifact_history.shutil.rmtree(orphan)
+            orphan_state = root / f".{RUN_IDS[1]}.finalize.state"
+            real_recover = artifact_history._recover_absent_run_states
+            recovering = threading.Event()
+            release = threading.Event()
+            published = threading.Event()
+
+            def pause_recovery(*args):
+                recovering.set()
+                self.assertTrue(release.wait(timeout=2))
+                return real_recover(*args)
+
+            def publish_concurrently() -> None:
+                publish_completed_run(root, concurrent)
+                published.set()
+
+            with (
+                patch.object(
+                    artifact_history,
+                    "_recover_absent_run_states",
+                    side_effect=pause_recovery,
+                ),
+                ThreadPoolExecutor(max_workers=2) as executor,
+            ):
+                prune = executor.submit(prune_run_history, root, 4)
+                self.assertTrue(recovering.wait(timeout=2))
+                publication = executor.submit(publish_concurrently)
+                self.assertFalse(published.wait(timeout=0.1))
+                release.set()
+                self.assertEqual(prune.result(timeout=2), [])
+                publication.result(timeout=2)
+
+            self.assertFalse(orphan_state.exists())
+            self.assertEqual(resolve_current_run_dir(root), concurrent.resolve())
+
     def test_replaced_legacy_lock_entry_cannot_split_root_serialization(self) -> None:
         from src import artifact_history
 

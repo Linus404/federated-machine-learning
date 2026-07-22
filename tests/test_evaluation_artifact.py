@@ -62,6 +62,184 @@ def test_protocol(rows: list[dict[str, object]]) -> dict[str, object]:
 
 
 class EvaluationArtifactTests(unittest.TestCase):
+    def test_publication_rejects_parent_replacement_at_every_commit_boundary(
+        self,
+    ) -> None:
+        """Never return a path through a renamed or replaced visible parent."""
+        from src import evaluation_artifact
+
+        for boundary in ("before rename", "after rename", "during fsync", "return"):
+            with (
+                self.subTest(boundary=boundary),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                parent = root / "parent"
+                parent.mkdir()
+                output = parent / "evaluation"
+                parked = root / "parked-parent"
+                parent_identity = (parent.stat().st_dev, parent.stat().st_ino)
+                real_rename = os.rename
+                real_fsync = os.fsync
+                real_inventory = evaluation_artifact._verify_evaluation_inventory
+                replaced = False
+                inventory_calls = 0
+
+                def replace_parent() -> None:
+                    nonlocal replaced
+                    if replaced:
+                        return
+                    replaced = True
+                    real_rename(parent, parked)
+                    parent.mkdir()
+
+                def replace_around_rename(source, destination, **kwargs):
+                    if destination == "evaluation":
+                        if boundary == "before rename":
+                            replace_parent()
+                        result = real_rename(source, destination, **kwargs)
+                        if boundary == "after rename":
+                            replace_parent()
+                        return result
+                    return real_rename(source, destination, **kwargs)
+
+                def replace_during_fsync(descriptor):
+                    result = real_fsync(descriptor)
+                    file_stat = os.fstat(descriptor)
+                    if (
+                        boundary == "during fsync"
+                        and (file_stat.st_dev, file_stat.st_ino) == parent_identity
+                        and output.is_dir()
+                    ):
+                        replace_parent()
+                    return result
+
+                def replace_before_return(descriptor, files):
+                    nonlocal inventory_calls
+                    result = real_inventory(descriptor, files)
+                    inventory_calls += 1
+                    if boundary == "return" and inventory_calls == 2:
+                        replace_parent()
+                    return result
+
+                with (
+                    patch.object(
+                        evaluation_artifact,
+                        "require_secure_artifact_platform",
+                        return_value=None,
+                    ),
+                    patch.object(
+                        evaluation_artifact.os,
+                        "rename",
+                        side_effect=replace_around_rename,
+                    ),
+                    patch.object(
+                        evaluation_artifact.os,
+                        "fsync",
+                        side_effect=replace_during_fsync,
+                    ),
+                    patch.object(
+                        evaluation_artifact,
+                        "_verify_evaluation_inventory",
+                        side_effect=replace_before_return,
+                    ),
+                    self.assertRaisesRegex(ValueError, "parent changed"),
+                ):
+                    publish_evaluation_artifact(
+                        self.rows, output, protocol=self.protocol
+                    )
+
+                self.assertTrue(replaced)
+                self.assertFalse(output.exists())
+                self.assertFalse((parked / "evaluation").exists())
+                self.assertEqual(
+                    publish_evaluation_artifact(
+                        self.rows, output, protocol=self.protocol
+                    ),
+                    output,
+                )
+
+    def test_post_rename_failures_remove_owned_destination_and_allow_retry(
+        self,
+    ) -> None:
+        """Roll back the exact installed directory across every late failure."""
+        from src import evaluation_artifact
+
+        for failure in ("verification", "fsync", "final reachability"):
+            with (
+                self.subTest(failure=failure),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                output = root / "evaluation"
+                parent_identity = (root.stat().st_dev, root.stat().st_ino)
+                real_matches = evaluation_artifact._directory_entry_matches_descriptor
+                real_fsync = os.fsync
+                real_verify_parent = evaluation_artifact._verify_evaluation_parent
+                verification_failed = False
+                fsync_failed = False
+                reachability_calls = 0
+
+                def fail_verification(parent_descriptor, name, descriptor):
+                    nonlocal verification_failed
+                    if (
+                        failure == "verification"
+                        and name == "evaluation"
+                        and not verification_failed
+                    ):
+                        verification_failed = True
+                        return False
+                    return real_matches(parent_descriptor, name, descriptor)
+
+                def fail_fsync(descriptor):
+                    nonlocal fsync_failed
+                    file_stat = os.fstat(descriptor)
+                    if (
+                        failure == "fsync"
+                        and (file_stat.st_dev, file_stat.st_ino) == parent_identity
+                        and output.is_dir()
+                        and not fsync_failed
+                    ):
+                        fsync_failed = True
+                        raise OSError("injected parent fsync failure")
+                    return real_fsync(descriptor)
+
+                def fail_final_reachability(parent):
+                    nonlocal reachability_calls
+                    if output.is_dir():
+                        reachability_calls += 1
+                    if failure == "final reachability" and reachability_calls == 3:
+                        raise ValueError("evaluation parent changed during publication")
+                    return real_verify_parent(parent)
+
+                with (
+                    patch.object(
+                        evaluation_artifact,
+                        "_directory_entry_matches_descriptor",
+                        side_effect=fail_verification,
+                    ),
+                    patch.object(
+                        evaluation_artifact.os, "fsync", side_effect=fail_fsync
+                    ),
+                    patch.object(
+                        evaluation_artifact,
+                        "_verify_evaluation_parent",
+                        side_effect=fail_final_reachability,
+                    ),
+                    self.assertRaises((OSError, ValueError)),
+                ):
+                    publish_evaluation_artifact(
+                        self.rows, output, protocol=self.protocol
+                    )
+
+                self.assertFalse(output.exists())
+                self.assertEqual(
+                    publish_evaluation_artifact(
+                        self.rows, output, protocol=self.protocol
+                    ),
+                    output,
+                )
+
     def test_publication_rejects_staging_entry_substitution(self) -> None:
         """Reject renamed substitutes while leaving every unowned entry intact."""
         from src import evaluation_artifact
@@ -144,8 +322,10 @@ class EvaluationArtifactTests(unittest.TestCase):
             ):
                 publish_evaluation_artifact(self.rows, output, protocol=self.protocol)
 
+            self.assertFalse(output.exists())
             self.assertEqual(
-                (output / EVALUATION_RECORDS_FILENAME).read_bytes(), b"changed\n"
+                publish_evaluation_artifact(self.rows, output, protocol=self.protocol),
+                output,
             )
 
     def test_publication_rejects_unsupported_platform_before_mutation(self) -> None:

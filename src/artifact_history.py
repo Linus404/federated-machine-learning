@@ -1047,6 +1047,32 @@ def _finalization_state_name(run_id: str) -> str:
     return f".{run_id}.finalize.state"
 
 
+def _finalization_state_run_id(name: str) -> str | None:
+    """Return the canonical UUID4 encoded by a finalization-state filename.
+
+    Parameters
+    ----------
+    name : str
+        Direct artifact-root entry name.
+
+    Returns
+    -------
+    str or None
+        Canonical run identity, or ``None`` for any other filename.
+    """
+    suffix = ".finalize.state"
+    if not name.startswith(".") or not name.endswith(suffix):
+        return None
+    run_id = name[1 : -len(suffix)]
+    try:
+        parsed = uuid.UUID(run_id)
+    except ValueError:
+        return None
+    if parsed.version != 4 or str(parsed) != run_id:
+        return None
+    return run_id
+
+
 def _load_finalization_state_at(
     root_descriptor: int, run_id: str
 ) -> tuple[_FinalizationState, bytes] | None:
@@ -1875,7 +1901,7 @@ def _state_allows_prune(
 
 
 def _remove_finalization_state(
-    root: _RetainedDirectory, run_id: str, current_bytes: bytes
+    root: _RetainedDirectory, run_id: str, current_bytes: bytes | None
 ) -> None:
     """Durably remove one proven safe state while preserving it on failure.
 
@@ -1885,8 +1911,8 @@ def _remove_finalization_state(
         Retained artifact root.
     run_id : str
         Canonical pruned run identity.
-    current_bytes : bytes
-        Exact current pointer used to prove a pending state obsolete.
+    current_bytes : bytes or None
+        Exact current pointer used to prove a pending state obsolete, or no pointer.
 
     Returns
     -------
@@ -1927,6 +1953,77 @@ def _remove_finalization_state(
         os.close(retained.descriptor)
 
 
+def _recover_absent_run_states(
+    root: Path,
+    descriptors: _HistoryRootDescriptors,
+    current_bytes: bytes | None,
+) -> None:
+    """Durably remove safe finalization state left after run deletion.
+
+    Parameters
+    ----------
+    root : pathlib.Path
+        Canonical artifact root used for pointer validation diagnostics.
+    descriptors : _HistoryRootDescriptors
+        Retained artifact root and runs directory chain.
+    current_bytes : bytes or None
+        Exact current-pointer bytes, or ``None`` when no pointer exists.
+
+    Returns
+    -------
+    None
+    """
+    removable: list[str] = []
+    for name in os.listdir(descriptors.root.descriptor):
+        run_id = _finalization_state_run_id(name)
+        if run_id is None:
+            continue
+        try:
+            os.stat(
+                run_id,
+                dir_fd=descriptors.runs.descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            continue
+        try:
+            record = _load_finalization_state_at(descriptors.root.descriptor, run_id)
+        except ValueError:
+            continue
+        if record is None or record[0].candidate.run_id != run_id:
+            continue
+        state = record[0]
+        previous_bytes = None if state.previous is None else state.previous.content
+        if state.status == _PUBLICATION_PENDING and current_bytes in {
+            state.candidate.content,
+            previous_bytes,
+        }:
+            continue
+        removable.append(run_id)
+
+    if not removable:
+        return
+    _sync_retained_directory(descriptors.runs)
+    for run_id in removable:
+        _verify_history_root(descriptors)
+        try:
+            os.stat(
+                run_id,
+                dir_fd=descriptors.runs.descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            continue
+        current = _load_current_index_at(root, descriptors.root.descriptor)
+        if (None if current is None else current[1]) != current_bytes:
+            raise ValueError("current-run index changed during pruning")
+        _remove_finalization_state(descriptors.root, run_id, current_bytes)
+
+
 def prune_run_history(
     artifact_root: str | Path,
     retention_runs: int,
@@ -1959,6 +2056,11 @@ def prune_run_history(
         with _finalization_lock(descriptors.root.descriptor):
             _verify_history_root(descriptors)
             current_record = _load_current_index_at(root, descriptors.root.descriptor)
+            _recover_absent_run_states(
+                root,
+                descriptors,
+                None if current_record is None else current_record[1],
+            )
             if current_record is None:
                 return []
             current_bytes = current_record[1]

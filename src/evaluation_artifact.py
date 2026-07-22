@@ -93,6 +93,16 @@ class _RetainedEvaluationFile:
     content: bytes
 
 
+@dataclass(frozen=True)
+class _RetainedEvaluationParent:
+    """Retain the visible destination parent and its owning directory."""
+
+    path: Path
+    descriptor: int
+    owner_descriptor: int | None
+    name: str | None
+
+
 def load_scientific_protocol() -> Mapping[str, Any]:
     """Load the frozen scientific protocol from the repository.
 
@@ -196,7 +206,9 @@ def _evaluation_dataset_manifest(protocol: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _open_new_artifact_parent(output_dir: str | Path) -> tuple[Path, str, int]:
+def _open_new_artifact_parent(
+    output_dir: str | Path,
+) -> tuple[_RetainedEvaluationParent, str]:
     """Open a symlink-free parent chain for a new evaluation artifact.
 
     Parameters
@@ -206,8 +218,8 @@ def _open_new_artifact_parent(output_dir: str | Path) -> tuple[Path, str, int]:
 
     Returns
     -------
-    tuple of pathlib.Path, str, and int
-        Lexical absolute parent, destination basename, and held directory descriptor.
+    tuple of _RetainedEvaluationParent and str
+        Retained visible parent chain and destination basename.
 
     Raises
     ------
@@ -227,7 +239,7 @@ def _open_new_artifact_parent(output_dir: str | Path) -> tuple[Path, str, int]:
     current = anchor
     try:
         relative_parts = output_path.parent.parts[len(anchor.parts) :]
-        for component in relative_parts:
+        for index, component in enumerate(relative_parts):
             try:
                 component_stat = os.stat(
                     component, dir_fd=descriptor, follow_symlinks=False
@@ -243,13 +255,49 @@ def _open_new_artifact_parent(output_dir: str | Path) -> tuple[Path, str, int]:
                     "regular directory"
                 )
             next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            if index == len(relative_parts) - 1:
+                return (
+                    _RetainedEvaluationParent(
+                        current / component,
+                        next_descriptor,
+                        descriptor,
+                        component,
+                    ),
+                    output_path.name,
+                )
             os.close(descriptor)
             descriptor = next_descriptor
             current /= component
-        return current, output_path.name, descriptor
+        return (
+            _RetainedEvaluationParent(current, descriptor, None, None),
+            output_path.name,
+        )
     except BaseException:
         os.close(descriptor)
         raise
+
+
+def _verify_evaluation_parent(parent: _RetainedEvaluationParent) -> None:
+    """Require the visible parent path to retain its opened identity.
+
+    Parameters
+    ----------
+    parent : _RetainedEvaluationParent
+        Retained destination parent and its owning directory.
+
+    Returns
+    -------
+    None
+    """
+    if parent.owner_descriptor is None:
+        if not stat.S_ISDIR(os.fstat(parent.descriptor).st_mode):
+            raise ValueError("evaluation parent changed during publication")
+        return
+    assert parent.name is not None
+    if not _directory_entry_matches_descriptor(
+        parent.owner_descriptor, parent.name, parent.descriptor
+    ):
+        raise ValueError("evaluation parent changed during publication")
 
 
 def _acquire_evaluation_lock(
@@ -513,9 +561,8 @@ def _validate_row(
 
 def _publish_evaluation_artifact_unlocked(
     rows: Iterable[Mapping[str, Any]],
-    parent: Path,
+    parent: _RetainedEvaluationParent,
     output_name: str,
-    parent_descriptor: int,
     *,
     protocol: Mapping[str, Any] | None = None,
 ) -> Path:
@@ -525,12 +572,10 @@ def _publish_evaluation_artifact_unlocked(
     ----------
     rows : iterable of mappings
         Official test rows in ascending source order.
-    parent : pathlib.Path
-        Validated lexical parent retained for the returned diagnostic path.
+    parent : _RetainedEvaluationParent
+        Retained visible parent chain for mutation and the returned path.
     output_name : str
         Direct child destination basename.
-    parent_descriptor : int
-        Held descriptor anchoring all mutation to the validated parent.
     protocol : mapping or None, optional
         Parsed frozen protocol, primarily for deterministic tests.
 
@@ -548,7 +593,9 @@ def _publish_evaluation_artifact_unlocked(
     """
     frozen = protocol or load_scientific_protocol()
     dataset_manifest = _evaluation_dataset_manifest(frozen)
-    output_path = parent / output_name
+    parent_descriptor = parent.descriptor
+    output_path = parent.path / output_name
+    _verify_evaluation_parent(parent)
     if _destination_exists(parent_descriptor, output_name):
         raise FileExistsError(
             f"evaluation artifact path already exists; refusing replacement: {output_path}"
@@ -565,6 +612,7 @@ def _publish_evaluation_artifact_unlocked(
     label_counts: Counter[int] = Counter()
     row_count = 0
     retained_files: dict[str, _RetainedEvaluationFile] = {}
+    destination_owned = False
     try:
         records_descriptor = os.open(
             EVALUATION_RECORDS_FILENAME,
@@ -656,29 +704,46 @@ def _publish_evaluation_artifact_unlocked(
             staged_stat.st_ino,
         ) != (opened_stat.st_dev, opened_stat.st_ino):
             raise ValueError("evaluation staging directory changed during publication")
+        _verify_evaluation_parent(parent)
         os.rename(
             staging_name,
             output_name,
             src_dir_fd=parent_descriptor,
             dst_dir_fd=parent_descriptor,
         )
+        destination_owned = True
+        _verify_evaluation_parent(parent)
         if not _directory_entry_matches_descriptor(
             parent_descriptor, output_name, staging_descriptor
         ):
             raise ValueError("evaluation destination changed during publication")
         os.fsync(parent_descriptor)
+        _verify_evaluation_parent(parent)
         if not _directory_entry_matches_descriptor(
             parent_descriptor, output_name, staging_descriptor
         ):
             raise ValueError("evaluation destination changed during publication")
         _verify_evaluation_inventory(staging_descriptor, retained_files)
+        _verify_evaluation_parent(parent)
+        if not _directory_entry_matches_descriptor(
+            parent_descriptor, output_name, staging_descriptor
+        ):
+            raise ValueError("evaluation destination changed during publication")
         return output_path
     except BaseException:
         try:
-            if _directory_entry_matches_descriptor(
-                parent_descriptor, staging_name, staging_descriptor
-            ):
-                shutil.rmtree(staging_name, dir_fd=parent_descriptor)
+            owned_names = (
+                (output_name, staging_name)
+                if destination_owned
+                else (staging_name, output_name)
+            )
+            for owned_name in owned_names:
+                if _directory_entry_matches_descriptor(
+                    parent_descriptor, owned_name, staging_descriptor
+                ):
+                    shutil.rmtree(owned_name, dir_fd=parent_descriptor)
+                    os.fsync(parent_descriptor)
+                    break
         except FileNotFoundError:
             pass
         raise
@@ -721,31 +786,36 @@ def publish_evaluation_artifact(
         If owned residue, rows, or paths are invalid.
     """
     require_secure_artifact_platform()
-    parent, output_name, parent_descriptor = _open_new_artifact_parent(output_dir)
-    lock = _acquire_evaluation_lock(parent_descriptor, output_name)
+    parent, output_name = _open_new_artifact_parent(output_dir)
     try:
-        prefix = f".{output_name}."
-        for residue_name in os.listdir(parent_descriptor):
-            if not residue_name.startswith(prefix) or not residue_name.endswith(
-                ".staging"
-            ):
-                continue
-            residue_stat = os.stat(
-                residue_name, dir_fd=parent_descriptor, follow_symlinks=False
+        lock = _acquire_evaluation_lock(parent.descriptor, output_name)
+        try:
+            _verify_evaluation_parent(parent)
+            prefix = f".{output_name}."
+            for residue_name in os.listdir(parent.descriptor):
+                if not residue_name.startswith(prefix) or not residue_name.endswith(
+                    ".staging"
+                ):
+                    continue
+                residue_stat = os.stat(
+                    residue_name, dir_fd=parent.descriptor, follow_symlinks=False
+                )
+                if not stat.S_ISDIR(residue_stat.st_mode):
+                    raise ValueError("evaluation staging residue is unsafe")
+                shutil.rmtree(residue_name, dir_fd=parent.descriptor)
+            _verify_evaluation_parent(parent)
+            return _publish_evaluation_artifact_unlocked(
+                rows,
+                parent,
+                output_name,
+                protocol=protocol,
             )
-            if not stat.S_ISDIR(residue_stat.st_mode):
-                raise ValueError("evaluation staging residue is unsafe")
-            shutil.rmtree(residue_name, dir_fd=parent_descriptor)
-        return _publish_evaluation_artifact_unlocked(
-            rows,
-            parent,
-            output_name,
-            parent_descriptor,
-            protocol=protocol,
-        )
+        finally:
+            lock.release()
     finally:
-        lock.release()
-        os.close(parent_descriptor)
+        os.close(parent.descriptor)
+        if parent.owner_descriptor is not None:
+            os.close(parent.owner_descriptor)
 
 
 def _require_exact_fields(
