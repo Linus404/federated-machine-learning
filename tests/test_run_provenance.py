@@ -6,9 +6,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.artifact_compatibility import ARTIFACT_SCHEMA_VERSION
+from src.artifact_compatibility import (
+    ARTIFACT_SCHEMA_VERSION,
+    PUBLIC_ARTIFACT_SCHEMA_VERSION,
+)
 from src.run_provenance import (
     _code_revision,
+    _dataset_metadata,
     _environment_metadata,
     load_run_provenance_manifest,
     write_run_provenance_manifest,
@@ -44,7 +48,7 @@ def write_public_dataset_contract(path: Path) -> dict[str, object]:
     (path / "manifest.json").write_text(
         json.dumps(
             {
-                "schema_version": ARTIFACT_SCHEMA_VERSION,
+                "schema_version": PUBLIC_ARTIFACT_SCHEMA_VERSION,
                 "embedding_dim": 100,
                 "sequence_length": 500,
                 "vocabulary_size": 4,
@@ -112,6 +116,46 @@ def runtime_environment() -> dict[str, object]:
 
 
 class RunProvenanceTests(unittest.TestCase):
+    def test_public_checksums_use_the_same_snapshot_as_validation(self) -> None:
+        from src.app_manifest import load_app_manifest
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            public_dir = Path(tmpdir) / "public"
+            public_dir.mkdir()
+            protocol = write_public_dataset_contract(public_dir)
+            manifest_path = public_dir / "manifest.json"
+            vocabulary_path = public_dir / "vocab.txt"
+            manifest_bytes = manifest_path.read_bytes()
+            vocabulary_bytes = vocabulary_path.read_bytes()
+
+            def load_then_mutate(**kwargs):
+                snapshot = load_app_manifest(protocol=protocol, **kwargs)
+                mutated_manifest = manifest_path.read_bytes().replace(
+                    b'"rows": 25000', b'"rows": 35000'
+                )
+                self.assertEqual(len(mutated_manifest), len(manifest_bytes))
+                manifest_path.write_bytes(mutated_manifest)
+                vocabulary_path.write_bytes(
+                    vocabulary_path.read_bytes().replace(b"good", b"evil")
+                )
+                return snapshot
+
+            with patch(
+                "src.run_provenance.load_app_manifest",
+                side_effect=load_then_mutate,
+            ):
+                metadata = _dataset_metadata(public_dir)
+
+        self.assertEqual(
+            metadata["checksums"]["manifest.json"],
+            "sha256:" + hashlib.sha256(manifest_bytes).hexdigest(),
+        )
+        self.assertEqual(
+            metadata["checksums"]["vocab.txt"],
+            "sha256:" + hashlib.sha256(vocabulary_bytes).hexdigest(),
+        )
+        self.assertEqual(json.loads(metadata["identity"])["rows"], 25000)
+
     def test_linux_environment_uses_tensorflow_cpu_distribution_version(self) -> None:
         versions = {
             "datasets": "4.8.5",

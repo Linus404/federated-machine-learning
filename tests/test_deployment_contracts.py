@@ -226,7 +226,7 @@ class DistributedDeploymentContractTests(unittest.TestCase):
 
     def test_regeneration_uses_matching_non_destructive_artifact_paths(self) -> None:
         compatibility = Path("COMPATIBILITY.md").read_text(encoding="utf-8")
-        root = "artifacts/regenerated-schema-1"
+        root = "artifacts/regenerated-public-v2"
 
         self.assertIn(f"--client-shard-dir {root}/clients", compatibility)
         self.assertIn(f"--public-artifact-dir {root}/public", compatibility)

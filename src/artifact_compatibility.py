@@ -14,6 +14,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 ARTIFACT_SCHEMA_VERSION = 1
+PUBLIC_ARTIFACT_SCHEMA_VERSION = 2
 SERVER_ARTIFACT_MANIFEST_FILENAME = "artifact_manifest.json"
 SERVER_ARTIFACTS: dict[str, dict[str, Any]] = {
     "model": {"filename": "global_model.keras", "format": "keras-v3"},
@@ -192,7 +193,12 @@ def write_json_atomically(
     return path
 
 
-def validate_artifact_schema(payload: object, artifact_name: str) -> Mapping[str, Any]:
+def validate_artifact_schema(
+    payload: object,
+    artifact_name: str,
+    *,
+    supported_version: int = ARTIFACT_SCHEMA_VERSION,
+) -> Mapping[str, Any]:
     """Validate an artifact manifest against the supported schema.
 
     Parameters
@@ -201,6 +207,8 @@ def validate_artifact_schema(payload: object, artifact_name: str) -> Mapping[str
         Decoded JSON payload to validate.
     artifact_name : str
         Human-readable artifact name used in error messages.
+    supported_version : int, optional
+        Schema version supported for this artifact kind.
 
     Returns
     -------
@@ -220,11 +228,12 @@ def validate_artifact_schema(payload: object, artifact_name: str) -> Mapping[str
         raise ValueError(
             f"{artifact_name} has no valid schema_version; regenerate its artifacts"
         )
-    if version != ARTIFACT_SCHEMA_VERSION:
-        direction = "older" if version < ARTIFACT_SCHEMA_VERSION else "newer"
+    if version != supported_version:
+        direction = "older" if version < supported_version else "newer"
         raise ValueError(
             f"{artifact_name} schema_version {version} is {direction} than supported "
-            f"version {ARTIFACT_SCHEMA_VERSION}; regenerate with this project version"
+            f"version {supported_version}; regenerate or migrate with this project "
+            "version"
         )
 
     return payload

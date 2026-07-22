@@ -8,6 +8,7 @@ from pathlib import Path
 from src.app_manifest import load_app_manifest
 from src.artifact_compatibility import (
     ARTIFACT_SCHEMA_VERSION,
+    PUBLIC_ARTIFACT_SCHEMA_VERSION,
     SERVER_ARTIFACTS,
     load_server_artifact_manifest,
     validate_artifact_schema,
@@ -37,7 +38,8 @@ class ArtifactCompatibilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir)
             (path / "manifest.json").write_text(
-                json.dumps({"schema_version": 2}), encoding="utf-8"
+                json.dumps({"schema_version": PUBLIC_ARTIFACT_SCHEMA_VERSION + 1}),
+                encoding="utf-8",
             )
 
             with self.assertRaisesRegex(ValueError, "public manifest.*newer"):
@@ -84,7 +86,7 @@ class ArtifactCompatibilityTests(unittest.TestCase):
             },
         }
         valid_payload = {
-            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "schema_version": PUBLIC_ARTIFACT_SCHEMA_VERSION,
             "embedding_dim": 100,
             "sequence_length": 500,
             "vocabulary_size": 3,
@@ -95,7 +97,11 @@ class ArtifactCompatibilityTests(unittest.TestCase):
             },
             "dataset": dataset,
         }
-        for version, error in ((None, "no valid"), (0, "older"), (2, "newer")):
+        for version, error in (
+            (None, "no valid"),
+            (1, "older.*regenerate or migrate"),
+            (PUBLIC_ARTIFACT_SCHEMA_VERSION + 1, "newer"),
+        ):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as tmpdir:
                 path = Path(tmpdir)
                 payload = dict(valid_payload)

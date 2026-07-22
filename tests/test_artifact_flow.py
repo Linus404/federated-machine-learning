@@ -9,14 +9,24 @@ from unittest.mock import patch
 import numpy as np
 
 from src.app_manifest import AppManifest, load_app_manifest
-from src.artifact_compatibility import ARTIFACT_SCHEMA_VERSION
+from src.artifact_compatibility import (
+    ARTIFACT_SCHEMA_VERSION,
+    PUBLIC_ARTIFACT_SCHEMA_VERSION,
+)
 from src.contracts import client_shard_metadata
-from src.data_prep import main, package_raw_client_shards, prepare_all
+from src.data_prep import (
+    build_vectorizer,
+    main,
+    package_raw_client_shards,
+    prepare_all,
+    publish_public_artifacts,
+)
 from src.evaluation_artifact import canonical_source_row_bytes
 from src.local_training import (
     build_model_from_manifest,
     load_client_shard,
 )
+from src.text_preprocessing import create_text_vectorizer, protocol_standardize
 
 
 def write_public_artifacts(path: Path, sequence_length: int = 4) -> AppManifest:
@@ -24,7 +34,7 @@ def write_public_artifacts(path: Path, sequence_length: int = 4) -> AppManifest:
     vocabulary_sha256 = hashlib.sha256(vocabulary).hexdigest()
     (path / "vocab.txt").write_bytes(vocabulary)
     payload = {
-        "schema_version": ARTIFACT_SCHEMA_VERSION,
+        "schema_version": PUBLIC_ARTIFACT_SCHEMA_VERSION,
         "embedding_dim": 100,
         "sequence_length": sequence_length,
         "vocabulary_size": 5,
@@ -45,11 +55,18 @@ def write_public_artifacts(path: Path, sequence_length: int = 4) -> AppManifest:
         },
     }
     manifest_path = path / "manifest.json"
-    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    manifest_bytes = json.dumps(payload).encode("utf-8")
+    manifest_path.write_bytes(manifest_bytes)
     (path / "client_metadata.json").write_text(
         json.dumps({"schema_version": ARTIFACT_SCHEMA_VERSION}), encoding="utf-8"
     )
-    return AppManifest(payload, path / "vocab.txt")
+    return AppManifest(
+        payload,
+        path / "vocab.txt",
+        manifest_bytes,
+        vocabulary,
+        tuple(vocabulary.decode("utf-8")[:-1].split("\n")),
+    )
 
 
 def public_protocol() -> dict[str, object]:
@@ -303,7 +320,7 @@ def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> No
     manifest = json.loads((public_dir / "manifest.json").read_text(encoding="utf-8"))
     vocabulary = (public_dir / "vocab.txt").read_text(encoding="utf-8").splitlines()
     assert manifest["vocabulary_size"] == len(vocabulary)
-    assert manifest["schema_version"] == ARTIFACT_SCHEMA_VERSION
+    assert manifest["schema_version"] == PUBLIC_ARTIFACT_SCHEMA_VERSION
     assert "glove" not in json.dumps(manifest).lower()
     assert "embedding_matrix" not in manifest
     assert not list(client_dir.glob("client-*.tar.gz"))
@@ -336,6 +353,195 @@ def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> No
 
 
 class ArtifactFlowTests(unittest.TestCase):
+    def test_frozen_standardizer_matches_producer_and_every_consumer(self) -> None:
+        import keras
+        import tensorflow as tf
+
+        import dashboard
+
+        cases = [
+            "<b>AZ</b>\tÄÖÜ ẞ Σ İ CAFÉ!",
+            " A\tB\nC\rD\fE\vF  G\u00a0H\u2003I\u2028J\u2029K ",
+        ]
+        expected_standardized = [
+            " az \tÄÖÜ ẞ Σ İ cafÉ",
+            " a\tb\nc\rd\fe\vf  g\u00a0h\u2003i\u2028j\u2029k ",
+        ]
+        preliminary = create_text_vectorizer(
+            sequence_length=500,
+            max_tokens=20_000,
+        )
+        preliminary.adapt(tf.constant(cases))
+        vocabulary = preliminary.get_vocabulary()
+        vocabulary_bytes = b"".join(term.encode("utf-8") + b"\n" for term in vocabulary)
+        protocol = {
+            "dataset": {
+                "id": "example/imdb",
+                "config": "plain_text",
+                "revision": "frozen",
+                "datasets_version": "1.0.0",
+                "splits": {
+                    "train": {
+                        "rows": 2,
+                        "raw_parquet_sha256": "1" * 64,
+                        "content_sha256": "2" * 64,
+                    }
+                },
+            },
+            "preprocessing": {
+                "vocabulary_size": len(vocabulary),
+                "vocabulary_sha256": hashlib.sha256(vocabulary_bytes).hexdigest(),
+            },
+        }
+
+        with (
+            patch(
+                "src.data_prep._validated_frameworks",
+                return_value=(keras, tf, protocol),
+            ),
+            tempfile.TemporaryDirectory() as tmpdir,
+        ):
+            root = Path(tmpdir)
+            producer = build_vectorizer(cases)
+            publish_public_artifacts(producer, root, protocol=protocol)
+            manifest = load_app_manifest(public_artifact_dir=root, protocol=protocol)
+            records = [
+                {"text": text, "label": label} for label in (0, 1) for text in cases
+            ]
+            (root / "reviews.jsonl").write_text(
+                "\n".join(json.dumps(record, ensure_ascii=False) for record in records),
+                encoding="utf-8",
+            )
+            (root / "client_metadata.json").write_text(
+                json.dumps({"schema_version": ARTIFACT_SCHEMA_VERSION}),
+                encoding="utf-8",
+            )
+
+            expected_ids = np.asarray(producer([record["text"] for record in records]))
+            train, validation = load_client_shard(root, manifest, validation_split=0.5)
+            consumed_ids = np.concatenate([train[0], validation[0]])
+            self.assertEqual(
+                Counter(map(tuple, consumed_ids)),
+                Counter(map(tuple, expected_ids)),
+            )
+
+            dashboard.load_vectorizer.clear()
+            with patch.object(dashboard, "load_app_manifest", return_value=manifest):
+                dashboard_vectorizer = dashboard.load_vectorizer()
+            dashboard.load_vectorizer.clear()
+            np.testing.assert_array_equal(
+                dashboard_vectorizer(tf.constant(cases)), producer(tf.constant(cases))
+            )
+
+        self.assertEqual(
+            [
+                value.decode("utf-8")
+                for value in protocol_standardize(tf.constant(cases)).numpy()
+            ],
+            expected_standardized,
+        )
+        self.assertIs(
+            keras.saving.deserialize_keras_object(
+                keras.saving.serialize_keras_object(protocol_standardize)
+            ),
+            protocol_standardize,
+        )
+
+    def test_validated_vocabulary_snapshot_survives_same_length_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            write_public_artifacts(root)
+            manifest = load_app_manifest(
+                public_artifact_dir=root, protocol=public_protocol()
+            )
+            (root / "vocab.txt").write_bytes(b"\n[UNK]\nevil\nbad\nmovie\n")
+            records = [
+                {"text": "good movie", "label": 1},
+                {"text": "evil movie", "label": 1},
+                {"text": "bad movie", "label": 0},
+                {"text": "movie", "label": 0},
+            ]
+            (root / "reviews.jsonl").write_text(
+                "\n".join(json.dumps(record) for record in records),
+                encoding="utf-8",
+            )
+
+            train, validation = load_client_shard(root, manifest, validation_split=0.5)
+
+        consumed = np.concatenate([train[0], validation[0]])
+        self.assertTrue(any(np.array_equal(row[:2], [2, 4]) for row in consumed))
+        self.assertTrue(any(np.array_equal(row[:2], [1, 4]) for row in consumed))
+
+    def test_preparation_rejects_hostile_roots_before_loading_or_publication(
+        self,
+    ) -> None:
+        for artifact_name in ("client", "public", "evaluation"):
+            with (
+                self.subTest(artifact_name=artifact_name),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                external = root / "external"
+                external.mkdir()
+                client = root / "clients"
+                public = root / "public"
+                evaluation = root / "evaluation"
+                hostile_root = {
+                    "client": client,
+                    "public": public,
+                    "evaluation": evaluation,
+                }[artifact_name]
+                hostile_root.symlink_to(external, target_is_directory=True)
+                with (
+                    patch("src.data_prep._validated_frameworks") as frameworks,
+                    patch("src.data_prep.load_verified_imdb_dataset") as load_dataset,
+                    patch("src.data_prep.publish_public_artifacts") as publish_public,
+                    self.assertRaisesRegex(ValueError, "must not be a symlink"),
+                ):
+                    prepare_all(4, client, public, evaluation)
+
+                frameworks.assert_not_called()
+                load_dataset.assert_not_called()
+                publish_public.assert_not_called()
+                self.assertEqual(list(external.iterdir()), [])
+
+        for artifact_name in ("client", "public", "evaluation"):
+            with (
+                self.subTest(path_type=artifact_name),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                outputs = {
+                    "client": root / "clients",
+                    "public": root / "public",
+                    "evaluation": root / "evaluation",
+                }
+                outputs[artifact_name].write_bytes(b"not a directory")
+                with (
+                    patch("src.data_prep.load_verified_imdb_dataset") as load_dataset,
+                    self.assertRaisesRegex(ValueError, "regular directory"),
+                ):
+                    prepare_all(
+                        4,
+                        outputs["client"],
+                        outputs["public"],
+                        outputs["evaluation"],
+                    )
+                load_dataset.assert_not_called()
+
+    def test_public_publisher_rejects_symlink_without_external_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            external = root / "external"
+            external.mkdir()
+            public = root / "public"
+            public.symlink_to(external, target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+                publish_public_artifacts(object(), public, protocol={})
+
+            self.assertEqual(list(external.iterdir()), [])
+
     def test_preparation_publishes_evaluation_only_after_retryable_outputs(
         self,
     ) -> None:

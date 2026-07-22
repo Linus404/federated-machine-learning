@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from src.artifact_compatibility import ARTIFACT_SCHEMA_VERSION
+from src.artifact_compatibility import PUBLIC_ARTIFACT_SCHEMA_VERSION
 from src.artifact_history import resolve_current_run_dir
 from src.local_training import DEFAULT_VALIDATION_SEED, train
 from src.run_provenance import (
@@ -48,7 +48,7 @@ class LocalTrainingTests(unittest.TestCase):
             (args.public_artifact_dir / "manifest.json").write_text(
                 json.dumps(
                     {
-                        "schema_version": ARTIFACT_SCHEMA_VERSION,
+                        "schema_version": PUBLIC_ARTIFACT_SCHEMA_VERSION,
                         "embedding_dim": 8,
                         "sequence_length": 16,
                         "vocabulary_size": 4,

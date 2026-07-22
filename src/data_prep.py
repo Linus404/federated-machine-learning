@@ -5,8 +5,6 @@ import hashlib
 import importlib.metadata
 import json
 import os
-import re
-import string
 from collections import Counter
 from pathlib import Path
 from typing import Any, Mapping
@@ -18,7 +16,7 @@ os.environ.setdefault("KERAS_BACKEND", "tensorflow")
 
 import numpy as np
 
-from src.artifact_compatibility import ARTIFACT_SCHEMA_VERSION, sha256_file
+from src.artifact_compatibility import PUBLIC_ARTIFACT_SCHEMA_VERSION, sha256_file
 from src.contracts import (
     DEFAULT_DIRICHLET_ALPHA,
     DEFAULT_SPLIT_SEED,
@@ -36,10 +34,55 @@ from src.paths import (
     default_public_artifact_dir,
     resolve_dir,
 )
+from src.text_preprocessing import create_text_vectorizer
 
 DEFAULT_MAX_TOKENS = 20_000
 DEFAULT_SEQUENCE_LENGTH = 500
 DEFAULT_EMBEDDING_DIM = 100
+
+
+def _preflight_output_root(
+    output_dir: str | Path, artifact_name: str, *, reusable: bool
+) -> Path:
+    """Validate an artifact root without creating or following it.
+
+    Parameters
+    ----------
+    output_dir : str or pathlib.Path
+        Configured artifact root.
+    artifact_name : str
+        Human-readable artifact kind used in errors.
+    reusable : bool
+        Permit an existing real directory for retryable outputs.
+
+    Returns
+    -------
+    pathlib.Path
+        Absolute validated output root.
+
+    Raises
+    ------
+    FileExistsError
+        If an immutable output root already exists.
+    ValueError
+        If the root or its existing parent is a symlink or invalid path type.
+    """
+    output_path = resolve_dir(output_dir)
+    if output_path.is_symlink():
+        raise ValueError(f"{artifact_name} artifact root must not be a symlink")
+    if output_path.exists():
+        if not output_path.is_dir():
+            raise ValueError(
+                f"{artifact_name} artifact root must be a regular directory"
+            )
+        if not reusable:
+            raise FileExistsError(
+                f"{artifact_name} artifact path already exists; use a new path"
+            )
+    parent = output_path.parent
+    if parent.is_symlink() or (parent.exists() and not parent.is_dir()):
+        raise ValueError(f"{artifact_name} artifact parent must be a regular directory")
+    return output_path
 
 
 def _raw_split_path(
@@ -50,6 +93,31 @@ def _raw_split_path(
     *,
     local_files_only: bool,
 ) -> Path:
+    """Resolve the immutable raw Parquet file for one dataset split.
+
+    Parameters
+    ----------
+    dataset_id : str
+        Hugging Face dataset repository identifier.
+    config : str
+        Dataset configuration name.
+    revision : str
+        Immutable dataset revision.
+    split : str
+        Split whose Parquet file is required.
+    local_files_only : bool
+        Require the file to exist in the local cache.
+
+    Returns
+    -------
+    pathlib.Path
+        Resolved cached Parquet path.
+
+    Raises
+    ------
+    huggingface_hub.errors.HfHubHTTPError
+        If the immutable file cannot be resolved from the configured source.
+    """
     from huggingface_hub import hf_hub_download
 
     return Path(
@@ -68,6 +136,26 @@ def _validate_loaded_dataset(
     protocol: Mapping[str, Any],
     raw_paths: Mapping[str, Path],
 ) -> None:
+    """Validate loaded dataset identity, rows, labels, and content hashes.
+
+    Parameters
+    ----------
+    dataset : Any
+        Loaded dataset mapping keyed by split name.
+    protocol : mapping of str to Any
+        Frozen scientific protocol.
+    raw_paths : mapping of str to pathlib.Path
+        Immutable raw Parquet paths keyed by split name.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If any split differs from its frozen identity or checksum contract.
+    """
     dataset_spec = protocol["dataset"]
     split_specs = dataset_spec["splits"]
     if set(dataset) != set(split_specs):
@@ -230,22 +318,10 @@ def build_vectorizer(texts: Any) -> Any:
     keras.layers.TextVectorization
         Adapted vectorizer matching the frozen vocabulary contract.
     """
-    keras, tf, protocol = _validated_frameworks()
-
-    def protocol_standardize(text):
-        text = tf.strings.regex_replace(text, "<[^>]+>", " ")
-        text = tf.strings.lower(text)
-        return tf.strings.regex_replace(
-            text, "[" + re.escape(string.punctuation) + "]", ""
-        )
-
-    vectorizer = keras.layers.TextVectorization(
+    _, tf, protocol = _validated_frameworks()
+    vectorizer = create_text_vectorizer(
+        sequence_length=DEFAULT_SEQUENCE_LENGTH,
         max_tokens=DEFAULT_MAX_TOKENS,
-        standardize=protocol_standardize,
-        split="whitespace",
-        output_mode="int",
-        output_sequence_length=DEFAULT_SEQUENCE_LENGTH,
-        pad_to_max_tokens=False,
     )
     vectorizer.adapt(
         tf.data.Dataset.from_tensor_slices(list(texts)).batch(256, drop_remainder=False)
@@ -319,7 +395,7 @@ def package_raw_client_shards(
             f"len(texts)={len(text_array)} len(labels)={len(label_array)}"
         )
 
-    output_path = resolve_dir(output_dir)
+    output_path = _preflight_output_root(output_dir, "client", reusable=True)
     output_path.mkdir(parents=True, exist_ok=True)
     for legacy_archive in output_path.glob("client-*.tar.gz"):
         legacy_archive.unlink()
@@ -398,7 +474,7 @@ def publish_public_artifacts(
     dict of str to Any
         Published public manifest.
     """
-    output_path = resolve_dir(output_dir)
+    output_path = _preflight_output_root(output_dir, "public", reusable=True)
     output_path.mkdir(parents=True, exist_ok=True)
     vocabulary = vectorizer.get_vocabulary()
     vocabulary_bytes = b"".join(item.encode("utf-8") + b"\n" for item in vocabulary)
@@ -413,7 +489,7 @@ def publish_public_artifacts(
     dataset = frozen["dataset"]
     train = dataset["splits"]["train"]
     manifest = {
-        "schema_version": ARTIFACT_SCHEMA_VERSION,
+        "schema_version": PUBLIC_ARTIFACT_SCHEMA_VERSION,
         "embedding_dim": DEFAULT_EMBEDDING_DIM,
         "sequence_length": DEFAULT_SEQUENCE_LENGTH,
         "vocabulary_size": len(vocabulary),
@@ -462,9 +538,11 @@ def prepare_all(
     -------
     None
     """
-    client_dir = resolve_dir(client_shard_dir)
-    public_dir = resolve_dir(public_artifact_dir)
-    evaluation_dir = resolve_dir(evaluation_artifact_dir)
+    client_dir = _preflight_output_root(client_shard_dir, "client", reusable=True)
+    public_dir = _preflight_output_root(public_artifact_dir, "public", reusable=True)
+    evaluation_dir = _preflight_output_root(
+        evaluation_artifact_dir, "evaluation", reusable=False
+    )
     roots = {
         "client": client_dir.resolve(strict=False),
         "public": public_dir.resolve(strict=False),
@@ -482,12 +560,6 @@ def prepare_all(
                 raise ValueError(
                     f"{first_name} and {second_name} artifact roots must be separate"
                 )
-    if evaluation_dir.exists() or evaluation_dir.is_symlink():
-        raise FileExistsError(
-            "evaluation artifact path already exists; use a new path to preserve "
-            "the immutable test set"
-        )
-
     _validated_frameworks()
     dataset = load_verified_imdb_dataset()
     train = dataset["train"]

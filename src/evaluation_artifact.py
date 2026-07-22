@@ -153,6 +153,18 @@ def canonical_evaluation_row_bytes(index: int, text: str, label: int) -> bytes:
 
 
 def _evaluation_dataset_manifest(protocol: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the frozen test-dataset identity for an evaluation manifest.
+
+    Parameters
+    ----------
+    protocol : mapping of str to Any
+        Parsed frozen scientific protocol.
+
+    Returns
+    -------
+    dict of str to Any
+        Exact test-split identity permitted at the evaluation boundary.
+    """
     dataset = protocol["dataset"]
     split = dataset["splits"]["test"]
     return {
@@ -169,6 +181,25 @@ def _evaluation_dataset_manifest(protocol: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _validate_new_artifact_path(output_dir: str | Path) -> Path:
+    """Validate and prepare a new immutable evaluation artifact path.
+
+    Parameters
+    ----------
+    output_dir : str or pathlib.Path
+        New evaluation artifact directory.
+
+    Returns
+    -------
+    pathlib.Path
+        Canonical destination beneath a real parent directory.
+
+    Raises
+    ------
+    FileExistsError
+        If the destination already exists or is a symlink.
+    ValueError
+        If the destination parent is not a regular directory.
+    """
     output_path = resolve_dir(output_dir)
     if output_path.exists() or output_path.is_symlink():
         raise FileExistsError(
@@ -305,6 +336,26 @@ def publish_evaluation_artifact(
 def _require_exact_fields(
     payload: Mapping[str, Any], expected: set[str], name: str
 ) -> None:
+    """Require an evaluation manifest object to contain exactly known fields.
+
+    Parameters
+    ----------
+    payload : mapping of str to Any
+        Manifest object whose keys are validated.
+    expected : set of str
+        Complete permitted field set.
+    name : str
+        Human-readable object name used in errors.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If the object contains missing or additional fields.
+    """
     if set(payload) != expected:
         raise ValueError(f"evaluation {name} has an invalid field set")
 

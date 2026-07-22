@@ -33,6 +33,7 @@ from src.paths import (
     default_public_artifact_dir,
     resolve_dir,
 )
+from src.text_preprocessing import create_text_vectorizer
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"keras\..*")
 
@@ -122,15 +123,9 @@ def load_client_shard(
         encoding="utf-8"
     ) as review_file:
         records = [json.loads(line) for line in review_file]
-    with manifest.vocabulary_path.open(encoding="utf-8") as vocabulary_file:
-        saved_vocab = [
-            line.removesuffix("\n").removesuffix("\r") for line in vocabulary_file
-        ]
-    vectorizer = keras.layers.TextVectorization(
-        output_mode="int",
-        output_sequence_length=int(manifest.payload["sequence_length"]),
-        vocabulary=saved_vocab[2:],
-        dtype="int32",
+    vectorizer = create_text_vectorizer(
+        sequence_length=int(manifest.payload["sequence_length"]),
+        vocabulary=manifest.vocabulary_terms[2:],
     )
     x = np.asarray(vectorizer([record["text"] for record in records]), dtype="int32")
     y = np.asarray([record["label"] for record in records], dtype="float32")

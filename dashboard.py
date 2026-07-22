@@ -15,7 +15,6 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("KERAS_BACKEND", "tensorflow")
 
 import keras
-from keras.layers import TextVectorization
 import tensorflow as tf
 
 from src.app_manifest import load_app_manifest
@@ -26,6 +25,7 @@ from src.artifact_compatibility import (
     load_server_artifact_snapshot,
 )
 from src.paths import default_public_artifact_dir, default_server_artifact_dir
+from src.text_preprocessing import create_text_vectorizer
 
 
 PUBLIC_ARTIFACT_DIR: Path = default_public_artifact_dir()
@@ -98,24 +98,23 @@ def load_model(path: Path | None = None) -> Any:
 
 
 @st.cache_resource
-def load_vectorizer():
+def load_vectorizer() -> keras.layers.TextVectorization:
+    """Load the checksum-verified public vocabulary into the shared vectorizer.
+
+    Returns
+    -------
+    keras.layers.TextVectorization
+        Vocabulary-bound vectorizer implementing the frozen protocol.
+
+    Raises
+    ------
+    ValueError
+        If the public manifest or vocabulary artifact is invalid.
+    """
     app_manifest = load_app_manifest(public_artifact_dir=PUBLIC_ARTIFACT_DIR)
-    vocab_path = app_manifest.vocabulary_path
-    if not vocab_path.exists():
-        raise FileNotFoundError(
-            f"Keine Vokabular-Datei gefunden unter {vocab_path}. "
-            "Bitte zuerst Stage 1 Datenvorbereitung ausführen."
-        )
-
-    saved_vocab = vocab_path.read_text(encoding="utf-8").splitlines()
-    # TextVectorization adds "" and "[UNK]" itself when a vocabulary is supplied.
-    vocab = [term for term in saved_vocab[2:] if term]
-
-    seq_len = int(app_manifest.payload["sequence_length"])
-    return TextVectorization(
-        output_mode="int",
-        output_sequence_length=seq_len,
-        vocabulary=vocab,
+    return create_text_vectorizer(
+        sequence_length=int(app_manifest.payload["sequence_length"]),
+        vocabulary=app_manifest.vocabulary_terms[2:],
     )
 
 

@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping
 
 from src.artifact_compatibility import (
+    PUBLIC_ARTIFACT_SCHEMA_VERSION,
     read_regular_file,
     sha256_bytes,
     validate_artifact_schema,
@@ -18,8 +20,27 @@ from src.paths import default_public_artifact_dir, resolve_dir
 
 @dataclass(frozen=True)
 class AppManifest:
-    payload: dict[str, Any]
+    """Validated immutable snapshot of one public application manifest.
+
+    Parameters
+    ----------
+    payload : mapping of str to Any
+        Validated decoded manifest payload.
+    vocabulary_path : pathlib.Path
+        Original verified vocabulary path, retained for diagnostics only.
+    manifest_bytes : bytes
+        Exact manifest bytes read during validation.
+    vocabulary_bytes : bytes
+        Exact vocabulary bytes read during validation.
+    vocabulary_terms : tuple of str
+        Parsed vocabulary terms including the two reserved tokens.
+    """
+
+    payload: Mapping[str, Any]
     vocabulary_path: Path
+    manifest_bytes: bytes
+    vocabulary_bytes: bytes
+    vocabulary_terms: tuple[str, ...]
 
 
 def configured_value(config, key):
@@ -78,7 +99,12 @@ def load_app_manifest(
     Returns
     -------
     AppManifest
-        Validated manifest payload and vocabulary path.
+        Validated manifest, vocabulary bytes, and parsed-term snapshot.
+
+    Raises
+    ------
+    ValueError
+        If the public artifact path, schema, dataset, or vocabulary is invalid.
     """
     public_dir = resolve_public_artifact_dir(public_artifact_dir=public_artifact_dir)
     if public_dir.is_symlink() or not public_dir.is_dir():
@@ -89,7 +115,9 @@ def load_app_manifest(
         manifest_bytes = read_regular_file(path, parent=canonical_dir)
         payload = dict(
             validate_artifact_schema(
-                json.loads(manifest_bytes.decode("utf-8")), "public manifest"
+                json.loads(manifest_bytes.decode("utf-8")),
+                "public manifest",
+                supported_version=PUBLIC_ARTIFACT_SCHEMA_VERSION,
             )
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -140,4 +168,21 @@ def load_app_manifest(
         raise ValueError("public vocabulary byte length is invalid")
     if sha256_bytes(vocabulary_bytes) != f"sha256:{vocabulary['sha256']}":
         raise ValueError("public vocabulary checksum mismatch")
-    return AppManifest(payload, vocabulary_path)
+    try:
+        vocabulary_text = vocabulary_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("public vocabulary is not valid UTF-8") from error
+    if not vocabulary_text.endswith("\n"):
+        raise ValueError("public vocabulary must end with an LF byte")
+    vocabulary_terms = tuple(vocabulary_text[:-1].split("\n"))
+    if len(vocabulary_terms) != payload["vocabulary_size"]:
+        raise ValueError("public vocabulary term count is invalid")
+    if vocabulary_terms[:2] != ("", "[UNK]"):
+        raise ValueError("public vocabulary reserved tokens are invalid")
+    return AppManifest(
+        MappingProxyType(payload),
+        vocabulary_path,
+        manifest_bytes,
+        vocabulary_bytes,
+        vocabulary_terms,
+    )

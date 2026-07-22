@@ -16,8 +16,8 @@ from typing import Any, Mapping
 from src.app_manifest import load_app_manifest
 from src.artifact_compatibility import (
     ARTIFACT_SCHEMA_VERSION,
+    sha256_bytes,
     validate_artifact_schema,
-    sha256_file,
     write_json_atomically,
 )
 from src.contracts import DEFAULT_SPLIT_SEED, DEFAULT_VALIDATION_SEED
@@ -390,9 +390,6 @@ def _dataset_metadata(public_artifact_dir: str | Path | None) -> dict[str, Any]:
         }
 
     manifest = load_app_manifest(public_artifact_dir=public_dir)
-    vocabulary_path = manifest.vocabulary_path.resolve()
-    if not vocabulary_path.is_relative_to(public_dir.resolve()):
-        raise ValueError("public vocabulary must remain inside its artifact directory")
     identity = json.dumps(
         manifest.payload["dataset"],
         ensure_ascii=False,
@@ -403,8 +400,8 @@ def _dataset_metadata(public_artifact_dir: str | Path | None) -> dict[str, Any]:
     return {
         "identity": identity,
         "checksums": {
-            "manifest.json": sha256_file(public_dir / "manifest.json"),
-            manifest.vocabulary_path.name: sha256_file(vocabulary_path),
+            "manifest.json": sha256_bytes(manifest.manifest_bytes),
+            manifest.vocabulary_path.name: sha256_bytes(manifest.vocabulary_bytes),
         },
         "status": "available",
         "private_client_shards": private_status,
