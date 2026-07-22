@@ -56,6 +56,7 @@ ENVIRONMENT_FIELDS = {
     "machine",
     "packages",
 }
+_PRIVATE_SHARD_FILENAMES = {"client_metadata.json", "reviews.jsonl"}
 
 
 def _required_nested_fields(
@@ -433,7 +434,7 @@ def _validate_dataset(dataset: Mapping[str, Any]) -> None:
                 "run provenance private shard public manifest binding differs from "
                 "the authoritative public manifest"
             )
-        if any(
+        if set(shard_checksums) != _PRIVATE_SHARD_FILENAMES or any(
             not isinstance(name, str)
             or not isinstance(checksum, str)
             or len(checksum) != 71
@@ -590,6 +591,13 @@ def _dataset_metadata(
         public_dir = resolve_public_artifact_dir(
             public_artifact_dir=public_artifact_dir
         )
+    if client_shard is not None and (
+        not isinstance(client_shard, Mapping)
+        or set(client_shard) != {"identity", "checksums"}
+        or not isinstance(client_shard["checksums"], Mapping)
+        or set(client_shard["checksums"]) != _PRIVATE_SHARD_FILENAMES
+    ):
+        raise ValueError("dataset.private_client_shards provenance is invalid")
     private_status = (
         {
             "status": "available",

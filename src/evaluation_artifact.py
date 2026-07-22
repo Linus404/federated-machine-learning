@@ -80,6 +80,19 @@ class EvaluationArtifactSnapshot:
     records: bytes
 
 
+@dataclass(frozen=True)
+class _RetainedEvaluationFile:
+    """Retain one staged evaluation file and its exact identity and bytes."""
+
+    descriptor: int
+    device: int
+    inode: int
+    size_bytes: int
+    modified_ns: int
+    changed_ns: int
+    content: bytes
+
+
 def load_scientific_protocol() -> Mapping[str, Any]:
     """Load the frozen scientific protocol from the repository.
 
@@ -317,6 +330,154 @@ def _destination_exists(parent_descriptor: int, output_name: str) -> bool:
     return True
 
 
+def _read_retained_evaluation_file(
+    directory_descriptor: int, name: str
+) -> _RetainedEvaluationFile:
+    """Open and retain one stable, single-link staged regular file.
+
+    Parameters
+    ----------
+    directory_descriptor : int
+        Retained staging directory descriptor.
+    name : str
+        Direct child filename.
+
+    Returns
+    -------
+    _RetainedEvaluationFile
+        Retained identity and exact bytes.
+    """
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+        dir_fd=directory_descriptor,
+    )
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ValueError("evaluation staging file is unsafe")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        content = b"".join(chunks)
+        after = os.fstat(descriptor)
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if before_identity != after_identity or len(content) != after.st_size:
+            raise ValueError("evaluation staging file changed during publication")
+        return _RetainedEvaluationFile(
+            descriptor,
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+            content,
+        )
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _verify_evaluation_inventory(
+    directory_descriptor: int,
+    files: Mapping[str, _RetainedEvaluationFile],
+) -> None:
+    """Require the exact retained evaluation inventory and bytes.
+
+    Parameters
+    ----------
+    directory_descriptor : int
+        Retained staged or installed directory descriptor.
+    files : mapping of str to _RetainedEvaluationFile
+        Exact expected file inventory.
+
+    Returns
+    -------
+    None
+    """
+    if set(os.listdir(directory_descriptor)) != set(files):
+        raise ValueError("evaluation artifact inventory changed during publication")
+    for name, retained in files.items():
+        entry = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+        current = os.fstat(retained.descriptor)
+        os.lseek(retained.descriptor, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        while chunk := os.read(retained.descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        identity = (
+            retained.device,
+            retained.inode,
+            retained.size_bytes,
+            retained.modified_ns,
+            retained.changed_ns,
+        )
+        if (
+            not stat.S_ISREG(entry.st_mode)
+            or entry.st_nlink != 1
+            or (
+                entry.st_dev,
+                entry.st_ino,
+                entry.st_size,
+                entry.st_mtime_ns,
+                entry.st_ctime_ns,
+            )
+            != identity
+            or (
+                current.st_dev,
+                current.st_ino,
+                current.st_size,
+                current.st_mtime_ns,
+                current.st_ctime_ns,
+            )
+            != identity
+            or b"".join(chunks) != retained.content
+        ):
+            raise ValueError("evaluation artifact changed during publication")
+
+
+def _directory_entry_matches_descriptor(
+    parent_descriptor: int, name: str, directory_descriptor: int
+) -> bool:
+    """Return whether a name still selects a retained directory descriptor.
+
+    Parameters
+    ----------
+    parent_descriptor : int
+        Owning parent directory descriptor.
+    name : str
+        Direct child directory name.
+    directory_descriptor : int
+        Retained directory descriptor.
+
+    Returns
+    -------
+    bool
+        Whether the directory entry and retained descriptor identities match.
+    """
+    try:
+        entry = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        retained = os.fstat(directory_descriptor)
+    except OSError:
+        return False
+    return stat.S_ISDIR(entry.st_mode) and (entry.st_dev, entry.st_ino) == (
+        retained.st_dev,
+        retained.st_ino,
+    )
+
+
 def _validate_row(
     text: object, label: object, *, split: str, index: int
 ) -> tuple[str, int]:
@@ -403,6 +564,7 @@ def _publish_evaluation_artifact_unlocked(
     content_hash = hashlib.sha256()
     label_counts: Counter[int] = Counter()
     row_count = 0
+    retained_files: dict[str, _RetainedEvaluationFile] = {}
     try:
         records_descriptor = os.open(
             EVALUATION_RECORDS_FILENAME,
@@ -442,6 +604,7 @@ def _publish_evaluation_artifact_unlocked(
                 "test canonical content SHA-256 differs from the frozen protocol"
             )
 
+        records_checksum = f"sha256:{record_hash.hexdigest()}"
         manifest = {
             "schema_version": EVALUATION_ARTIFACT_SCHEMA_VERSION,
             "artifact_type": "untouched_global_test_set",
@@ -458,9 +621,7 @@ def _publish_evaluation_artifact_unlocked(
                 "row_identity": "{split}:{zero_based_official_split_row_index}",
                 "order": "ascending_zero_based_official_split_row_index",
             },
-            "checksums": {
-                EVALUATION_RECORDS_FILENAME: f"sha256:{record_hash.hexdigest()}"
-            },
+            "checksums": {EVALUATION_RECORDS_FILENAME: records_checksum},
         }
         manifest_descriptor = os.open(
             EVALUATION_MANIFEST_FILENAME,
@@ -469,9 +630,22 @@ def _publish_evaluation_artifact_unlocked(
             dir_fd=staging_descriptor,
         )
         with os.fdopen(manifest_descriptor, "wb") as file:
-            file.write(canonical_json_bytes(manifest))
+            manifest_bytes = canonical_json_bytes(manifest)
+            file.write(manifest_bytes)
             file.flush()
             os.fsync(file.fileno())
+        for name in (EVALUATION_MANIFEST_FILENAME, EVALUATION_RECORDS_FILENAME):
+            retained_files[name] = _read_retained_evaluation_file(
+                staging_descriptor, name
+            )
+        if retained_files[EVALUATION_MANIFEST_FILENAME].content != manifest_bytes:
+            raise ValueError("evaluation manifest changed during publication")
+        if (
+            sha256_bytes(retained_files[EVALUATION_RECORDS_FILENAME].content)
+            != records_checksum
+        ):
+            raise ValueError("evaluation records changed during publication")
+        _verify_evaluation_inventory(staging_descriptor, retained_files)
         os.fsync(staging_descriptor)
         staged_stat = os.stat(
             staging_name, dir_fd=parent_descriptor, follow_symlinks=False
@@ -488,15 +662,29 @@ def _publish_evaluation_artifact_unlocked(
             src_dir_fd=parent_descriptor,
             dst_dir_fd=parent_descriptor,
         )
+        if not _directory_entry_matches_descriptor(
+            parent_descriptor, output_name, staging_descriptor
+        ):
+            raise ValueError("evaluation destination changed during publication")
         os.fsync(parent_descriptor)
+        if not _directory_entry_matches_descriptor(
+            parent_descriptor, output_name, staging_descriptor
+        ):
+            raise ValueError("evaluation destination changed during publication")
+        _verify_evaluation_inventory(staging_descriptor, retained_files)
         return output_path
     except BaseException:
         try:
-            shutil.rmtree(staging_name, dir_fd=parent_descriptor)
+            if _directory_entry_matches_descriptor(
+                parent_descriptor, staging_name, staging_descriptor
+            ):
+                shutil.rmtree(staging_name, dir_fd=parent_descriptor)
         except FileNotFoundError:
             pass
         raise
     finally:
+        for retained in retained_files.values():
+            os.close(retained.descriptor)
         os.close(staging_descriptor)
 
 

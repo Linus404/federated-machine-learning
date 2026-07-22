@@ -152,6 +152,42 @@ def private_shard_provenance(manifest_bytes: bytes) -> dict[str, Any]:
 
 
 class RunProvenanceTests(unittest.TestCase):
+    def test_available_private_shard_requires_exact_checksum_inventory(self) -> None:
+        """Reject missing, extra, empty, and malformed private checksum bindings."""
+        mutations = {
+            "empty": {},
+            "missing metadata": {"reviews.jsonl": "sha256:" + "2" * 64},
+            "missing reviews": {"client_metadata.json": "sha256:" + "1" * 64},
+            "extra": {
+                "client_metadata.json": "sha256:" + "1" * 64,
+                "reviews.jsonl": "sha256:" + "2" * 64,
+                "extra.json": "sha256:" + "3" * 64,
+            },
+            "malformed": {
+                "client_metadata.json": "sha256:" + "1" * 64,
+                "reviews.jsonl": "sha256:not-a-digest",
+            },
+        }
+        for name, checksums in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmpdir:
+                public_dir = Path(tmpdir) / "public"
+                public_dir.mkdir()
+                protocol = write_public_dataset_contract(public_dir)
+                from src.app_manifest import load_app_manifest
+
+                snapshot = load_app_manifest(
+                    public_artifact_dir=public_dir, protocol=protocol
+                )
+                shard = private_shard_provenance(snapshot.manifest_bytes)
+                shard["checksums"] = checksums
+                with self.assertRaisesRegex(ValueError, "private_client_shards"):
+                    write_run_provenance_manifest(
+                        Path(tmpdir) / "run",
+                        {},
+                        app_manifest=snapshot,
+                        client_shard=shard,
+                    )
+
     def test_private_shard_requires_exact_dataset_and_public_binding(self) -> None:
         mutations = {
             field: value

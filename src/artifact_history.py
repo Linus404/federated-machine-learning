@@ -80,6 +80,16 @@ class _HistoryDescriptors:
     run_name: str
 
 
+@dataclass(frozen=True)
+class _HistoryRootDescriptors:
+    """Retain the canonical root and runs directory chain."""
+
+    root_parent: _RetainedDirectory
+    root: _RetainedDirectory
+    runs: _RetainedDirectory
+    root_name: str
+
+
 def _directory_identity(descriptor: int) -> tuple[int, int]:
     """Return the stable device and inode identity of a directory descriptor.
 
@@ -245,6 +255,69 @@ def _verify_history_descriptors(descriptors: _HistoryDescriptors) -> None:
     )
 
 
+@contextmanager
+def _retain_history_root(
+    root: Path, runs_root: Path
+) -> Iterator[_HistoryRootDescriptors]:
+    """Retain and verify the canonical root-to-runs directory chain.
+
+    Parameters
+    ----------
+    root : pathlib.Path
+        Canonical artifact root.
+    runs_root : pathlib.Path
+        Canonical runs directory.
+
+    Yields
+    ------
+    _HistoryRootDescriptors
+        Retained root and runs descriptors.
+    """
+    require_secure_artifact_platform()
+    retained: list[_RetainedDirectory] = []
+    try:
+        root_parent = _open_retained_directory(root.parent)
+        retained.append(root_parent)
+        retained_root = _open_retained_directory(
+            root.name, parent_descriptor=root_parent.descriptor
+        )
+        retained.append(retained_root)
+        retained_runs = _open_retained_directory(
+            RUNS_DIRECTORY, parent_descriptor=retained_root.descriptor
+        )
+        retained.append(retained_runs)
+        descriptors = _HistoryRootDescriptors(
+            root_parent, retained_root, retained_runs, root.name
+        )
+        _verify_history_root(descriptors)
+        yield descriptors
+    finally:
+        for directory in reversed(retained):
+            os.close(directory.descriptor)
+
+
+def _verify_history_root(descriptors: _HistoryRootDescriptors) -> None:
+    """Revalidate the retained artifact root and runs entries.
+
+    Parameters
+    ----------
+    descriptors : _HistoryRootDescriptors
+        Retained root-to-runs descriptor chain.
+
+    Returns
+    -------
+    None
+    """
+    _verify_directory_entry(
+        descriptors.root_parent.descriptor,
+        descriptors.root_name,
+        descriptors.root,
+    )
+    _verify_directory_entry(
+        descriptors.root.descriptor, RUNS_DIRECTORY, descriptors.runs
+    )
+
+
 def _read_descriptor_bytes(descriptor: int) -> tuple[bytes, os.stat_result]:
     """Read exact bytes while requiring stable descriptor metadata.
 
@@ -323,6 +396,106 @@ def _open_retained_file(parent_descriptor: int, name: str) -> _RetainedFile:
     except BaseException:
         os.close(descriptor)
         raise
+
+
+def _retained_file_entry_matches(
+    parent_descriptor: int,
+    name: str,
+    retained: _RetainedFile,
+    expected_content: bytes,
+) -> bool:
+    """Return whether a name still selects one retained exact file.
+
+    Parameters
+    ----------
+    parent_descriptor : int
+        Owning directory descriptor.
+    name : str
+        Direct child filename.
+    retained : _RetainedFile
+        Retained file identity and descriptor.
+    expected_content : bytes
+        Exact bytes required from the retained file.
+
+    Returns
+    -------
+    bool
+        Whether the entry, descriptor identity, and bytes all still match.
+    """
+    try:
+        entry = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        content, current = _read_descriptor_bytes(retained.descriptor)
+    except (OSError, ValueError):
+        return False
+    captured = retained.snapshot
+    return (
+        stat.S_ISREG(entry.st_mode)
+        and entry.st_nlink == 1
+        and (entry.st_dev, entry.st_ino) == (captured.device, captured.inode)
+        and (current.st_dev, current.st_ino) == (captured.device, captured.inode)
+        and content == expected_content
+    )
+
+
+def _require_retained_file_entry(
+    parent_descriptor: int,
+    name: str,
+    retained: _RetainedFile,
+    expected_content: bytes,
+) -> None:
+    """Require a name to select one retained file with exact bytes.
+
+    Parameters
+    ----------
+    parent_descriptor : int
+        Owning directory descriptor.
+    name : str
+        Direct child filename.
+    retained : _RetainedFile
+        Retained file identity and descriptor.
+    expected_content : bytes
+        Exact bytes required from the retained file.
+
+    Returns
+    -------
+    None
+    """
+    if not _retained_file_entry_matches(
+        parent_descriptor, name, retained, expected_content
+    ):
+        raise ValueError("installed artifact entry changed during finalization")
+
+
+def _unlink_retained_file_entry(
+    parent_descriptor: int,
+    name: str,
+    retained: _RetainedFile,
+    expected_content: bytes,
+) -> bool:
+    """Unlink a name only while it still selects the retained exact file.
+
+    Parameters
+    ----------
+    parent_descriptor : int
+        Owning directory descriptor.
+    name : str
+        Direct child filename.
+    retained : _RetainedFile
+        Retained file identity and descriptor.
+    expected_content : bytes
+        Exact bytes required from the retained file.
+
+    Returns
+    -------
+    bool
+        Whether the proven-owned entry was unlinked.
+    """
+    if not _retained_file_entry_matches(
+        parent_descriptor, name, retained, expected_content
+    ):
+        return False
+    os.unlink(name, dir_fd=parent_descriptor)
+    return True
 
 
 @contextmanager
@@ -942,7 +1115,8 @@ def _replace_bytes_at(
     content: bytes,
     *,
     mode: int = 0o644,
-) -> None:
+    retain: bool = False,
+) -> _RetainedFile | None:
     """Atomically replace one file descriptor-relatively.
 
     Parameters
@@ -955,10 +1129,13 @@ def _replace_bytes_at(
         Exact replacement bytes.
     mode : int, optional
         Exact permissions installed on the replacement file.
+    retain : bool, optional
+        Keep the installed file descriptor open for a later commit check.
 
     Returns
     -------
-    None
+    _RetainedFile or None
+        Retained installed file when requested, otherwise ``None``.
     """
     descriptor: int | None = None
     temporary: str | None = None
@@ -967,7 +1144,7 @@ def _replace_bytes_at(
         try:
             descriptor = os.open(
                 candidate,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                 mode,
                 dir_fd=root_descriptor,
             )
@@ -977,12 +1154,26 @@ def _replace_bytes_at(
         break
     if descriptor is None or temporary is None:
         raise FileExistsError("could not allocate an exclusive temporary file")
+    retained: _RetainedFile | None = None
     try:
         _write_all(descriptor, content)
         os.fchmod(descriptor, mode)
         os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = None
+        captured, file_stat = _read_descriptor_bytes(descriptor)
+        if captured != content:
+            raise ValueError("atomic replacement changed during write")
+        retained = _RetainedFile(
+            descriptor,
+            RegularFileSnapshot(
+                captured,
+                file_stat.st_dev,
+                file_stat.st_ino,
+                file_stat.st_size,
+                file_stat.st_mtime_ns,
+                file_stat.st_ctime_ns,
+            ),
+        )
+        _require_retained_file_entry(root_descriptor, temporary, retained, content)
         os.rename(
             temporary,
             name,
@@ -990,14 +1181,36 @@ def _replace_bytes_at(
             dst_dir_fd=root_descriptor,
         )
         temporary = None
+        _require_retained_file_entry(root_descriptor, name, retained, content)
+        if retain:
+            descriptor = None
+            return retained
+        os.close(descriptor)
+        descriptor = None
+        return None
     except BaseException:
-        if descriptor is not None:
-            os.close(descriptor)
         if temporary is not None:
             try:
-                os.unlink(temporary, dir_fd=root_descriptor)
-            except FileNotFoundError:
+                if retained is not None:
+                    _unlink_retained_file_entry(
+                        root_descriptor, temporary, retained, content
+                    )
+                elif descriptor is not None:
+                    temporary_stat = os.stat(
+                        temporary,
+                        dir_fd=root_descriptor,
+                        follow_symlinks=False,
+                    )
+                    owned_stat = os.fstat(descriptor)
+                    if (temporary_stat.st_dev, temporary_stat.st_ino) == (
+                        owned_stat.st_dev,
+                        owned_stat.st_ino,
+                    ):
+                        os.unlink(temporary, dir_fd=root_descriptor)
+            except (FileNotFoundError, ValueError):
                 pass
+        if descriptor is not None:
+            os.close(descriptor)
         raise
 
 
@@ -1032,29 +1245,39 @@ def _record_finalization_state(
     name = _finalization_state_name(run_id)
     previous_record = _load_finalization_state_at(root.descriptor, run_id)
     document = canonical_json_bytes(state.payload())
-    _replace_bytes_at(root.descriptor, name, document, mode=0o600)
+    installed = _replace_bytes_at(
+        root.descriptor, name, document, mode=0o600, retain=True
+    )
+    assert installed is not None
     try:
         _sync_retained_directory(root)
+        _require_retained_file_entry(root.descriptor, name, installed, document)
         persisted = _load_finalization_state_at(root.descriptor, run_id)
         if persisted != (state, document):
             raise ValueError("run finalization state changed during finalization")
     except BaseException:
-        if previous_record is None:
-            os.unlink(name, dir_fd=root.descriptor)
-        else:
-            _replace_bytes_at(
-                root.descriptor,
-                name,
-                previous_record[1],
-                mode=0o600,
-            )
-        _sync_retained_directory(root)
+        if _retained_file_entry_matches(root.descriptor, name, installed, document):
+            if previous_record is None:
+                _unlink_retained_file_entry(root.descriptor, name, installed, document)
+            else:
+                _replace_bytes_at(
+                    root.descriptor,
+                    name,
+                    previous_record[1],
+                    mode=0o600,
+                )
+            _sync_retained_directory(root)
         raise
+    finally:
+        os.close(installed.descriptor)
     return state, document
 
 
 def _rollback_current_index(
-    descriptors: _HistoryDescriptors, previous_bytes: bytes | None
+    descriptors: _HistoryDescriptors,
+    previous_bytes: bytes | None,
+    installed: _RetainedFile,
+    candidate_bytes: bytes,
 ) -> None:
     """Restore the pre-publication pointer after an identity failure.
 
@@ -1064,13 +1287,29 @@ def _rollback_current_index(
         Retained history descriptor chain.
     previous_bytes : bytes or None
         Exact prior pointer, or ``None`` when publication created it.
+    installed : _RetainedFile
+        Retained candidate pointer installed by this publication.
+    candidate_bytes : bytes
+        Exact candidate pointer bytes.
 
     Returns
     -------
     None
     """
+    if not _retained_file_entry_matches(
+        descriptors.root.descriptor,
+        CURRENT_RUN_FILENAME,
+        installed,
+        candidate_bytes,
+    ):
+        return
     if previous_bytes is None:
-        os.unlink(CURRENT_RUN_FILENAME, dir_fd=descriptors.root.descriptor)
+        _unlink_retained_file_entry(
+            descriptors.root.descriptor,
+            CURRENT_RUN_FILENAME,
+            installed,
+            candidate_bytes,
+        )
     else:
         _replace_bytes_at(
             descriptors.root.descriptor, CURRENT_RUN_FILENAME, previous_bytes
@@ -1083,7 +1322,7 @@ def _write_current_index_at(
     descriptors: _HistoryDescriptors,
     index: Mapping[str, Any],
     previous_bytes: bytes | None,
-) -> Path:
+) -> tuple[Path, _RetainedFile]:
     """Publish and durably flush ``current.json`` under the retained root.
 
     Parameters
@@ -1099,22 +1338,111 @@ def _write_current_index_at(
 
     Returns
     -------
-    pathlib.Path
-        Published current pointer path.
+    tuple of pathlib.Path and _RetainedFile
+        Published path and retained installed candidate pointer.
     """
     _verify_history_descriptors(descriptors)
-    _replace_bytes_at(
+    candidate_bytes = canonical_json_bytes(index)
+    installed = _replace_bytes_at(
         descriptors.root.descriptor,
         CURRENT_RUN_FILENAME,
-        canonical_json_bytes(index),
+        candidate_bytes,
+        retain=True,
     )
+    assert installed is not None
     try:
         _verify_history_descriptors(descriptors)
-    except ValueError:
-        _rollback_current_index(descriptors, previous_bytes)
+        _require_retained_file_entry(
+            descriptors.root.descriptor,
+            CURRENT_RUN_FILENAME,
+            installed,
+            candidate_bytes,
+        )
+    except BaseException:
+        _rollback_current_index(descriptors, previous_bytes, installed, candidate_bytes)
+        os.close(installed.descriptor)
         raise
-    _sync_retained_directory(descriptors.root)
-    return root / CURRENT_RUN_FILENAME
+    try:
+        _sync_retained_directory(descriptors.root)
+    except BaseException:
+        os.close(installed.descriptor)
+        raise
+    try:
+        _verify_history_descriptors(descriptors)
+        _require_retained_file_entry(
+            descriptors.root.descriptor,
+            CURRENT_RUN_FILENAME,
+            installed,
+            candidate_bytes,
+        )
+        reopened = _load_current_index_at(root, descriptors.root.descriptor)
+        if reopened is None or reopened[1] != candidate_bytes:
+            raise ValueError("current-run index changed during finalization")
+    except BaseException:
+        _rollback_current_index(descriptors, previous_bytes, installed, candidate_bytes)
+        os.close(installed.descriptor)
+        raise
+    return root / CURRENT_RUN_FILENAME, installed
+
+
+def _commit_complete_state(
+    root: Path,
+    descriptors: _HistoryDescriptors,
+    run_id: str,
+    state: _FinalizationState,
+    current: _RetainedFile,
+    completed_inventory: Mapping[str, _RetainedFile],
+    expected_content: Mapping[str, bytes],
+) -> None:
+    """Commit complete only while the candidate remains visibly installed.
+
+    Parameters
+    ----------
+    root : pathlib.Path
+        Canonical artifact root used for pointer validation diagnostics.
+    descriptors : _HistoryDescriptors
+        Retained root-to-run descriptor chain.
+    run_id : str
+        Canonical run identity.
+    state : _FinalizationState
+        Exact pending publication state.
+    current : _RetainedFile
+        Retained installed candidate pointer.
+    completed_inventory : mapping of str to _RetainedFile
+        Retained completed-run inventory.
+    expected_content : mapping of str to bytes
+        Exact completed-run bytes.
+
+    Returns
+    -------
+    None
+    """
+
+    def verify_commit_point() -> None:
+        _verify_history_descriptors(descriptors)
+        _verify_run_inventory(
+            descriptors.run.descriptor, completed_inventory, expected_content
+        )
+        _require_retained_file_entry(
+            descriptors.root.descriptor,
+            CURRENT_RUN_FILENAME,
+            current,
+            state.candidate.content,
+        )
+        reopened = _load_current_index_at(root, descriptors.root.descriptor)
+        if reopened is None or reopened[1] != state.candidate.content:
+            raise ValueError("current-run index changed during finalization")
+
+    verify_commit_point()
+    completed = False
+    try:
+        _record_finalization_state(descriptors.root, run_id, state.completed())
+        completed = True
+        verify_commit_point()
+    except BaseException:
+        if completed:
+            _record_finalization_state(descriptors.root, run_id, state)
+        raise
 
 
 def resolve_current_run_dir(artifact_root: str | Path) -> Path:
@@ -1453,24 +1781,21 @@ def publish_completed_run(
                             )
                         if current_bytes == candidate.content:
                             _sync_retained_directory(descriptors.root)
-                            _verify_history_descriptors(descriptors)
-                            _verify_run_inventory(
-                                descriptors.run.descriptor,
-                                completed_inventory,
-                                expected_content,
+                            recovered_pointer = _open_retained_file(
+                                descriptors.root.descriptor, CURRENT_RUN_FILENAME
                             )
-                            recovered = _load_current_index_at(
-                                root, descriptors.root.descriptor
-                            )
-                            if recovered is None or recovered[1] != candidate.content:
-                                raise ValueError(
-                                    "current-run index changed during finalization"
+                            try:
+                                _commit_complete_state(
+                                    root,
+                                    descriptors,
+                                    resolved_run_dir.name,
+                                    state,
+                                    recovered_pointer,
+                                    completed_inventory,
+                                    expected_content,
                                 )
-                            _record_finalization_state(
-                                descriptors.root,
-                                resolved_run_dir.name,
-                                state.completed(),
-                            )
+                            finally:
+                                os.close(recovered_pointer.descriptor)
                             return root / CURRENT_RUN_FILENAME
 
                         _verify_history_descriptors(descriptors)
@@ -1479,7 +1804,7 @@ def publish_completed_run(
                             completed_inventory,
                             expected_content,
                         )
-                        pointer = _write_current_index_at(
+                        pointer, installed_pointer = _write_current_index_at(
                             root, descriptors, index, previous_bytes
                         )
                         try:
@@ -1489,19 +1814,117 @@ def publish_completed_run(
                                 completed_inventory,
                                 expected_content,
                             )
+                            _commit_complete_state(
+                                root,
+                                descriptors,
+                                resolved_run_dir.name,
+                                state,
+                                installed_pointer,
+                                completed_inventory,
+                                expected_content,
+                            )
                         except ValueError:
-                            _rollback_current_index(descriptors, previous_bytes)
+                            _rollback_current_index(
+                                descriptors,
+                                previous_bytes,
+                                installed_pointer,
+                                candidate.content,
+                            )
                             raise
-                        _record_finalization_state(
-                            descriptors.root,
-                            resolved_run_dir.name,
-                            state.completed(),
-                        )
+                        finally:
+                            os.close(installed_pointer.descriptor)
                         return pointer
                     finally:
                         os.close(retained_manifest.descriptor)
             except FileNotFoundError as error:
                 raise ValueError("server artifact is missing or unsafe") from error
+
+
+def _state_allows_prune(
+    root_descriptor: int, run_id: str, current_bytes: bytes
+) -> tuple[bool, bool]:
+    """Classify whether a run and its finalization state may be pruned.
+
+    Parameters
+    ----------
+    root_descriptor : int
+        Retained artifact-root descriptor.
+    run_id : str
+        Canonical candidate run identity.
+    current_bytes : bytes
+        Exact current-pointer bytes.
+
+    Returns
+    -------
+    tuple of bool and bool
+        Whether the run may be pruned and whether its state must then be removed.
+    """
+    try:
+        state_record = _load_finalization_state_at(root_descriptor, run_id)
+    except ValueError:
+        return False, False
+    if state_record is None:
+        return True, False
+    state = state_record[0]
+    if state.status == _PUBLICATION_COMPLETE:
+        return True, True
+    previous_bytes = None if state.previous is None else state.previous.content
+    if current_bytes in {state.candidate.content, previous_bytes}:
+        return False, False
+    return True, True
+
+
+def _remove_finalization_state(
+    root: _RetainedDirectory, run_id: str, current_bytes: bytes
+) -> None:
+    """Durably remove one proven safe state while preserving it on failure.
+
+    Parameters
+    ----------
+    root : _RetainedDirectory
+        Retained artifact root.
+    run_id : str
+        Canonical pruned run identity.
+    current_bytes : bytes
+        Exact current pointer used to prove a pending state obsolete.
+
+    Returns
+    -------
+    None
+    """
+    record = _load_finalization_state_at(root.descriptor, run_id)
+    if record is None:
+        return
+    state, document = record
+    previous_bytes = None if state.previous is None else state.previous.content
+    if state.status != _PUBLICATION_COMPLETE and current_bytes in {
+        state.candidate.content,
+        previous_bytes,
+    }:
+        raise ValueError("pending run finalization state cannot be pruned")
+    name = _finalization_state_name(run_id)
+    retained = _open_retained_file(root.descriptor, name)
+    removed = False
+    try:
+        if retained.snapshot.content != document or not _unlink_retained_file_entry(
+            root.descriptor, name, retained, document
+        ):
+            raise ValueError("run finalization state changed during pruning")
+        removed = True
+        _sync_retained_directory(root)
+    except BaseException:
+        if removed:
+            try:
+                os.stat(name, dir_fd=root.descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                _replace_bytes_at(root.descriptor, name, document, mode=0o600)
+                try:
+                    _sync_retained_directory(root)
+                except OSError:
+                    pass
+        raise
+    finally:
+        os.close(retained.descriptor)
 
 
 def prune_run_history(
@@ -1532,55 +1955,105 @@ def prune_run_history(
     if not runs_root.exists():
         return []
 
-    protected: set[Path] = set()
-    index = _load_current_index(root)
-    if index is None:
-        return []
-    protected.add(load_current_run_snapshot(root).directory)
-    if active_run_dir is not None:
-        active_path = Path(active_run_dir)
-        if active_path.is_symlink():
-            raise ValueError("active run must be a regular directory")
-        if not active_path.exists():
-            active = None
-        else:
-            active = active_path.resolve(strict=True)
-        if active is not None and active.parent != runs_root.resolve(strict=True):
-            raise ValueError("active run must be directly below the artifact runs root")
-        if active is not None:
-            protected.add(active)
+    with _retain_history_root(root, runs_root) as descriptors:
+        with _finalization_lock(descriptors.root.descriptor):
+            _verify_history_root(descriptors)
+            current_record = _load_current_index_at(root, descriptors.root.descriptor)
+            if current_record is None:
+                return []
+            current_bytes = current_record[1]
+            protected = {load_current_run_snapshot(root).directory}
+            if active_run_dir is not None:
+                active_path = Path(active_run_dir)
+                if active_path.is_symlink():
+                    raise ValueError("active run must be a regular directory")
+                active = (
+                    active_path.resolve(strict=True) if active_path.exists() else None
+                )
+                if active is not None and active.parent != runs_root.resolve(
+                    strict=True
+                ):
+                    raise ValueError(
+                        "active run must be directly below the artifact runs root"
+                    )
+                if active is not None:
+                    protected.add(active)
 
-    candidates: list[tuple[datetime, str, Path]] = []
-    for path in runs_root.iterdir():
-        if not path.is_dir() or path.is_symlink():
-            continue
-        try:
-            canonical_path = path.resolve(strict=True)
-            manifest_path = run_manifest_path(canonical_path)
-            manifest_bytes = read_regular_file(manifest_path, parent=canonical_path)
-            manifest = load_run_provenance_manifest(
-                manifest_path, manifest_bytes=manifest_bytes
-            )
-        except ValueError:
-            continue
-        if manifest["run_id"] != path.name:
-            continue
-        created_at = datetime.fromisoformat(
-            str(manifest["created_at"]).replace("Z", "+00:00")
-        )
-        candidates.append((created_at, path.name, path.resolve()))
+            candidates: list[tuple[datetime, str, Path, bool, int, int]] = []
+            for name in os.listdir(descriptors.runs.descriptor):
+                try:
+                    entry = os.stat(
+                        name,
+                        dir_fd=descriptors.runs.descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    continue
+                path = runs_root / name
+                if not stat.S_ISDIR(entry.st_mode):
+                    continue
+                try:
+                    canonical_path = path.resolve(strict=True)
+                    manifest_path = run_manifest_path(canonical_path)
+                    manifest_bytes = read_regular_file(
+                        manifest_path, parent=canonical_path
+                    )
+                    manifest = load_run_provenance_manifest(
+                        manifest_path, manifest_bytes=manifest_bytes
+                    )
+                except ValueError:
+                    continue
+                if manifest["run_id"] != name:
+                    continue
+                may_prune, remove_state = _state_allows_prune(
+                    descriptors.root.descriptor, name, current_bytes
+                )
+                if not may_prune:
+                    protected.add(canonical_path)
+                created_at = datetime.fromisoformat(
+                    str(manifest["created_at"]).replace("Z", "+00:00")
+                )
+                candidates.append(
+                    (
+                        created_at,
+                        name,
+                        canonical_path,
+                        remove_state,
+                        entry.st_dev,
+                        entry.st_ino,
+                    )
+                )
 
-    candidates.sort(reverse=True)
-    keep = set(protected)
-    for _, _, path in candidates:
-        if path in keep:
-            continue
-        if len(keep) < retention_runs:
-            keep.add(path)
+            candidates.sort(reverse=True)
+            keep = set(protected)
+            for _, _, path, _, _, _ in candidates:
+                if path in keep:
+                    continue
+                if len(keep) < retention_runs:
+                    keep.add(path)
 
-    deleted: list[Path] = []
-    for _, _, path in reversed(candidates):
-        if path not in keep:
-            shutil.rmtree(path)
-            deleted.append(path)
-    return deleted
+            deleted: list[Path] = []
+            for _, name, path, remove_state, device, inode in reversed(candidates):
+                if path in keep:
+                    continue
+                _verify_history_root(descriptors)
+                current = _load_current_index_at(root, descriptors.root.descriptor)
+                if current is None or current[1] != current_bytes:
+                    raise ValueError("current-run index changed during pruning")
+                entry = os.stat(
+                    name,
+                    dir_fd=descriptors.runs.descriptor,
+                    follow_symlinks=False,
+                )
+                if not stat.S_ISDIR(entry.st_mode) or (
+                    entry.st_dev,
+                    entry.st_ino,
+                ) != (device, inode):
+                    raise ValueError("run history changed during pruning")
+                shutil.rmtree(name, dir_fd=descriptors.runs.descriptor)
+                _sync_retained_directory(descriptors.runs)
+                if remove_state:
+                    _remove_finalization_state(descriptors.root, name, current_bytes)
+                _verify_history_root(descriptors)
+                deleted.append(path)
+            return deleted

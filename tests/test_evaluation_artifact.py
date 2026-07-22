@@ -62,6 +62,92 @@ def test_protocol(rows: list[dict[str, object]]) -> dict[str, object]:
 
 
 class EvaluationArtifactTests(unittest.TestCase):
+    def test_publication_rejects_staging_entry_substitution(self) -> None:
+        """Reject renamed substitutes while leaving every unowned entry intact."""
+        from src import evaluation_artifact
+
+        for entry_type in ("valid directory", "file", "symlink", "directory"):
+            with (
+                self.subTest(entry_type=entry_type),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                output = root / "evaluation"
+                parked = root / "parked-owned-staging"
+                real_rename = os.rename
+
+                def substitute(source, destination, **kwargs):
+                    source_path = root / str(source)
+                    if destination == "evaluation" and str(source).endswith(".staging"):
+                        real_rename(source, parked.name, **kwargs)
+                        if entry_type == "valid directory":
+                            import shutil
+
+                            shutil.copytree(parked, source_path)
+                        elif entry_type == "file":
+                            source_path.write_bytes(b"unowned")
+                        elif entry_type == "symlink":
+                            source_path.symlink_to("missing")
+                        else:
+                            source_path.mkdir()
+                        return real_rename(source, destination, **kwargs)
+                    return real_rename(source, destination, **kwargs)
+
+                with (
+                    patch.object(
+                        evaluation_artifact,
+                        "require_secure_artifact_platform",
+                        return_value=None,
+                    ),
+                    patch.object(
+                        evaluation_artifact.os, "rename", side_effect=substitute
+                    ),
+                    self.assertRaisesRegex(ValueError, "destination changed"),
+                ):
+                    publish_evaluation_artifact(
+                        self.rows, output, protocol=self.protocol
+                    )
+
+                self.assertTrue(parked.is_dir())
+                if entry_type == "file":
+                    self.assertEqual(output.read_bytes(), b"unowned")
+                elif entry_type == "symlink":
+                    self.assertTrue(output.is_symlink())
+                else:
+                    self.assertTrue(output.is_dir())
+
+    def test_publication_rejects_post_rename_content_mutation(self) -> None:
+        """Validate exact installed content after the parent durability barrier."""
+        from src import evaluation_artifact
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            output = root / "evaluation"
+            real_fsync = os.fsync
+            mutated = False
+
+            def mutate_after_parent_sync(descriptor):
+                nonlocal mutated
+                result = real_fsync(descriptor)
+                if not mutated and output.is_dir():
+                    mutated = True
+                    (output / EVALUATION_RECORDS_FILENAME).write_bytes(b"changed\n")
+                return result
+
+            with (
+                patch.object(
+                    evaluation_artifact.os,
+                    "fsync",
+                    side_effect=mutate_after_parent_sync,
+                ),
+                self.assertRaisesRegex(ValueError, "changed during publication"),
+            ):
+                publish_evaluation_artifact(self.rows, output, protocol=self.protocol)
+
+            self.assertEqual(
+                (output / EVALUATION_RECORDS_FILENAME).read_bytes(), b"changed\n"
+            )
+
     def test_publication_rejects_unsupported_platform_before_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             output = Path(tmpdir) / "missing" / "evaluation"

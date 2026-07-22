@@ -1895,6 +1895,186 @@ with patch("src.app_manifest.load_scientific_protocol", return_value=_TEST_PROTO
             self.assertEqual(collision.read_bytes(), b"owned elsewhere")
             self.assertFalse((root / "target").exists())
 
+    def test_replace_bytes_rejects_parked_temp_source_substitutes(self) -> None:
+        """Retain the exclusive source and never clean a replacement by its name."""
+        from src import artifact_history
+
+        for entry_type in ("valid file", "file", "symlink", "directory"):
+            with (
+                self.subTest(entry_type=entry_type),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                parked = root / "parked-owned-temp"
+                descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+                real_rename = os.rename
+
+                def substitute(source, destination, **kwargs):
+                    source_path = root / str(source)
+                    if destination == "target":
+                        real_rename(source, parked.name, **kwargs)
+                        if entry_type == "valid file":
+                            source_path.write_bytes(b"prior pointer")
+                        elif entry_type == "file":
+                            source_path.write_bytes(b"unowned")
+                        elif entry_type == "symlink":
+                            source_path.symlink_to("missing")
+                        else:
+                            source_path.mkdir()
+                    return real_rename(source, destination, **kwargs)
+
+                try:
+                    with (
+                        patch.object(os, "rename", side_effect=substitute),
+                        self.assertRaises(ValueError),
+                    ):
+                        artifact_history._replace_bytes_at(
+                            descriptor, "target", b"candidate"
+                        )
+                finally:
+                    os.close(descriptor)
+
+                self.assertEqual(parked.read_bytes(), b"candidate")
+                target = root / "target"
+                if entry_type == "valid file":
+                    self.assertEqual(target.read_bytes(), b"prior pointer")
+                elif entry_type == "file":
+                    self.assertEqual(target.read_bytes(), b"unowned")
+                elif entry_type == "symlink":
+                    self.assertTrue(target.is_symlink())
+                else:
+                    self.assertTrue(target.is_dir())
+
+    def test_root_replacement_at_complete_transition_never_returns_success(
+        self,
+    ) -> None:
+        """Restore pending state on the retained root at both complete boundaries."""
+        from src import artifact_history
+
+        for boundary in ("before", "after"):
+            with (
+                self.subTest(boundary=boundary),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir) / "root"
+                root.mkdir()
+                run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+                parked = root.parent / "parked-root"
+                real_record = artifact_history._record_finalization_state
+                replaced = False
+
+                def replace_root():
+                    nonlocal replaced
+                    if replaced:
+                        return
+                    replaced = True
+                    root.rename(parked)
+                    root.mkdir()
+                    (root / "runs").mkdir()
+
+                def record(retained_root, run_id, state):
+                    if state.status == "complete" and boundary == "before":
+                        replace_root()
+                    result = real_record(retained_root, run_id, state)
+                    if state.status == "complete" and boundary == "after":
+                        replace_root()
+                    return result
+
+                with (
+                    patch.object(
+                        artifact_history,
+                        "_record_finalization_state",
+                        side_effect=record,
+                    ),
+                    self.assertRaisesRegex(ValueError, "history changed"),
+                ):
+                    publish_completed_run(root, run)
+
+                state_path = parked / f".{RUN_IDS[0]}.finalize.state"
+                self.assertEqual(
+                    json.loads(state_path.read_bytes())["state"], "pending"
+                )
+                self.assertFalse((root / "current.json").exists())
+
+    def test_pruning_removes_only_safe_finalization_state(self) -> None:
+        """Remove complete and obsolete state while preserving recoverable state."""
+        from src import artifact_history
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            oldest = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            current = create_run(root, RUN_IDS[1], "2026-01-02T00:00:00Z")
+            publish_completed_run(root, oldest)
+            publish_completed_run(root, current)
+            oldest_state = root / f".{RUN_IDS[0]}.finalize.state"
+
+            self.assertEqual(prune_run_history(root, 1), [oldest.resolve()])
+            self.assertFalse(oldest_state.exists())
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            current = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            pending = create_run(root, RUN_IDS[1], "2026-01-02T00:00:00Z")
+            publish_completed_run(root, current)
+            with (
+                patch.object(
+                    artifact_history,
+                    "_write_current_index_at",
+                    side_effect=OSError("injected pointer failure"),
+                ),
+                self.assertRaises(OSError),
+            ):
+                publish_completed_run(root, pending)
+            pending_state = root / f".{RUN_IDS[1]}.finalize.state"
+
+            self.assertEqual(prune_run_history(root, 1), [])
+            self.assertTrue(pending.is_dir())
+            self.assertTrue(pending_state.is_file())
+
+            replacement = create_run(root, RUN_IDS[2], "2026-01-03T00:00:00Z")
+            publish_completed_run(root, replacement)
+            self.assertEqual(
+                prune_run_history(root, 1), [current.resolve(), pending.resolve()]
+            )
+            self.assertFalse(pending_state.exists())
+
+    def test_pruning_preserves_unsafe_state_and_state_after_delete_failure(
+        self,
+    ) -> None:
+        """Never remove malformed state or state for a run whose deletion failed."""
+        from src import artifact_history
+
+        for failure in ("unsafe state", "delete failure"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                oldest = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+                current = create_run(root, RUN_IDS[1], "2026-01-02T00:00:00Z")
+                publish_completed_run(root, oldest)
+                publish_completed_run(root, current)
+                state_path = root / f".{RUN_IDS[0]}.finalize.state"
+                if failure == "unsafe state":
+                    state_path.write_bytes(b"not-json")
+                    self.assertEqual(prune_run_history(root, 1), [])
+                else:
+                    real_rmtree = artifact_history.shutil.rmtree
+
+                    def fail_oldest(path, *args, **kwargs):
+                        if str(path) == RUN_IDS[0]:
+                            raise OSError("injected prune failure")
+                        return real_rmtree(path, *args, **kwargs)
+
+                    with (
+                        patch.object(
+                            artifact_history.shutil,
+                            "rmtree",
+                            side_effect=fail_oldest,
+                        ),
+                        self.assertRaisesRegex(OSError, "prune failure"),
+                    ):
+                        prune_run_history(root, 1)
+                self.assertTrue(oldest.is_dir())
+                self.assertTrue(state_path.exists())
+
     def test_replaced_legacy_lock_entry_cannot_split_root_serialization(self) -> None:
         from src import artifact_history
 

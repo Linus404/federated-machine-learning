@@ -48,7 +48,10 @@ index use schema `1`:
   `master-seed` and SHA-256 namespaced derivation contract reproduce model,
   Dropout/training-order, and client/round update-noise streams. Its
   string-encoded public-dataset identity must itself be strict, canonical JSON
-  with the exact train-identity fields and valid field types and values.
+  with the exact train-identity fields and valid field types and values. An
+  available private shard records exactly the SHA-256 bindings for
+  `client_metadata.json` and `reviews.jsonl`; empty, partial, or extended checksum
+  inventories are invalid.
 - Schema-1 `server/current.json` atomically selects a completed run and binds its
   artifact manifest by SHA-256 checksum.
 
@@ -59,8 +62,10 @@ Publication retains no-follow descriptors and filesystem identities for the root
 canonical `runs/` directory, selected run, and captured files. It flushes the
 retained files, completed run directory, and `runs/` directory, revalidates the exact
 entry inventory, identities, and bytes, replaces `current.json` descriptor-relatively,
-and finally flushes the retained artifact root. Finalizers serialize on that retained
-root inode rather than a replaceable lock entry. Before the final barriers, a private,
+and finally flushes the retained artifact root. The exclusive temporary pointer remains
+open through replacement; the installed entry must retain that inode and exact bytes
+before and after the root flush. Finalizers serialize on that retained root inode rather
+than a replaceable lock entry. Before the final barriers, a private,
 strict-canonical state file is atomically replaced and flushed with the exact candidate
 pointer plus the exact previous pointer identity, bytes, and checksum, or its absence.
 A restart accepts only those two recorded pointer states: it retries publication from
@@ -145,6 +150,10 @@ temporarily exceeds the configured count. Directories with missing, malformed, o
 mismatched provenance are never deleted automatically. Pruning also stops without
 deleting anything when `current.json` is missing or does not select a fully
 checksum-valid completed run.
+Complete-state pruning is serialized on the same retained root inode as publication.
+It removes a pruned run's complete or provably obsolete finalization state and flushes
+the root, but protects recoverable pending or malformed state and its run. A failed run
+deletion leaves its state untouched.
 
 For a schema change, update the producer, every shared loader, rejection and
 acceptance tests, this policy, and the schema constant in the same pull request.
