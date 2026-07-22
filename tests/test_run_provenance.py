@@ -26,7 +26,16 @@ def write_public_dataset_contract(path: Path) -> None:
                 "sequence_length": 500,
                 "vocabulary_size": 4,
                 "vocabulary": {"filename": "vocab.txt"},
-                "provenance": "stanfordnlp/imdb training split",
+                "dataset": {
+                    "id": "stanfordnlp/imdb",
+                    "config": "plain_text",
+                    "revision": "e6281661ce1c48d982bc483cf8a173c1bbeb5d31",
+                    "datasets_version": "4.8.5",
+                    "split": "train",
+                    "rows": 25000,
+                    "raw_parquet_sha256": "db47d16b" + "0" * 56,
+                    "content_sha256": "4639bf10" + "0" * 56,
+                },
             }
         ),
         encoding="utf-8",
@@ -163,7 +172,22 @@ class RunProvenanceTests(unittest.TestCase):
             self.assertEqual(payload["seeds"]["run_config"], {"random-seed": 19})
             self.assertEqual(
                 payload["dataset"]["identity"],
-                "stanfordnlp/imdb training split",
+                json.dumps(
+                    {
+                        "id": "stanfordnlp/imdb",
+                        "config": "plain_text",
+                        "revision": "e6281661ce1c48d982bc483cf8a173c1bbeb5d31",
+                        "datasets_version": "4.8.5",
+                        "split": "train",
+                        "rows": 25000,
+                        "raw_parquet_sha256": "db47d16b" + "0" * 56,
+                        "content_sha256": "4639bf10" + "0" * 56,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ),
             )
             manifest_bytes = (public_dir / "manifest.json").read_bytes()
             self.assertEqual(

@@ -200,6 +200,12 @@ class DistributedDeploymentContractTests(unittest.TestCase):
                     "/app/artifacts/public", service_block(self.compose, service)
                 )
 
+    def test_untouched_evaluation_artifact_is_not_exposed_to_runtime_services(
+        self,
+    ) -> None:
+        self.assertNotIn("artifacts/evaluation", self.compose)
+        self.assertNotIn("FML_EVALUATION_ARTIFACT_DIR", self.compose)
+
     def test_server_outputs_have_one_writer_and_read_only_dashboard(self) -> None:
         self.assertIn(
             "./artifacts/server:/app/artifacts/server\n",
@@ -224,6 +230,7 @@ class DistributedDeploymentContractTests(unittest.TestCase):
 
         self.assertIn(f"--client-shard-dir {root}/clients", compatibility)
         self.assertIn(f"--public-artifact-dir {root}/public", compatibility)
+        self.assertIn(f"--evaluation-artifact-dir {root}/evaluation", compatibility)
         self.assertIn(
             f"client-data-dir='{root}/clients/client-{{partition}}'", compatibility
         )

@@ -6,8 +6,10 @@ from typing import BinaryIO
 
 PUBLIC_ARTIFACT_DIR_ENV = "FML_PUBLIC_ARTIFACT_DIR"
 SERVER_ARTIFACT_DIR_ENV = "FML_SERVER_ARTIFACT_DIR"
+EVALUATION_ARTIFACT_DIR_ENV = "FML_EVALUATION_ARTIFACT_DIR"
 DEFAULT_PUBLIC_ARTIFACT_DIR = Path("artifacts/public")
 DEFAULT_SERVER_ARTIFACT_DIR = Path("artifacts/server")
+DEFAULT_EVALUATION_ARTIFACT_DIR = Path("artifacts/evaluation")
 
 
 class RunArtifactLock:
@@ -63,6 +65,19 @@ def default_server_artifact_dir() -> Path:
     """Return the configured server artifact directory."""
     return resolve_dir(
         os.environ.get(SERVER_ARTIFACT_DIR_ENV, DEFAULT_SERVER_ARTIFACT_DIR)
+    )
+
+
+def default_evaluation_artifact_dir() -> Path:
+    """Return the configured evaluation-only artifact directory.
+
+    Returns
+    -------
+    pathlib.Path
+        Evaluation artifact directory from the environment or project default.
+    """
+    return resolve_dir(
+        os.environ.get(EVALUATION_ARTIFACT_DIR_ENV, DEFAULT_EVALUATION_ARTIFACT_DIR)
     )
 
 

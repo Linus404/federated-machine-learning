@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -10,7 +11,8 @@ import numpy as np
 from src.app_manifest import AppManifest, load_app_manifest
 from src.artifact_compatibility import ARTIFACT_SCHEMA_VERSION
 from src.contracts import client_shard_metadata
-from src.data_prep import main, package_raw_client_shards
+from src.data_prep import main, package_raw_client_shards, prepare_all
+from src.evaluation_artifact import canonical_source_row_bytes
 from src.local_training import (
     build_model_from_manifest,
     load_client_shard,
@@ -156,6 +158,7 @@ def check_client_loader_preserves_control_character_in_vocabulary(
 def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> None:
     public_dir = tmp_path / "public"
     client_dir = tmp_path / "clients"
+    evaluation_dir = tmp_path / "evaluation"
     public_dir.mkdir()
     client_dir.mkdir()
     (public_dir / "keep.txt").write_text("keep", encoding="utf-8")
@@ -163,10 +166,67 @@ def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> No
     (client_dir / "client-0.tar.gz").write_bytes(b"legacy private shard")
     texts = np.asarray([f"Review {index} good movie" for index in range(12)])
     labels = np.asarray([index % 2 for index in range(12)], dtype="int32")
+    test_rows = [
+        {"text": "untouched negative review", "label": 0},
+        {"text": "untouched positive review", "label": 1},
+    ]
 
-    with patch(
-        "src.data_prep.load_imdb_training_data", return_value=(texts, labels)
-    ) as load_dataset:
+    class Split:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def __getitem__(self, key):
+            return [row[key] for row in self.rows]
+
+        def __iter__(self):
+            return iter(self.rows)
+
+    class Vectorizer:
+        def get_vocabulary(self):
+            return ["", "[UNK]", "review", "good", "movie"]
+
+    content = b"".join(
+        canonical_source_row_bytes(row["text"], row["label"]) for row in test_rows
+    )
+    protocol = {
+        "dataset": {
+            "id": "stanfordnlp/imdb",
+            "config": "plain_text",
+            "revision": "e6281661ce1c48d982bc483cf8a173c1bbeb5d31",
+            "datasets_version": "4.8.5",
+            "splits": {
+                "train": {
+                    "rows": 12,
+                    "raw_parquet_sha256": "1" * 64,
+                    "content_sha256": "2" * 64,
+                },
+                "test": {
+                    "rows": 2,
+                    "label_counts": [1, 1],
+                    "raw_parquet_sha256": "3" * 64,
+                    "content_sha256": hashlib.sha256(content).hexdigest(),
+                },
+            },
+        }
+    }
+    dataset = {
+        "train": Split(
+            [
+                {"text": str(text), "label": int(label)}
+                for text, label in zip(texts, labels)
+            ]
+        ),
+        "test": Split(test_rows),
+        "unsupervised": object(),
+    }
+
+    with (
+        patch(
+            "src.data_prep.load_verified_imdb_dataset", return_value=dataset
+        ) as load_dataset,
+        patch("src.data_prep.build_vectorizer", return_value=Vectorizer()),
+        patch("src.data_prep.load_scientific_protocol", return_value=protocol),
+    ):
         main(
             [
                 "--partitions",
@@ -175,6 +235,8 @@ def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> No
                 str(client_dir),
                 "--public-artifact-dir",
                 str(public_dir),
+                "--evaluation-artifact-dir",
+                str(evaluation_dir),
             ]
         )
 
@@ -191,11 +253,49 @@ def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> No
         (client_dir / f"client-{index}" / "reviews.jsonl").exists()
         for index in range(4)
     )
+    client_records = [
+        json.loads(line)
+        for path in client_dir.glob("client-*/reviews.jsonl")
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    evaluation_records = [
+        json.loads(line)
+        for line in (evaluation_dir / "test.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert {record["row_id"] for record in client_records}.isdisjoint(
+        record["row_id"] for record in evaluation_records
+    )
+    assert all(record["row_id"].startswith("train:") for record in client_records)
+    assert all(record["row_id"].startswith("test:") for record in evaluation_records)
+    untouched_texts = {row["text"] for row in test_rows}
+    assert untouched_texts.isdisjoint(record["text"] for record in client_records)
+    public_bytes = b"".join(path.read_bytes() for path in public_dir.iterdir())
+    assert all(text.encode() not in public_bytes for text in untouched_texts)
     assert (public_dir / "keep.txt").read_text(encoding="utf-8") == "keep"
     assert (client_dir / "keep.txt").read_text(encoding="utf-8") == "keep"
 
 
 class ArtifactFlowTests(unittest.TestCase):
+    def test_preparation_rejects_overlapping_artifact_boundaries_before_loading(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with (
+                patch("src.data_prep.load_verified_imdb_dataset") as load_dataset,
+                self.assertRaisesRegex(ValueError, "artifact roots must be separate"),
+            ):
+                prepare_all(
+                    4,
+                    root / "clients",
+                    root / "public",
+                    root / "public" / "evaluation",
+                )
+
+            load_dataset.assert_not_called()
+
     def test_artifact_flow(self) -> None:
         checks = (
             check_public_manifest_loads_the_model_shape,

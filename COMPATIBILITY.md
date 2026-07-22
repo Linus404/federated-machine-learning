@@ -20,6 +20,8 @@ The current artifact schema is `1`. Every persisted contract carries
 - `artifacts/public/manifest.json` describes the vocabulary and model dimensions.
 - Each `client-N/client_metadata.json` describes its client-scoped raw-review
   shard, which `src.data_prep` creates centrally for the demo.
+- `artifacts/evaluation/manifest.json` strictly versions and checksums the
+  immutable official test-split JSONL artifact.
 - Each completed `server/runs/<run_id>` directory has `artifact_manifest.json`,
   which versions the Keras model and both metrics CSV layouts as one consistent,
   checksummed artifact set.
@@ -43,7 +45,7 @@ those files untouched, creates `runs/<run_id>`, and selects the completed run wi
 non-destructive:
 
 ```bash
-uv run python -m src.data_prep --partitions 4 --client-shard-dir artifacts/regenerated-schema-1/clients --public-artifact-dir artifacts/regenerated-schema-1/public
+uv run python -m src.data_prep --partitions 4 --client-shard-dir artifacts/regenerated-schema-1/clients --public-artifact-dir artifacts/regenerated-schema-1/public --evaluation-artifact-dir artifacts/regenerated-schema-1/evaluation
 uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "client-data-dir='artifacts/regenerated-schema-1/clients/client-{partition}' public-artifact-dir='artifacts/regenerated-schema-1/public' server-artifact-dir='artifacts/regenerated-schema-1/server'"
 ```
 

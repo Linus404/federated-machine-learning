@@ -32,19 +32,27 @@ uv sync
 
 ## Artifact preparation
 
-Prepare the raw client shards and shared public vocabulary:
+Prepare the raw client shards, shared public vocabulary, and immutable untouched
+evaluation dataset:
 
 ```bash
-uv run python -m src.data_prep --partitions 4 --client-shard-dir artifacts/clients --public-artifact-dir artifacts/public
+uv run python -m src.data_prep --partitions 4 --client-shard-dir artifacts/clients --public-artifact-dir artifacts/public --evaluation-artifact-dir artifacts/evaluation
 ```
 
-This command loads IMDB once on the operator's machine, reads the complete
-training split, creates every raw review/label shard, and publishes a vocabulary
-adapted on the complete split. The generated directories simulate client-scoped
+This command loads `stanfordnlp/imdb` configuration `plain_text` at the frozen
+revision, verifies every official split and raw/content SHA-256, creates every raw
+review/label shard from the training split only, and publishes a vocabulary
+adapted on that same split. It writes the official test split in ascending source
+order to `artifacts/evaluation`, with stable `test:<row-index>` identities and a
+strict checksum manifest. The unsupervised split is verified and excluded. The
+generated directories simulate client-scoped
 storage only after this centralized preparation; they are not evidence that data
 originated at or remained hidden within independent organizations. Clients
 tokenize their own mounted reviews, and no centrally tokenized partitions are
-generated.
+generated. The evaluation directory is immutable and evaluation-only: it must not
+be mounted into ClientApp, the dashboard, or the current training ServerApp. PR14
+and PR15 will add the registered consumers and metrics; this command performs no
+evaluation.
 
 The server does not read raw shard files during training, but it receives each
 client's resulting model parameters, sample counts, training metrics, and
@@ -87,7 +95,9 @@ uv run streamlit run dashboard.py
 ### Runtime paths
 
 The Flower configuration uses separate paths for public artifacts, server output,
-and raw client shards. Its default client path is
+and raw client shards. Data preparation also uses the separate evaluation-only
+path `artifacts/evaluation`, overridable with `--evaluation-artifact-dir` or
+`FML_EVALUATION_ARTIFACT_DIR`. Its default client path is
 `artifacts/clients/client-{partition}`. You can override paths with Flower run
 config, for example:
 
@@ -137,11 +147,11 @@ directories are left untouched for manual recovery.
 
 ## Local distributed Docker runtime
 
-Prepare the four client shards and public artifacts on the host before starting
-the runtime:
+Prepare the four client shards, public artifacts, and host-only evaluation
+artifact before starting the runtime:
 
 ```bash
-uv run python -m src.data_prep --partitions 4 --client-shard-dir artifacts/clients --public-artifact-dir artifacts/public
+uv run python -m src.data_prep --partitions 4 --client-shard-dir artifacts/clients --public-artifact-dir artifacts/public --evaluation-artifact-dir artifacts/evaluation
 ```
 
 Build the single application image and start the separate SuperLink, ServerApp,
@@ -172,8 +182,9 @@ SuperLink.
 The dashboard is available at <http://127.0.0.1:8501>. Each ClientApp receives
 only its matching `artifacts/clients/client-N` shard as a read-only mount. Public
 artifacts are read-only in every consuming service; only ServerApp can write
-`artifacts/server`, which the dashboard mounts read-only. Stop the runtime with
-`docker compose down`.
+`artifacts/server`, which the dashboard mounts read-only. The untouched
+`artifacts/evaluation` directory is not mounted into this PR13 runtime. Stop the
+runtime with `docker compose down`.
 
 ### Security and privacy scope
 

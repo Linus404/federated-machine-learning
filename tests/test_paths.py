@@ -8,9 +8,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.paths import (
+    EVALUATION_ARTIFACT_DIR_ENV,
     SERVER_ARTIFACT_DIR_ENV,
     acquire_run_artifact_lock,
     client_metrics_path,
+    default_evaluation_artifact_dir,
     default_server_artifact_dir,
     global_model_path,
     metrics_path,
@@ -60,6 +62,19 @@ class RunArtifactLockTests(unittest.TestCase):
 
 
 class ArtifactPathContractTests(unittest.TestCase):
+    def test_default_evaluation_artifact_dir_prefers_evaluation_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            evaluation_dir = Path(tmpdir) / "evaluation-artifacts"
+
+            with patch.dict(
+                os.environ,
+                {EVALUATION_ARTIFACT_DIR_ENV: str(evaluation_dir)},
+                clear=True,
+            ):
+                resolved = default_evaluation_artifact_dir()
+
+            self.assertEqual(resolved, evaluation_dir.resolve())
+
     def test_server_artifact_paths_follow_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             artifact_dir = Path(tmpdir) / "selected-artifacts"

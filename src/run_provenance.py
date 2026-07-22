@@ -394,6 +394,14 @@ def _dataset_metadata(public_artifact_dir: str | Path | None) -> dict[str, Any]:
     if not vocabulary_path.is_relative_to(public_dir.resolve()):
         raise ValueError("public vocabulary must remain inside its artifact directory")
     identity = manifest.payload.get("dataset") or manifest.payload.get("provenance")
+    if isinstance(identity, Mapping):
+        identity = json.dumps(
+            identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
     return {
         "identity": identity,
         "checksums": {
