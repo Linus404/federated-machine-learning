@@ -114,8 +114,8 @@ uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "
 `use-huber` enables an experimental robust aggregation path for outlier-resistance
 experiments; it is not a Byzantine-security guarantee. `use-update-noise` is an
 illustrative ablation, not formal differential privacy: it has no privacy
-accountant or published epsilon/delta and must not be presented as a privacy
-guarantee.
+accountant, composition or sensitivity model, or published epsilon/delta and must
+not be presented as a privacy guarantee.
 
 Every server run and the documented local-training command create an immutable
 `run_manifest.json` before training. It
@@ -161,7 +161,7 @@ uv run python -m src.flower_config
 uv run flwr run . local-docker --stream
 ```
 
-Flower 1.29 reads SuperLink connection profiles from `~/.flwr/config.toml` rather
+Flower 1.32.1 reads SuperLink connection profiles from `~/.flwr/config.toml` rather
 than the project configuration. The configuration command preserves unrelated
 profiles, rejects an existing `local-docker` profile unless it already points to
 the loopback Control API with insecure local transport, and waits until exactly
@@ -181,9 +181,10 @@ This repository does not implement TLS, client or SuperNode authentication,
 secure aggregation, or formal differential privacy. The dashboard has no
 application authentication. Model parameters, metrics, sample counts, and
 artifacts can leak information even though ServerApp does not read raw shard
-files. See the explicit [threat model](THREAT_MODEL.md) for assets, trust
-boundaries, attack surfaces, and requirements that must be met before production
-or privacy claims.
+files. The [secure-aggregation evaluation](docs/adr/0001-secure-aggregation.md)
+records why Flower SecAgg+ adoption is deferred. See the explicit
+[threat model](THREAT_MODEL.md) for assets, trust boundaries, attack surfaces,
+and requirements that must be met before production or privacy claims.
 
 ### Deployment scope
 
