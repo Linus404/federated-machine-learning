@@ -144,7 +144,7 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
             created,
             error_message=error_message,
         )
-        pending_creation: tuple[int, str, tuple[int, int] | None] | None = None
+        pending_creation: tuple[int, str, tuple[int, int]] | None = None
         try:
             anchor_descriptor = os.open(anchor, flags)
             directories.append(
@@ -154,7 +154,6 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
             for component in absolute.parts[len(anchor.parts) :]:
                 parent = directories[-1]
                 made = False
-                pending_identity: tuple[int, int] | None = None
                 try:
                     entry = os.stat(
                         component,
@@ -167,17 +166,15 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
                     chain.verify()
                     os.mkdir(component, mode=mode, dir_fd=parent.descriptor)
                     made = True
-                    pending_creation = (parent.descriptor, component, None)
                     entry = os.stat(
                         component,
                         dir_fd=parent.descriptor,
                         follow_symlinks=False,
                     )
-                    pending_identity = (entry.st_dev, entry.st_ino)
                     pending_creation = (
                         parent.descriptor,
                         component,
-                        pending_identity,
+                        (entry.st_dev, entry.st_ino),
                     )
                 if not stat.S_ISDIR(entry.st_mode):
                     raise ValueError(error_message)
@@ -978,7 +975,7 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
         cls,
         parent_descriptor: int,
         name: str,
-        identity: tuple[int, int] | None,
+        identity: tuple[int, int],
     ) -> None:
         """Remove an empty just-created entry only after proving its identity.
 
@@ -988,8 +985,8 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
             Retained directory that received the new entry.
         name : str
             Newly created direct child name.
-        identity : tuple of int or None
-            Captured device and inode, or ``None`` when ownership was never proved.
+        identity : tuple of int
+            Captured device and inode proving invocation ownership.
 
         Returns
         -------
@@ -1002,7 +999,7 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
             if (
                 not stat.S_ISDIR(entry.st_mode)
                 or entry.st_nlink < 1
-                or (identity is not None and (entry.st_dev, entry.st_ino) != identity)
+                or (entry.st_dev, entry.st_ino) != identity
             ):
                 return
             descriptor = os.open(
@@ -1011,12 +1008,10 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
                 dir_fd=parent_descriptor,
             )
             current = os.fstat(descriptor)
-            expected_identity = identity or (current.st_dev, current.st_ino)
             if (
                 not stat.S_ISDIR(current.st_mode)
                 or current.st_nlink < 1
-                or (current.st_dev, current.st_ino) != expected_identity
-                or (entry.st_dev, entry.st_ino) != expected_identity
+                or (current.st_dev, current.st_ino) != identity
                 or os.listdir(descriptor)
             ):
                 return

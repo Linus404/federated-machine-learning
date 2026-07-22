@@ -276,13 +276,105 @@ class ArtifactCompatibilityTests(unittest.TestCase):
             self.assertFalse(target.exists())
             self.assertFalse(any(parent.glob("*.deleting")))
 
-    def test_retained_chain_creation_cleans_each_failed_suffix_and_retries(
+    def test_retained_chain_creation_preserves_unproved_suffixes_and_retries(
+        self,
+    ) -> None:
+        """Preserve post-mkdir names when initial identity capture fails."""
+        from src import artifact_compatibility
+
+        for replacement in (False, True):
+            with (
+                self.subTest(replacement=replacement),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                target = root / "first" / "second" / "third" / "fourth"
+                parked = root / "first" / "second" / "parked"
+                real_mkdir = os.mkdir
+                real_rename = os.rename
+                real_stat = os.stat
+                baseline = len(os.listdir("/proc/self/fd"))
+                created_third = False
+                failed = False
+                replacement_identity: int | None = None
+
+                def record_mkdir(name, mode=0o777, *, dir_fd=None):
+                    nonlocal created_third
+                    result = real_mkdir(name, mode=mode, dir_fd=dir_fd)
+                    if name == "third":
+                        created_third = True
+                    return result
+
+                def fail_identity_capture(name, *args, **kwargs):
+                    nonlocal failed, replacement_identity
+                    result = real_stat(name, *args, **kwargs)
+                    if (
+                        created_third
+                        and not failed
+                        and name == "third"
+                        and kwargs.get("dir_fd") is not None
+                    ):
+                        failed = True
+                        if replacement:
+                            parent_descriptor = kwargs["dir_fd"]
+                            real_rename(
+                                "third",
+                                "parked",
+                                src_dir_fd=parent_descriptor,
+                                dst_dir_fd=parent_descriptor,
+                            )
+                            real_mkdir("third", dir_fd=parent_descriptor)
+                            replacement_identity = real_stat(
+                                "third",
+                                dir_fd=parent_descriptor,
+                                follow_symlinks=False,
+                            ).st_ino
+                        raise OSError("injected identity capture failure")
+                    return result
+
+                with (
+                    patch.object(
+                        artifact_compatibility.os,
+                        "mkdir",
+                        side_effect=record_mkdir,
+                    ),
+                    patch.object(
+                        artifact_compatibility.os,
+                        "stat",
+                        side_effect=fail_identity_capture,
+                    ),
+                    self.assertRaisesRegex(OSError, "identity capture failure"),
+                ):
+                    RetainedDirectoryChain.open(
+                        target,
+                        create=True,
+                        check_platform=False,
+                    )
+
+                self.assertTrue(target.parent.is_dir())
+                self.assertEqual(len(os.listdir("/proc/self/fd")), baseline)
+                if replacement:
+                    self.assertTrue(parked.is_dir())
+                    self.assertEqual(target.parent.stat().st_ino, replacement_identity)
+
+                with RetainedDirectoryChain.open(
+                    target,
+                    create=True,
+                    check_platform=False,
+                ) as chain:
+                    chain.commit()
+
+                self.assertTrue(target.is_dir())
+                if replacement:
+                    self.assertEqual(target.parent.stat().st_ino, replacement_identity)
+
+    def test_retained_chain_creation_cleans_proven_failures_and_retries(
         self,
     ) -> None:
         """Clean proven empty suffixes after each creation-stage failure without leaks."""
         from src import artifact_compatibility
 
-        for operation in ("mkdir", "stat", "open", "validation", "fsync"):
+        for operation in ("mkdir", "open", "validation", "fsync"):
             with (
                 self.subTest(operation=operation),
                 tempfile.TemporaryDirectory() as tmpdir,
@@ -290,7 +382,6 @@ class ArtifactCompatibilityTests(unittest.TestCase):
                 target = Path(tmpdir) / "first" / "second" / "third"
                 real_mkdir = os.mkdir
                 real_open = os.open
-                real_stat = os.stat
                 real_fstat = os.fstat
                 real_fsync = os.fsync
                 baseline = len(os.listdir("/proc/self/fd"))
@@ -304,19 +395,6 @@ class ArtifactCompatibilityTests(unittest.TestCase):
                     result = real_mkdir(name, mode=mode, dir_fd=dir_fd)
                     if name == "third":
                         created_third = True
-                    return result
-
-                def fail_stat(name, *args, **kwargs):
-                    nonlocal failed
-                    result = real_stat(name, *args, **kwargs)
-                    if (
-                        operation == "stat"
-                        and not failed
-                        and name == "third"
-                        and kwargs.get("dir_fd") is not None
-                    ):
-                        failed = True
-                        raise OSError("injected stat failure")
                     return result
 
                 def fail_open(name, flags, *args, **kwargs):
@@ -363,11 +441,6 @@ class ArtifactCompatibilityTests(unittest.TestCase):
                     ),
                     patch.object(
                         artifact_compatibility.os,
-                        "stat",
-                        side_effect=fail_stat,
-                    ),
-                    patch.object(
-                        artifact_compatibility.os,
                         "fstat",
                         side_effect=fail_fstat,
                     ),
@@ -397,83 +470,50 @@ class ArtifactCompatibilityTests(unittest.TestCase):
     def test_retained_chain_creation_preserves_open_boundary_replacement(
         self,
     ) -> None:
-        """Keep suffix replacements at stat and open boundaries and allow retry."""
+        """Keep a replacement installed after identity capture and allow retry."""
         from src import artifact_compatibility
 
-        for boundary in ("stat", "open"):
-            with (
-                self.subTest(boundary=boundary),
-                tempfile.TemporaryDirectory() as tmpdir,
-            ):
-                target = Path(tmpdir) / "first" / "second" / "third"
-                replacement = Path(tmpdir) / "replacement"
-                real_open = os.open
-                real_stat = os.stat
-                failed = False
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "first" / "second" / "third"
+            replacement = Path(tmpdir) / "replacement"
+            real_open = os.open
+            failed = False
 
-                def replace() -> None:
-                    nonlocal failed
+            def replace_before_open(name, flags, *args, **kwargs):
+                nonlocal failed
+                if not failed and name == "second" and kwargs.get("dir_fd") is not None:
                     failed = True
                     second = Path(tmpdir) / "first" / "second"
                     second.rename(replacement)
                     second.mkdir()
                     (second / "replacement").write_bytes(b"replacement")
+                    raise OSError("injected replacement open failure")
+                return real_open(name, flags, *args, **kwargs)
 
-                def replace_before_open(name, flags, *args, **kwargs):
-                    if (
-                        boundary == "open"
-                        and not failed
-                        and name == "second"
-                        and kwargs.get("dir_fd") is not None
-                    ):
-                        replace()
-                        raise OSError("injected replacement open failure")
-                    return real_open(name, flags, *args, **kwargs)
-
-                def replace_before_stat(name, *args, **kwargs):
-                    result = real_stat(name, *args, **kwargs)
-                    if (
-                        boundary == "stat"
-                        and not failed
-                        and name == "second"
-                        and kwargs.get("dir_fd") is not None
-                    ):
-                        replace()
-                        raise OSError("injected replacement stat failure")
-                    return result
-
-                with (
-                    patch.object(
-                        artifact_compatibility.os,
-                        "open",
-                        side_effect=replace_before_open,
-                    ),
-                    patch.object(
-                        artifact_compatibility.os,
-                        "stat",
-                        side_effect=replace_before_stat,
-                    ),
-                    self.assertRaisesRegex(
-                        OSError,
-                        f"replacement {boundary} failure",
-                    ),
-                ):
-                    RetainedDirectoryChain.open(
-                        target,
-                        create=True,
-                        check_platform=False,
-                    )
-
-                marker = Path(tmpdir) / "first" / "second" / "replacement"
-                self.assertEqual(marker.read_bytes(), b"replacement")
-                with RetainedDirectoryChain.open(
+            with (
+                patch.object(
+                    artifact_compatibility.os,
+                    "open",
+                    side_effect=replace_before_open,
+                ),
+                self.assertRaisesRegex(OSError, "replacement open failure"),
+            ):
+                RetainedDirectoryChain.open(
                     target,
                     create=True,
                     check_platform=False,
-                ) as chain:
-                    chain.commit()
-                self.assertEqual(marker.read_bytes(), b"replacement")
-                self.assertTrue(target.is_dir())
+                )
+
+            marker = Path(tmpdir) / "first" / "second" / "replacement"
+            self.assertEqual(marker.read_bytes(), b"replacement")
+            with RetainedDirectoryChain.open(
+                target,
+                create=True,
+                check_platform=False,
+            ) as chain:
+                chain.commit()
+            self.assertEqual(marker.read_bytes(), b"replacement")
+            self.assertTrue(target.is_dir())
 
     def test_strict_json_rejects_overflow_and_accepts_finite_exponents(self) -> None:
         for value in ("1e999", "-1e999"):
