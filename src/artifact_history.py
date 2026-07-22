@@ -178,7 +178,8 @@ def _load_current_index(artifact_root: str | Path) -> Mapping[str, Any] | None:
         raise ValueError(f"invalid current-run index: {path}") from error
     if not isinstance(payload, Mapping):
         raise ValueError("current-run index must be a JSON object")
-    if payload.get("schema_version") != ARTIFACT_SCHEMA_VERSION:
+    version = payload.get("schema_version")
+    if type(version) is not int or version != ARTIFACT_SCHEMA_VERSION:
         raise ValueError("current-run index has an unsupported schema_version")
     run_id = payload.get("run_id")
     checksum = payload.get("artifact_manifest_checksum")

@@ -122,7 +122,8 @@ def resolve_prepared_artifact_dir(value: str | Path, artifact_kind: str) -> Path
         "logical_roots",
     }:
         raise ValueError("prepared generation index has an invalid field set")
-    if payload["schema_version"] != PREPARED_GENERATION_SCHEMA_VERSION:
+    version = payload["schema_version"]
+    if type(version) is not int or version != PREPARED_GENERATION_SCHEMA_VERSION:
         raise ValueError("prepared generation index has an unsupported schema_version")
     logical_roots = payload["logical_roots"]
     if (
