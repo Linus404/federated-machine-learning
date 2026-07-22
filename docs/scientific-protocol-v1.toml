@@ -1,0 +1,269 @@
+protocol_version = 1
+name = "federated-imdb-scientific-protocol"
+status = "frozen"
+amendment_policy = "Changes require a separately reviewed protocol version before comparative results are produced."
+
+[dataset]
+id = "stanfordnlp/imdb"
+config = "plain_text"
+revision = "e6281661ce1c48d982bc483cf8a173c1bbeb5d31"
+datasets_version = "4.8.5"
+raw_hash_algorithm = "sha256"
+content_hash_algorithm = "sha256"
+content_hash_serialization = "For each row in dataset order, encode compact UTF-8 JSON with sorted keys label and text, then one newline."
+content_hash_json_ensure_ascii = false
+content_hash_json_separators = [",", ":"]
+
+[dataset.sources]
+dataset_api = "https://huggingface.co/api/datasets/stanfordnlp/imdb"
+refs_api = "https://huggingface.co/api/datasets/stanfordnlp/imdb/refs"
+revision_tree_api = "https://huggingface.co/api/datasets/stanfordnlp/imdb/tree/e6281661ce1c48d982bc483cf8a173c1bbeb5d31"
+loading_documentation = "https://huggingface.co/docs/datasets/loading"
+
+[dataset.splits.train]
+rows = 25000
+use = "training_and_deterministic_validation_only"
+raw_parquet_sha256 = "db47d16b5c297cc0dd625e519c81319c24c9149e70e8496de5475f6fa928342c"
+content_sha256 = "4639bf1063fddebc3d7a446004a1032832227b0d3d28b01f58f99a4f94c0ab8a"
+
+[dataset.splits.test]
+rows = 25000
+use = "sole_untouched_global_test_set"
+raw_parquet_sha256 = "b52e26e2f872d282ffac460bf9770b25ac6f102cda0e6ca7158df98c94e8b3da"
+content_sha256 = "48168f7787435514498e777646a1312897c1207d239c61acdde5e049bc3f1a3f"
+
+[dataset.splits.unsupervised]
+rows = 50000
+use = "excluded"
+raw_parquet_sha256 = "74d14fbfcbb39fb7d299c38ca9f0ae6d231bf97108da85d620027ba437b6d52e"
+content_sha256 = "d56c24962d82526173fc9fab14b820873ea281d64ab11915ec12eaf73f65deeb"
+
+[untouched_test]
+split = "test"
+sole_global_test_set = true
+available_to_client_training = false
+available_to_validation = false
+available_to_tuning = false
+available_to_model_selection = false
+available_to_partitioning = false
+access = "registered_final_model_evaluation_and_registered_privacy_analysis_only"
+decision_threshold = 0.5
+threshold_comparison = "probability_greater_than_or_equal"
+selection_rule = "Never tune thresholds, hyperparameters, strategies, stopping, or model selection on test results."
+train_split_use = "Only the official train split may supply training and deterministic stratified validation rows."
+
+[seeding]
+seeds = [67, 101, 211, 307, 401]
+application = ["partitioning", "validation_split", "model_initialization", "training_order", "threat_construction"]
+
+[partitioning]
+registered = ["iid_stratified", "dirichlet_1.0", "dirichlet_0.5", "dirichlet_0.1"]
+dirichlet_alphas = [1.0, 0.5, 0.1]
+minimum_samples_per_client = 32
+first_attempt = 0
+last_attempt = 9999
+attempt_seed_rule = "derive_deterministically_from_experiment_seed_and_attempt"
+acceptance_rule = "Accept the first attempt in ascending order where every client has at least 32 samples; fail after attempt 9999."
+client_scales = [4, 16, 64]
+primary_client_scale = 4
+
+[model]
+revision = "sentiment-cnn-v1"
+vocabulary_size = 20000
+sequence_length = 500
+embedding_dimension = 100
+embedding_trainable = true
+padding_token_id = 0
+padding_masked_before_convolution = true
+convolution_filters = 64
+convolution_kernel_size = 3
+convolution_padding = "same"
+convolution_activation = "relu"
+convolution_use_bias = false
+pooling = "global_max_1d"
+hidden_units = 32
+hidden_activation = "relu"
+dropout_rate = 0.3
+output_units = 1
+output_activation = "sigmoid"
+loss = "binary_crossentropy"
+
+[training]
+rounds = 20
+local_epochs = 1
+batch_size = 64
+validation_fraction = 0.2
+validation_sampling = "deterministic_stratified_within_train_partition"
+early_stopping = false
+optimizer = "adam"
+learning_rate = 0.001
+beta_1 = 0.9
+beta_2 = 0.999
+epsilon = 1e-7
+amsgrad = false
+update_noise = false
+
+[strategies.centralized]
+kind = "centralized"
+
+[strategies.local_only]
+kind = "one_model_per_client"
+
+[strategies.fedavg]
+kind = "sample_weighted_mean"
+
+[strategies.fedprox]
+kind = "sample_weighted_mean_with_proximal_objective"
+mu = 0.1
+
+[strategies.fedprox_huber]
+kind = "fedprox_with_iterative_huber_aggregation"
+mu = 0.1
+threshold = 10.0
+iterations = 10
+epsilon = 1e-8
+
+[strategies.fedmedian]
+kind = "coordinate_wise_median"
+assumption = "Requires fewer than 50 percent Byzantine values at each coordinate."
+
+[strategies.fedtrimmedavg]
+kind = "coordinate_wise_trimmed_mean"
+beta = 0.25
+trim_count_rule = "floor(beta_times_client_count)_per_side"
+assumption = "Robustness requires Byzantine values to occupy the trimmed extremes; no guarantee is claimed at 50 percent malicious clients."
+
+[threats]
+client_scale = 4
+partition = "dirichlet_0.5"
+malicious_fractions = [0.25, 0.5]
+malicious_client_counts = [1, 2]
+update_source = "malicious_client_model_delta"
+
+[threats.outlier]
+transformation = "submitted_delta_equals_10_times_honest_delta"
+scale = 10.0
+
+[threats.sign_flip]
+transformation = "submitted_delta_equals_negative_10_times_honest_delta"
+scale = -10.0
+
+[privacy.membership_inference]
+access = "black_box_prediction_probabilities"
+knowledge = "candidate_records_and_membership_labels_for_the_balanced_attack_sample"
+member_source = "official_train_split"
+nonmember_source = "official_test_split"
+member_records = 1000
+nonmember_records = 1000
+success_metrics = ["roc_auc", "max_tpr_minus_fpr", "tpr_at_1_percent_fpr"]
+
+[privacy.update_leakage]
+attacker = "honest_but_curious_server"
+access = ["individual_client_update", "current_global_model", "candidate_records"]
+score = "per_example_gradient_cosine_similarity_with_individual_client_update"
+success_metrics = ["roc_auc", "max_tpr_minus_fpr", "tpr_at_1_percent_fpr"]
+
+[metrics.classification]
+raw_predictions = true
+confusion_matrix_order = [["TN", "FP"], ["FN", "TP"]]
+reported = ["accuracy", "precision", "recall", "f1", "roc_auc"]
+positive_label = 1
+zero_division = 0
+
+[metrics.system]
+convergence = "first_round_reaching_at_least_95_percent_of_that_run_maximum_accuracy"
+client_fit_timer = "monotonic_clock"
+communication_volume = "exact_serialized_application_bytes"
+reported = ["convergence_round", "communication_bytes", "client_training_time"]
+
+[statistics]
+replicates = 5
+raw_per_run_metrics = true
+mean = true
+sample_variance = true
+sample_standard_deviation = true
+confidence_interval = 0.95
+confidence_interval_method = "two_sided_student_t"
+t_critical = 2.776
+variance_ddof = 1
+paired_deltas = true
+paired_by = "seed"
+paired_delta_baselines = ["fedavg", "iid_stratified", "4_clients", "no_attack"]
+
+[matrix.primary_federated]
+strategies = ["fedavg", "fedprox", "fedprox_huber", "fedmedian", "fedtrimmedavg"]
+partitions = ["iid_stratified", "dirichlet_1.0", "dirichlet_0.5", "dirichlet_0.1"]
+seeds = 5
+client_scale = 4
+cells = 100
+
+[matrix.centralized]
+strategies = ["centralized"]
+seeds = 5
+cells = 5
+
+[matrix.local_only]
+strategies = ["local_only"]
+partitions = ["iid_stratified", "dirichlet_1.0", "dirichlet_0.5", "dirichlet_0.1"]
+seeds = 5
+client_scale = 4
+cells = 20
+training_invocations_per_cell = 4
+training_invocations = 80
+
+[matrix.scale]
+strategies = ["fedavg", "fedprox_huber"]
+partitions = ["iid_stratified", "dirichlet_1.0", "dirichlet_0.5", "dirichlet_0.1"]
+seeds = 5
+client_scales = [16, 64]
+cells = 80
+
+[matrix.robustness]
+strategies = ["fedavg", "fedprox_huber", "fedmedian", "fedtrimmedavg"]
+attacks = ["outlier", "sign_flip"]
+malicious_fractions = [0.25, 0.5]
+seeds = 5
+client_scale = 4
+partition = "dirichlet_0.5"
+cells = 80
+
+[matrix.membership_inference]
+models = ["centralized", "fedavg"]
+seeds = 5
+fedavg_client_scale = 4
+fedavg_partition = "dirichlet_0.5"
+cells = 10
+
+[matrix.update_leakage]
+models = ["fedavg"]
+seeds = 5
+client_scale = 4
+partition = "dirichlet_0.5"
+cells = 5
+
+[matrix.totals]
+maximum_cells = 300
+maximum_training_invocations = 360
+privacy_analyses_reuse_trained_models = true
+
+[budget]
+maximum_cells = 300
+maximum_training_invocations = 360
+maximum_gpu_hours = 500
+maximum_cpu_hours = 5000
+compute_limit_operator = "either"
+maximum_memory_gib_per_job = 32
+maximum_vram_gib_per_job = 12
+maximum_storage_gib = 50
+timeout_hours_4_clients = 2
+timeout_hours_16_clients = 3
+timeout_hours_64_clients = 6
+campaign_days = 14
+retry_limit = 1
+retry_counts_toward_budget = true
+second_timeout_oom_or_nonfinite = "cell_failed"
+abort_at_first_compute_or_storage_limit = true
+abort_when_failed_cell_fraction_exceeds = 0.05
+retuning_after_start = false
+incomplete_matrix_label = "incomplete"
+incomplete_matrix_may_support_readme_evidence = false
