@@ -1,7 +1,6 @@
 import tomllib
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 import keras
 import numpy as np
@@ -67,6 +66,7 @@ class ScientificContractTests(unittest.TestCase):
             [(32, "relu"), (1, "sigmoid")],
         )
         self.assertEqual(dropout.rate, 0.3)
+        self.assertIsInstance(dropout.seed, int)
         self.assertIsInstance(model.optimizer, keras.optimizers.Adam)
         self.assertEqual(model.loss, "binary_crossentropy")
 
@@ -82,6 +82,7 @@ class ScientificContractTests(unittest.TestCase):
                 "local-epochs": 1,
                 "batch-size": 64,
                 "validation-split": 0.2,
+                "master-seed": 67,
                 "public-artifact-dir": "artifacts/public",
                 "server-artifact-dir": "artifacts/server",
                 "artifact-retention-runs": 10,
@@ -124,16 +125,14 @@ class ScientificContractTests(unittest.TestCase):
 
     def test_update_noise_clips_each_weight_update_before_adding_noise(self) -> None:
         client = SentimentClient.__new__(SentimentClient)
+        client.client_id = 0
+        client.master_seed = 67
         client.update_noise_l2_norm_clip = 2.0
-        client.update_noise_multiplier = 0.5
+        client.update_noise_multiplier = 0.0
         before = [np.asarray([1.0, 1.0], dtype=np.float32)]
         after = [np.asarray([4.0, 5.0], dtype=np.float32)]
 
-        with patch(
-            "src.client_app.np.random.standard_normal",
-            return_value=np.zeros(2, dtype=np.float32),
-        ):
-            result = client._add_update_noise(before, after)
+        result = client._add_update_noise(before, after, 1)
 
         self.assertEqual(result[0].dtype, np.dtype(np.float32))
         np.testing.assert_allclose(result[0], [2.2, 2.6])

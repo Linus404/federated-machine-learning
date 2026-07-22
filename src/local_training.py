@@ -41,6 +41,12 @@ from src.paths import (
     resolve_dir,
     resolve_prepared_artifact_dir,
 )
+from src.reproducibility import (
+    DEFAULT_MASTER_SEED,
+    MASTER_SEED_CONFIG_KEY,
+    derive_seed,
+    effective_master_seed,
+)
 from src.text_preprocessing import create_text_vectorizer
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"keras\..*")
@@ -426,6 +432,9 @@ def build_model(
     vocab_size: int,
     sequence_length: int,
     embedding_dim: int,
+    *,
+    master_seed: int = DEFAULT_MASTER_SEED,
+    seed_namespace: tuple[str | int, ...] = ("standalone",),
 ) -> Any:
     """Build the sentiment model reused by local and federated training.
 
@@ -437,6 +446,10 @@ def build_model(
         Exact frozen token sequence length.
     embedding_dim : int
         Exact frozen embedding dimension.
+    master_seed : int, optional
+        Effective run master seed.
+    seed_namespace : tuple of str or int, optional
+        Namespace identifying this model construction.
 
     Returns
     -------
@@ -449,6 +462,9 @@ def build_model(
         If the runtime differs from the frozen protocol.
     """
     validate_protocol_runtime()
+    keras.utils.set_random_seed(
+        derive_seed(master_seed, *seed_namespace, "model-construction")
+    )
     inputs = keras.Input(shape=(sequence_length,), dtype="int32")
 
     x = keras.layers.Embedding(vocab_size, embedding_dim, name="token_embedding")(
@@ -466,7 +482,10 @@ def build_model(
     )(x)
     x = keras.layers.GlobalMaxPooling1D()(x)
     x = keras.layers.Dense(32, activation="relu")(x)
-    x = keras.layers.Dropout(0.3)(x)
+    x = keras.layers.Dropout(
+        0.3,
+        seed=derive_seed(master_seed, *seed_namespace, "dropout", "initial"),
+    )(x)
 
     outputs = keras.layers.Dense(1, activation="sigmoid")(x)
 
@@ -474,6 +493,38 @@ def build_model(
     model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
 
     return model
+
+
+def seed_model_training(
+    model: Any,
+    master_seed: int,
+    *seed_namespace: str | int,
+) -> None:
+    """Reset deterministic training-order and Dropout streams.
+
+    Parameters
+    ----------
+    model : Any
+        Keras model whose Dropout streams are reset.
+    master_seed : int
+        Effective run master seed.
+    *seed_namespace : str or int
+        Client/local and round namespace components.
+
+    Returns
+    -------
+    None
+    """
+    keras.utils.set_random_seed(
+        derive_seed(master_seed, *seed_namespace, "training-order")
+    )
+    for layer_index, layer in enumerate(model.layers):
+        if isinstance(layer, keras.layers.Dropout):
+            dropout_seed = derive_seed(
+                master_seed, *seed_namespace, "dropout", layer_index
+            )
+            layer.seed = dropout_seed
+            layer.seed_generator.state.assign([dropout_seed, 0])
 
 
 def train(args: argparse.Namespace) -> tuple[Any, Any]:
@@ -501,12 +552,14 @@ def train(args: argparse.Namespace) -> tuple[Any, Any]:
         "client-id": getattr(args, "client_id", 0),
         "client-data-dir": args.client_data_dir,
         "epochs": args.epochs,
+        MASTER_SEED_CONFIG_KEY: getattr(args, "master_seed", DEFAULT_MASTER_SEED),
         "public-artifact-dir": args.public_artifact_dir,
         "quiet": args.quiet,
         "run-artifact-dir": args.run_artifact_dir,
         "validation-seed": DEFAULT_VALIDATION_SEED,
         "validation-split": args.validation_split,
     }
+    master_seed = effective_master_seed(run_config)
     manifest = load_app_manifest(public_artifact_dir=args.public_artifact_dir)
     lock = acquire_run_artifact_lock(artifact_root)
     try:
@@ -527,8 +580,13 @@ def train(args: argparse.Namespace) -> tuple[Any, Any]:
         train_data, val_data = _tokenize_client_shard(
             shard_snapshot, manifest, args.validation_split
         )
-        model = build_model_from_manifest(manifest)
+        model = build_model_from_manifest(
+            manifest,
+            master_seed=master_seed,
+            seed_namespace=("local",),
+        )
 
+        seed_model_training(model, master_seed, "local", "round", 1)
         history = model.fit(
             *train_data,
             validation_data=val_data,
@@ -582,18 +640,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--epochs", type=int, default=DEFAULT_LOCAL_EPOCHS)
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument(
+        f"--{MASTER_SEED_CONFIG_KEY}", type=int, default=DEFAULT_MASTER_SEED
+    )
     parser.add_argument("--validation-split", type=float, default=0.2)
     parser.add_argument("--quiet", action="store_true")
     return parser.parse_args(argv)
 
 
-def build_model_from_manifest(manifest: AppManifest) -> Any:
+def build_model_from_manifest(
+    manifest: AppManifest,
+    *,
+    master_seed: int = DEFAULT_MASTER_SEED,
+    seed_namespace: tuple[str | int, ...] = ("standalone",),
+) -> Any:
     """Build the sentiment model from public manifest metadata.
 
     Parameters
     ----------
     manifest : AppManifest
         Manifest containing the model dimensions.
+    master_seed : int, optional
+        Effective run master seed.
+    seed_namespace : tuple of str or int, optional
+        Namespace identifying this model construction.
 
     Returns
     -------
@@ -606,6 +676,8 @@ def build_model_from_manifest(manifest: AppManifest) -> Any:
         payload["vocabulary_size"],
         payload["sequence_length"],
         payload["embedding_dim"],
+        master_seed=master_seed,
+        seed_namespace=seed_namespace,
     )
 
 

@@ -44,11 +44,20 @@ index use schema `1`:
   entry type or unmanifested name is accepted.
 - Each run directory has an immutable schema-1 `run_manifest.json`, which versions
   run identity, configuration, environment, code, seed, and public-dataset
-  provenance as one schema-checked record. Its string-encoded public-dataset
-  identity must itself be strict, canonical JSON with the exact train-identity
-  fields and valid field types and values.
+  provenance as one schema-checked record. Its effective unsigned 32-bit
+  `master-seed` and SHA-256 namespaced derivation contract reproduce model,
+  Dropout/training-order, and client/round update-noise streams. Its
+  string-encoded public-dataset identity must itself be strict, canonical JSON
+  with the exact train-identity fields and valid field types and values.
 - Schema-1 `server/current.json` atomically selects a completed run and binds its
   artifact manifest by SHA-256 checksum.
+
+Both current-pointer and explicit historical consumers validate completed-run
+provenance bytes, directory/run identity, frozen public dataset and vocabulary
+bindings, checksums, and exact inventory before returning artifact bytes.
+Publication flushes captured regular files, then the completed run directory, then
+the artifact root after `current.json`; a pointer is never returned before those
+POSIX durability barriers succeed.
 
 Each consumer accepts only its artifact kind's current schema. Missing,
 non-integer, older, and newer versions are rejected before the artifact is used.

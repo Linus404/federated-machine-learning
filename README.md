@@ -161,17 +161,28 @@ Every server run and the documented local-training command create an immutable
 `run_manifest.json` before training. It
 contains a UUID, the Flower run ID, creation time, complete run configuration,
 Python/OS/package versions, Git revision and worktree state when available, known
-seeds, and SHA-256 checksums for the public manifest and vocabulary. Each completed
+seeds, and SHA-256 checksums for the public manifest and vocabulary. The effective
+`master-seed` defaults to `67`; SHA-256 domain-separated namespaces deterministically
+derive distinct model-construction, client/round Dropout and training-order, and
+client/round update-noise streams. Each completed
 `artifact_manifest.json` binds the saved model, metrics, and provenance file bytes
 to their SHA-256 checksums. Completed runs also retain the canonical public
 `manifest.json` and `vocab.txt`; consumers validate those bytes against the frozen
 protocol, require the provenance and model dimensions to match them, and reject
-any unmanifested directory entry before loading.
+any unmanifested directory entry before loading. Current and explicit historical
+loads apply the same completed-run provenance, directory-identity, public-evidence,
+vocabulary, checksum, and exact-inventory validation boundary.
 Set
 `FML_CODE_REVISION` to the full Git object ID in images that do not contain `.git`.
 Client shard identities and checksums are not collected by the server manifest.
 In this demo the operator still created all shards centrally; the boundary only
 describes what ServerApp reads at runtime.
+
+Completed-run publication flushes every captured regular artifact before publishing
+the completed manifest, flushes the run directory after that replacement, and
+flushes the artifact root after atomically replacing `current.json`. A failed
+pre-pointer durability barrier leaves the run unselected and can be retried safely;
+no publication call reports success unless every barrier completes.
 
 `artifact-retention-runs` defaults to `10`. Retention orders validated run
 manifests by `(created_at, run_id)`, keeps the newest configured count, and never

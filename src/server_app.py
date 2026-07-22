@@ -43,6 +43,12 @@ from src.paths import (
     metrics_path,
     resolve_dir,
 )
+from src.reproducibility import (
+    DEFAULT_MASTER_SEED,
+    MASTER_SEED_CONFIG_KEY,
+    SERVER_ROUND_CONFIG_KEY,
+    effective_master_seed,
+)
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"keras\..*")
 
@@ -313,6 +319,7 @@ class SentimentServer(FedProx):
 
     expected_client_ids: frozenset[int]
     expected_weight_shapes: tuple[tuple[int, ...], ...]
+    master_seed: int = DEFAULT_MASTER_SEED
 
     def __init__(
         self,
@@ -323,6 +330,7 @@ class SentimentServer(FedProx):
         artifact_retention_runs: int = DEFAULT_ARTIFACT_RETENTION_RUNS,
         final_round: int | None = None,
         huber_threshold: float = DEFAULT_HUBER_THRESHOLD,
+        master_seed: int = DEFAULT_MASTER_SEED,
         use_huber: bool = False,
         *args,
         **kwargs,
@@ -335,6 +343,7 @@ class SentimentServer(FedProx):
         self.final_round = final_round
         self.app_manifest = app_manifest
         self.huber_threshold = huber_threshold
+        self.master_seed = effective_master_seed({MASTER_SEED_CONFIG_KEY: master_seed})
         self.use_huber = use_huber
         write_server_artifact_manifest(
             self.artifact_dir, app_manifest=self.app_manifest
@@ -453,7 +462,11 @@ class SentimentServer(FedProx):
 
             # Artifact saving
             self.artifact_dir.mkdir(parents=True, exist_ok=True)
-            model = build_model_from_manifest(self.app_manifest)
+            model = build_model_from_manifest(
+                self.app_manifest,
+                master_seed=self.master_seed,
+                seed_namespace=("server", "round", server_round),
+            )
             model.set_weights(parameters_to_ndarrays(parameters))
             model.save(str(self.model_path))
         except BaseException:
@@ -550,6 +563,7 @@ def create_strategy(
     proximal_mu: float = 0.1,
     use_huber: bool = False,
     huber_threshold: float = DEFAULT_HUBER_THRESHOLD,
+    master_seed: int = DEFAULT_MASTER_SEED,
 ) -> SentimentServer:
     """Create the deployment strategy with exact-round validation.
 
@@ -577,6 +591,8 @@ def create_strategy(
         Whether to replace sample-weighted averaging with Huber aggregation.
     huber_threshold : float, optional
         Positive Huber residual threshold.
+    master_seed : int, optional
+        Effective run master seed.
 
     Returns
     -------
@@ -595,7 +611,12 @@ def create_strategy(
     manifest = app_manifest or load_app_manifest(
         public_artifact_dir=public_artifact_dir,
     )
-    initial_model = build_model_from_manifest(manifest)
+    validated_master_seed = effective_master_seed({MASTER_SEED_CONFIG_KEY: master_seed})
+    initial_model = build_model_from_manifest(
+        manifest,
+        master_seed=validated_master_seed,
+        seed_namespace=("server", "initial"),
+    )
     initial_weights = initial_model.get_weights()
 
     strategy = SentimentServer(
@@ -608,6 +629,7 @@ def create_strategy(
         final_round=final_round,
         app_manifest=manifest,
         huber_threshold=huber_threshold,
+        master_seed=validated_master_seed,
         use_huber=use_huber,
         fraction_fit=1.0,
         fraction_evaluate=1.0,
@@ -615,6 +637,7 @@ def create_strategy(
         min_evaluate_clients=min_clients,
         min_available_clients=min_clients,
         initial_parameters=ndarrays_to_parameters(initial_weights),
+        on_fit_config_fn=lambda server_round: {SERVER_ROUND_CONFIG_KEY: server_round},
         fit_metrics_aggregation_fn=weighted_average,
         evaluate_metrics_aggregation_fn=weighted_average,
     )
@@ -666,6 +689,7 @@ def server_fn(context: Context) -> ServerAppComponents:
     ):
         raise ValueError("server and public artifact directories must not overlap")
     app_manifest = load_app_manifest(public_artifact_dir=public_artifact_dir)
+    master_seed = effective_master_seed(run_config)
     artifact_lock = acquire_run_artifact_lock(artifact_root)
     try:
         run_dir = create_run_artifact_dir(
@@ -690,6 +714,7 @@ def server_fn(context: Context) -> ServerAppComponents:
             huber_threshold=float(
                 run_config.get("huber-threshold", DEFAULT_HUBER_THRESHOLD)
             ),
+            master_seed=master_seed,
         )
         return ServerAppComponents(
             strategy=strategy,

@@ -10,9 +10,18 @@ import dashboard
 import numpy as np
 from src.artifact_compatibility import (
     SERVER_ARTIFACT_SCHEMA_VERSION,
+    canonical_json_bytes,
+    sha256_bytes,
     write_server_artifact_manifest,
 )
 from tests.artifact_helpers import compatible_model, fake_app_manifest
+from tests.test_artifact_history import (
+    RUN_IDS,
+    _TEST_PROTOCOL,
+    create_public_snapshot,
+    create_run,
+    publish_completed_run,
+)
 
 
 def write_server_manifest(path: Path, version: int | None) -> None:
@@ -280,6 +289,47 @@ class DashboardArtifactTests(unittest.TestCase):
                         self.assertRaisesRegex(ValueError, "does not match"),
                     ):
                         dashboard.load_metrics(path, filename=filename)
+
+    def test_explicit_historical_paths_reject_rechecksummed_wrong_run_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            public = create_public_snapshot(root, "public")
+            run = create_run(
+                root,
+                RUN_IDS[0],
+                "2026-01-01T00:00:00Z",
+                provenance_app_manifest=public,
+                artifact_app_manifest=public,
+            )
+            with patch(
+                "src.app_manifest.load_scientific_protocol",
+                return_value=_TEST_PROTOCOL,
+            ):
+                publish_completed_run(root, run)
+            provenance_path = run / "run_manifest.json"
+            provenance = json.loads(provenance_path.read_bytes())
+            provenance["run_id"] = RUN_IDS[1]
+            provenance_bytes = canonical_json_bytes(provenance)
+            provenance_path.write_bytes(provenance_bytes)
+            artifact_path = run / "artifact_manifest.json"
+            artifact = json.loads(artifact_path.read_bytes())
+            artifact["sizes"]["run_manifest.json"] = len(provenance_bytes)
+            artifact["checksums"]["run_manifest.json"] = sha256_bytes(provenance_bytes)
+            artifact_path.write_bytes(canonical_json_bytes(artifact))
+
+            with patch(
+                "src.app_manifest.load_scientific_protocol",
+                return_value=_TEST_PROTOCOL,
+            ):
+                for loader, path in (
+                    (dashboard.load_model, run / "global_model.keras"),
+                    (dashboard.load_metrics, run / "metrics.csv"),
+                ):
+                    with (
+                        self.subTest(loader=loader.__name__),
+                        self.assertRaisesRegex(ValueError, "run_id"),
+                    ):
+                        loader(path, app_manifest=public)
 
     def test_public_snapshot_cache_is_keyed_by_immutable_generation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

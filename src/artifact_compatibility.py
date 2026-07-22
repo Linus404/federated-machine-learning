@@ -338,7 +338,9 @@ def read_regular_file(path: Path, *, parent: Path) -> bytes:
     return read_regular_file_snapshot(path, parent=parent).content
 
 
-def read_regular_file_snapshot(path: Path, *, parent: Path) -> RegularFileSnapshot:
+def read_regular_file_snapshot(
+    path: Path, *, parent: Path, sync: bool = False
+) -> RegularFileSnapshot:
     """Read one regular file while retaining descriptor identity metadata.
 
     Parameters
@@ -347,6 +349,8 @@ def read_regular_file_snapshot(path: Path, *, parent: Path) -> RegularFileSnapsh
         File to read.
     parent : pathlib.Path
         Canonical directory that must directly contain the file.
+    sync : bool, optional
+        Flush the opened regular file before returning its stable snapshot.
 
     Returns
     -------
@@ -385,6 +389,8 @@ def read_regular_file_snapshot(path: Path, *, parent: Path) -> RegularFileSnapsh
         with os.fdopen(descriptor, "rb") as file:
             descriptor = -1
             content = file.read()
+            if sync:
+                os.fsync(file.fileno())
             after = os.fstat(file.fileno())
             identity = (
                 before.st_dev,
@@ -498,18 +504,56 @@ def write_bytes_atomically(
     try:
         with os.fdopen(descriptor, "wb") as file:
             file.write(content)
+            os.fchmod(file.fileno(), 0o644)
             file.flush()
             os.fsync(file.fileno())
-        temporary_path.chmod(0o644)
         if overwrite:
             os.replace(temporary_path, path)
         else:
             os.link(temporary_path, path)
             temporary_path.unlink()
+        sync_directory(path.parent)
     except BaseException:
         temporary_path.unlink(missing_ok=True)
         raise
     return path
+
+
+def sync_directory(path: Path) -> None:
+    """Flush one directory entry set through a no-follow descriptor.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Existing regular directory to synchronize.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    RuntimeError
+        If the Linux filesystem contract is unavailable.
+    ValueError
+        If the path is not a no-follow regular directory.
+    OSError
+        If the durability barrier fails.
+    """
+    require_secure_artifact_platform()
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+    except OSError as error:
+        raise ValueError(f"artifact directory is unsafe: {path}") from error
+    try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise ValueError(f"artifact directory is unsafe: {path}")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def validate_artifact_schema(
@@ -788,7 +832,10 @@ def capture_server_artifact_files(artifact_dir: Path) -> ServerFinalizationSnaps
 
 
 def verify_server_artifact_files(
-    artifact_dir: Path, artifact_snapshot: ServerFinalizationSnapshot
+    artifact_dir: Path,
+    artifact_snapshot: ServerFinalizationSnapshot,
+    *,
+    sync: bool = False,
 ) -> None:
     """Require current paths to remain identical to retained artifact bytes.
 
@@ -798,6 +845,8 @@ def verify_server_artifact_files(
         Direct server run directory owning the retained files.
     artifact_snapshot : ServerFinalizationSnapshot
         Previously retained secure snapshot.
+    sync : bool, optional
+        Flush every retained regular file before returning.
 
     Returns
     -------
@@ -825,9 +874,138 @@ def verify_server_artifact_files(
         raise ValueError("server artifact inventory changed during finalization")
     canonical_dir = artifact_dir.resolve(strict=True)
     for name, retained in files.items():
-        current = read_regular_file_snapshot(artifact_dir / name, parent=canonical_dir)
+        current = read_regular_file_snapshot(
+            artifact_dir / name,
+            parent=canonical_dir,
+            sync=sync,
+        )
         if current != retained:
             raise ValueError(f"server artifact changed during finalization: {name}")
+
+
+def sync_server_artifact_files(
+    artifact_dir: Path, artifact_snapshot: ServerFinalizationSnapshot
+) -> None:
+    """Flush every securely retained completed-run regular file.
+
+    Parameters
+    ----------
+    artifact_dir : pathlib.Path
+        Direct server run directory owning the retained files.
+    artifact_snapshot : ServerFinalizationSnapshot
+        Previously retained secure snapshot.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If an artifact changed or became unsafe before its durability barrier.
+    OSError
+        If any file durability barrier fails.
+    """
+    verify_server_artifact_files(artifact_dir, artifact_snapshot, sync=True)
+
+
+def validate_run_provenance_evidence(
+    provenance: Mapping[str, Any],
+    artifact_manifest: Mapping[str, Any],
+    retained_manifest: AppManifest,
+) -> None:
+    """Validate run provenance and server binding against retained public bytes.
+
+    Parameters
+    ----------
+    provenance : mapping of str to Any
+        Validated run provenance manifest.
+    artifact_manifest : mapping of str to Any
+        Validated server artifact manifest.
+    retained_manifest : src.app_manifest.AppManifest
+        Public snapshot reconstructed from the retained bytes.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If provenance or server binding differs from retained public bytes.
+    """
+    if dict(artifact_manifest["binding"]) != server_artifact_binding(retained_manifest):
+        raise ValueError(
+            "server artifact binding does not match retained public evidence"
+        )
+    manifest_checksum = sha256_bytes(retained_manifest.manifest_bytes)
+    expected_checksums = {
+        "manifest.json": manifest_checksum,
+        "vocab.txt": sha256_bytes(retained_manifest.vocabulary_bytes),
+    }
+    expected_public_manifest = {
+        "filename": "manifest.json",
+        "size_bytes": len(retained_manifest.manifest_bytes),
+        "checksum": manifest_checksum,
+    }
+    expected_identity = json.dumps(
+        dict(retained_manifest.payload["dataset"]),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    dataset = provenance["dataset"]
+    if (
+        dataset["status"] != "available"
+        or dict(dataset["checksums"]) != expected_checksums
+        or dict(dataset["public_manifest"]) != expected_public_manifest
+        or dataset["identity"] != expected_identity
+    ):
+        raise ValueError("run provenance does not match retained public evidence")
+
+
+def _validate_completed_run_provenance(
+    artifact_dir: Path,
+    artifact_manifest: Mapping[str, Any],
+    files: Mapping[str, bytes],
+    retained_manifest: AppManifest,
+) -> None:
+    """Validate completed provenance bytes and directory identity.
+
+    Parameters
+    ----------
+    artifact_dir : pathlib.Path
+        Canonical completed run directory.
+    artifact_manifest : mapping of str to Any
+        Validated completed server artifact manifest.
+    files : mapping of str to bytes
+        Exact checksummed completed artifact bytes.
+    retained_manifest : src.app_manifest.AppManifest
+        Public snapshot reconstructed from the retained bytes.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If provenance identity or public evidence differs from retained bytes.
+    """
+    from src.run_provenance import load_run_provenance_manifest
+
+    provenance = load_run_provenance_manifest(
+        artifact_dir / "run_manifest.json",
+        manifest_bytes=files["run_manifest.json"],
+    )
+    if provenance["run_id"] != artifact_dir.name:
+        raise ValueError("completed run directory does not match its provenance run_id")
+    validate_run_provenance_evidence(
+        provenance,
+        artifact_manifest,
+        retained_manifest,
+    )
 
 
 def load_server_artifact_snapshot(
@@ -961,6 +1139,12 @@ def load_server_artifact_snapshot(
             raise ValueError(
                 "completed server artifact inventory changed while loading"
             )
+        _validate_completed_run_provenance(
+            canonical_dir,
+            payload,
+            files,
+            retained_manifest,
+        )
     return ServerArtifactSnapshot(
         directory=canonical_dir,
         manifest=deep_freeze(payload),

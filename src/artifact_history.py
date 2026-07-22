@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hmac
-import json
 import os
 import shutil
 import stat
@@ -24,9 +23,11 @@ from src.artifact_compatibility import (
     load_server_artifact_snapshot,
     read_regular_file,
     read_regular_file_snapshot,
-    server_artifact_binding,
     sha256_bytes,
     strict_json_loads,
+    sync_directory,
+    sync_server_artifact_files,
+    validate_run_provenance_evidence,
     verify_server_artifact_files,
     write_bytes_atomically,
     write_json_atomically,
@@ -238,63 +239,6 @@ def resolve_current_run_dir(artifact_root: str | Path) -> Path:
     return load_current_run_snapshot(root).directory
 
 
-def _validate_public_artifact_evidence(
-    provenance: Mapping[str, Any],
-    artifact_manifest: Mapping[str, Any],
-    app_manifest: AppManifest,
-) -> None:
-    """Bind completed-run metadata to retained validated public artifact bytes.
-
-    Parameters
-    ----------
-    provenance : mapping of str to Any
-        Validated run provenance manifest.
-    artifact_manifest : mapping of str to Any
-        Validated server artifact manifest.
-    app_manifest : AppManifest
-        Public snapshot reconstructed from retained completed-run bytes.
-
-    Returns
-    -------
-    None
-
-    Raises
-    ------
-    ValueError
-        If provenance or the server binding differs from retained public evidence.
-    """
-    expected_binding = server_artifact_binding(app_manifest)
-    if dict(artifact_manifest["binding"]) != expected_binding:
-        raise ValueError(
-            "server artifact binding does not match retained public evidence"
-        )
-    dataset = provenance["dataset"]
-    manifest_checksum = sha256_bytes(app_manifest.manifest_bytes)
-    expected_checksums = {
-        "manifest.json": manifest_checksum,
-        "vocab.txt": sha256_bytes(app_manifest.vocabulary_bytes),
-    }
-    expected_manifest = {
-        "filename": "manifest.json",
-        "size_bytes": len(app_manifest.manifest_bytes),
-        "checksum": manifest_checksum,
-    }
-    expected_identity = json.dumps(
-        dict(app_manifest.payload["dataset"]),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
-    if (
-        dataset["status"] != "available"
-        or dict(dataset["checksums"]) != expected_checksums
-        or dict(dataset["public_manifest"]) != expected_manifest
-        or dataset["identity"] != expected_identity
-    ):
-        raise ValueError("run provenance does not match retained public evidence")
-
-
 def _retain_public_artifacts(run_dir: Path, app_manifest: AppManifest) -> None:
     """Publish immutable public evidence into one run before final capture.
 
@@ -371,20 +315,6 @@ def load_current_run_snapshot(
         manifest_bytes=manifest_bytes,
         app_manifest=app_manifest,
     )
-    provenance = load_run_provenance_manifest(
-        run_manifest_path(canonical_run_dir),
-        manifest_bytes=snapshot.files["run_manifest.json"],
-    )
-    if provenance["run_id"] != canonical_run_dir.name:
-        raise ValueError("current run directory does not match its provenance run_id")
-    from src.app_manifest import validate_app_manifest_bytes
-
-    retained_manifest = validate_app_manifest_bytes(
-        snapshot.files["manifest.json"],
-        snapshot.files["vocab.txt"],
-        vocabulary_path=canonical_run_dir / "vocab.txt",
-    )
-    _validate_public_artifact_evidence(provenance, snapshot.manifest, retained_manifest)
     return snapshot
 
 
@@ -456,6 +386,7 @@ def publish_completed_run(
         )
         if provenance["run_id"] != resolved_run_dir.name:
             raise ValueError("run directory does not match its provenance run_id")
+        sync_server_artifact_files(resolved_run_dir, artifact_snapshot)
         if manifest_path.exists():
             manifest_bytes = read_regular_file(manifest_path, parent=resolved_run_dir)
             snapshot = load_server_artifact_snapshot(
@@ -463,7 +394,7 @@ def publish_completed_run(
                 manifest_bytes=manifest_bytes,
                 app_manifest=validated_manifest,
             )
-            _validate_public_artifact_evidence(
+            validate_run_provenance_evidence(
                 provenance, snapshot.manifest, validated_manifest
             )
             if snapshot.manifest.get("lifecycle") != "complete":
@@ -489,21 +420,13 @@ def publish_completed_run(
                 artifact_snapshot=artifact_snapshot,
             )
             manifest_bytes = read_regular_file(manifest_path, parent=resolved_run_dir)
-        completed = load_server_artifact_snapshot(
+        load_server_artifact_snapshot(
             resolved_run_dir,
             manifest_bytes=manifest_bytes,
             app_manifest=validated_manifest,
         )
-        completed_provenance = load_run_provenance_manifest(
-            provenance_path,
-            manifest_bytes=completed.files["run_manifest.json"],
-        )
-        if completed_provenance["run_id"] != resolved_run_dir.name:
-            raise ValueError("run directory does not match its provenance run_id")
-        _validate_public_artifact_evidence(
-            completed_provenance, completed.manifest, validated_manifest
-        )
         verify_server_artifact_files(resolved_run_dir, artifact_snapshot)
+        sync_directory(resolved_run_dir)
         index = {
             "schema_version": ARTIFACT_SCHEMA_VERSION,
             "run_id": resolved_run_dir.name,

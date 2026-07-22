@@ -870,6 +870,43 @@ class ArtifactHistoryTests(unittest.TestCase):
                             else:
                                 load_server_artifact_snapshot(run)
 
+    def test_completed_loaders_reject_rechecksummed_provenance_tampering(self) -> None:
+        for loader_name in ("current", "historical"):
+            for mutation in ("wrong run_id", "wrong public checksum"):
+                with (
+                    self.subTest(loader=loader_name, mutation=mutation),
+                    tempfile.TemporaryDirectory() as tmpdir,
+                ):
+                    root = Path(tmpdir)
+                    run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+                    publish_completed_run(root, run)
+                    provenance_path = run / "run_manifest.json"
+                    provenance = json.loads(provenance_path.read_bytes())
+                    if mutation == "wrong run_id":
+                        provenance["run_id"] = RUN_IDS[1]
+                    else:
+                        provenance["dataset"]["checksums"]["vocab.txt"] = (
+                            "sha256:" + "0" * 64
+                        )
+                    provenance_bytes = canonical_json_bytes(provenance)
+                    provenance_path.write_bytes(provenance_bytes)
+                    artifact_path = run / "artifact_manifest.json"
+                    artifact = json.loads(artifact_path.read_bytes())
+                    artifact["sizes"]["run_manifest.json"] = len(provenance_bytes)
+                    artifact["checksums"]["run_manifest.json"] = sha256_bytes(
+                        provenance_bytes
+                    )
+                    artifact_path.write_bytes(canonical_json_bytes(artifact))
+                    rewrite_current_artifact_manifest(root, run)
+
+                    with self.assertRaisesRegex(
+                        ValueError, "run_id|retained public evidence"
+                    ):
+                        if loader_name == "current":
+                            load_current_run_snapshot(root)
+                        else:
+                            load_server_artifact_snapshot(run)
+
     @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "Unix sockets require POSIX")
     def test_completed_loaders_reject_every_extra_entry_type(self) -> None:
         for loader_name in ("current", "historical"):
@@ -1169,6 +1206,122 @@ class ArtifactHistoryTests(unittest.TestCase):
             self.assertEqual(resolve_current_run_dir(root), run.resolve())
             with self.assertRaisesRegex(ValueError, "cannot be finalized again"):
                 publish_completed_run(root, run)
+
+    def test_publication_crosses_durability_barriers_before_returning_current(
+        self,
+    ) -> None:
+        from src import artifact_compatibility, artifact_history
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            events: list[str] = []
+            real_sync_files = artifact_history.sync_server_artifact_files
+            real_sync_directory = artifact_compatibility.sync_directory
+            real_run_sync = artifact_history.sync_directory
+            real_write_current = artifact_history.write_json_atomically
+
+            def sync_files(*args, **kwargs):
+                events.append("captured-files:sync")
+                return real_sync_files(*args, **kwargs)
+
+            def sync_written_directory(path):
+                events.append(f"atomic-directory:{Path(path).resolve()}")
+                return real_sync_directory(path)
+
+            def sync_completed_run(path):
+                events.append("completed-run:sync")
+                return real_run_sync(path)
+
+            def write_current(path, payload, *, overwrite=True):
+                events.append("current:start")
+                result = real_write_current(path, payload, overwrite=overwrite)
+                events.append("current:return")
+                return result
+
+            with (
+                patch.object(
+                    artifact_history,
+                    "sync_server_artifact_files",
+                    side_effect=sync_files,
+                ),
+                patch.object(
+                    artifact_compatibility,
+                    "sync_directory",
+                    side_effect=sync_written_directory,
+                ),
+                patch.object(
+                    artifact_history,
+                    "sync_directory",
+                    side_effect=sync_completed_run,
+                ),
+                patch.object(
+                    artifact_history,
+                    "write_json_atomically",
+                    side_effect=write_current,
+                ),
+            ):
+                publish_completed_run(root, run)
+
+            files_sync = events.index("captured-files:sync")
+            completed_manifest_sync = events.index(
+                f"atomic-directory:{run.resolve()}", files_sync
+            )
+            completed_run_sync = events.index("completed-run:sync")
+            current_start = events.index("current:start")
+            root_sync = events.index(
+                f"atomic-directory:{root.resolve()}", current_start
+            )
+            current_return = events.index("current:return")
+            self.assertLess(files_sync, completed_manifest_sync)
+            self.assertLess(completed_manifest_sync, completed_run_sync)
+            self.assertLess(completed_run_sync, current_start)
+            self.assertLess(current_start, root_sync)
+            self.assertLess(root_sync, current_return)
+            self.assertEqual(resolve_current_run_dir(root), run.resolve())
+
+    def test_durability_checkpoint_failures_do_not_select_and_are_recoverable(
+        self,
+    ) -> None:
+        from src import artifact_compatibility, artifact_history
+
+        for checkpoint in ("captured files", "completed manifest directory"):
+            with (
+                self.subTest(checkpoint=checkpoint),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+                if checkpoint == "captured files":
+                    durability_patch = patch.object(
+                        artifact_history,
+                        "sync_server_artifact_files",
+                        side_effect=OSError("captured-file fsync failure"),
+                    )
+                else:
+                    real_sync = artifact_compatibility.sync_directory
+                    run_sync_count = 0
+
+                    def fail_completed_manifest_sync(path):
+                        nonlocal run_sync_count
+                        if Path(path).resolve() == run.resolve():
+                            run_sync_count += 1
+                            if run_sync_count == 3:
+                                raise OSError("completed-directory fsync failure")
+                        return real_sync(path)
+
+                    durability_patch = patch.object(
+                        artifact_compatibility,
+                        "sync_directory",
+                        side_effect=fail_completed_manifest_sync,
+                    )
+
+                with durability_patch, self.assertRaisesRegex(OSError, "fsync"):
+                    publish_completed_run(root, run)
+
+                self.assertFalse((root / "current.json").exists())
+                publish_completed_run(root, run)
+                self.assertEqual(resolve_current_run_dir(root), run.resolve())
 
     def test_concurrent_finalization_has_exactly_one_publisher(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

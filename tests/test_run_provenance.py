@@ -20,6 +20,7 @@ from src.run_provenance import (
     load_run_provenance_manifest,
     write_run_provenance_manifest,
 )
+from src.reproducibility import SEED_DERIVATION, SEED_NAMESPACES
 
 
 def write_public_dataset_contract(path: Path) -> dict[str, object]:
@@ -484,6 +485,7 @@ class RunProvenanceTests(unittest.TestCase):
             self.assertEqual(
                 payload["run_config"],
                 {
+                    "master-seed": 67,
                     "num-server-rounds": 3,
                     "public-artifact-dir": str(public_dir),
                     "random-seed": 19,
@@ -492,7 +494,13 @@ class RunProvenanceTests(unittest.TestCase):
             )
             self.assertEqual(payload["environment"], runtime_environment())
             self.assertEqual(payload["code_revision"]["commit"], "a" * 40)
-            self.assertEqual(payload["seeds"]["run_config"], {"random-seed": 19})
+            self.assertEqual(
+                payload["seeds"]["run_config"],
+                {"master-seed": 67, "random-seed": 19},
+            )
+            self.assertEqual(payload["seeds"]["effective_master_seed"], 67)
+            self.assertEqual(payload["seeds"]["derivation"], SEED_DERIVATION)
+            self.assertEqual(payload["seeds"]["namespaces"], SEED_NAMESPACES)
             self.assertEqual(
                 payload["dataset"]["identity"],
                 json.dumps(
@@ -651,6 +659,42 @@ class RunProvenanceTests(unittest.TestCase):
                 write_run_provenance_manifest(path, {"nested": {"unsafe": True}})
 
             self.assertFalse((path / "run_manifest.json").exists())
+
+    def test_master_seed_is_effective_default_and_tamper_evident(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with (
+                patch(
+                    "src.run_provenance._code_revision",
+                    return_value={
+                        "commit": None,
+                        "dirty": None,
+                        "source": "unavailable",
+                    },
+                ),
+                patch(
+                    "src.run_provenance._environment_metadata",
+                    return_value=runtime_environment(),
+                ),
+            ):
+                path = write_run_provenance_manifest(root / "run", {})
+            payload = json.loads(path.read_bytes())
+
+            self.assertEqual(payload["run_config"]["master-seed"], 67)
+            self.assertEqual(payload["seeds"]["effective_master_seed"], 67)
+            for mutation in ("master", "derivation", "run config"):
+                with self.subTest(mutation=mutation):
+                    hostile = json.loads(json.dumps(payload))
+                    if mutation == "master":
+                        hostile["seeds"]["effective_master_seed"] = 68
+                    elif mutation == "derivation":
+                        hostile["seeds"]["derivation"]["domain"] = "attacker"
+                    else:
+                        hostile["run_config"]["master-seed"] = 68
+                    hostile_path = root / f"{mutation}.json"
+                    hostile_path.write_bytes(canonical_json_bytes(hostile))
+                    with self.assertRaisesRegex(ValueError, "seed"):
+                        load_run_provenance_manifest(hostile_path)
 
     def test_loader_rejects_incomplete_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

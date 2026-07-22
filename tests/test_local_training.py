@@ -172,6 +172,7 @@ class LocalTrainingTests(unittest.TestCase):
                     "client-id": 0,
                     "client-data-dir": str(args.client_data_dir),
                     "epochs": 2,
+                    "master-seed": 67,
                     "public-artifact-dir": str(args.public_artifact_dir),
                     "quiet": True,
                     "run-artifact-dir": str(args.run_artifact_dir),

@@ -29,6 +29,12 @@ from src.artifact_compatibility import (
 )
 from src.contracts import DEFAULT_SPLIT_SEED, DEFAULT_VALIDATION_SEED
 from src.paths import run_manifest_path
+from src.reproducibility import (
+    MASTER_SEED_CONFIG_KEY,
+    SEED_DERIVATION,
+    SEED_NAMESPACES,
+    effective_master_seed,
+)
 
 CODE_REVISION_ENV = "FML_CODE_REVISION"
 RUNTIME_PACKAGES = ("datasets", "flwr", "keras", "numpy", "tensorflow")
@@ -176,14 +182,36 @@ def _validate_seeds(seeds: Mapping[str, Any]) -> None:
     ValueError
         If seed metadata is missing or malformed.
     """
-    _required_nested_fields(seeds, {"run_config", "code_defaults"}, "seeds")
+    _required_nested_fields(
+        seeds,
+        {
+            "effective_master_seed",
+            "derivation",
+            "namespaces",
+            "run_config",
+            "code_defaults",
+        },
+        "seeds",
+    )
+    master_seed = seeds["effective_master_seed"]
+    derivation = seeds["derivation"]
+    namespaces = seeds["namespaces"]
     run_config = seeds["run_config"]
     code_defaults = seeds["code_defaults"]
+    effective_master_seed({MASTER_SEED_CONFIG_KEY: master_seed})
+    if not isinstance(derivation, Mapping) or dict(derivation) != SEED_DERIVATION:
+        raise ValueError("run provenance manifest has an invalid seeds.derivation")
+    if not isinstance(namespaces, Mapping) or dict(namespaces) != SEED_NAMESPACES:
+        raise ValueError("run provenance manifest has an invalid seeds.namespaces")
     if not isinstance(run_config, Mapping):
         raise ValueError("run provenance manifest has an invalid seeds.run_config")
     _canonical_run_config(run_config)
     if any("seed" not in key.lower() for key in run_config):
         raise ValueError("run provenance manifest has an invalid seeds.run_config")
+    if run_config.get(MASTER_SEED_CONFIG_KEY) != master_seed:
+        raise ValueError(
+            "run provenance manifest has inconsistent master seed metadata"
+        )
     if not isinstance(code_defaults, Mapping):
         raise ValueError("run provenance manifest has an invalid seeds.code_defaults")
     _required_nested_fields(
@@ -650,7 +678,8 @@ def write_run_provenance_manifest(
         type(flower_run_id) is not int or flower_run_id < 0
     ):
         raise ValueError("Flower run ID must be a non-negative integer")
-    config = _canonical_run_config(run_config)
+    master_seed = effective_master_seed(run_config)
+    config = _canonical_run_config({**run_config, MASTER_SEED_CONFIG_KEY: master_seed})
     timestamp = created_at or datetime.now(timezone.utc).isoformat().replace(
         "+00:00", "Z"
     )
@@ -671,6 +700,9 @@ def write_run_provenance_manifest(
         "environment": _environment_metadata(),
         "code_revision": _code_revision(),
         "seeds": {
+            "effective_master_seed": master_seed,
+            "derivation": SEED_DERIVATION,
+            "namespaces": SEED_NAMESPACES,
             "run_config": seed_config,
             "code_defaults": {
                 "client_validation_split": DEFAULT_VALIDATION_SEED,
@@ -758,9 +790,14 @@ def load_run_provenance_manifest(
     for field in ("run_config", "environment", "code_revision", "seeds", "dataset"):
         if not isinstance(payload[field], Mapping):
             raise ValueError(f"run provenance manifest has an invalid {field}")
-    _canonical_run_config(payload["run_config"])
+    canonical_config = _canonical_run_config(payload["run_config"])
     _validate_environment(payload["environment"])
     _validate_code_revision(payload["code_revision"])
     _validate_seeds(payload["seeds"])
+    expected_seed_config = {
+        key: value for key, value in canonical_config.items() if "seed" in key.lower()
+    }
+    if dict(payload["seeds"]["run_config"]) != expected_seed_config:
+        raise ValueError("run provenance manifest has inconsistent seed configuration")
     _validate_dataset(payload["dataset"])
     return payload
