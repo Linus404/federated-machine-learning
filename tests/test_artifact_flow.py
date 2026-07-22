@@ -511,7 +511,7 @@ class ArtifactFlowTests(unittest.TestCase):
             )
 
             dashboard.load_vectorizer.clear()
-            with patch.object(dashboard, "load_app_manifest", return_value=manifest):
+            with patch.object(dashboard, "load_public_snapshot", return_value=manifest):
                 dashboard_vectorizer = dashboard.load_vectorizer()
             dashboard.load_vectorizer.clear()
             np.testing.assert_array_equal(
@@ -766,6 +766,177 @@ class ArtifactFlowTests(unittest.TestCase):
             self.assertTrue((root / "public").is_symlink())
             self.assertTrue((root / "clients").is_symlink())
             self.assertTrue(evaluation_dir.is_symlink())
+
+    def test_publication_migrates_legacy_roots_and_deployment_selects_new_bytes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            roots = {
+                "client": root / "clients",
+                "public": root / "public",
+                "evaluation": root / "evaluation",
+            }
+            for kind, logical_root in roots.items():
+                logical_root.mkdir()
+                (logical_root / "selected.txt").write_text(
+                    f"legacy-{kind}", encoding="utf-8"
+                )
+            (roots["client"] / "client-0").mkdir()
+            (roots["client"] / "client-0" / "shard.txt").write_text(
+                "legacy-client-0", encoding="utf-8"
+            )
+            legacy_client_descriptor = os.open(
+                roots["client"] / "client-0", os.O_RDONLY | os.O_DIRECTORY
+            )
+            legacy_public_descriptor = os.open(
+                roots["public"], os.O_RDONLY | os.O_DIRECTORY
+            )
+
+            generations = root / ".prepared-generations"
+            generation_stage = generations / ".prepare-integration.staging"
+            stages = {kind: generation_stage / kind for kind in roots}
+            for kind, stage in stages.items():
+                stage.mkdir(parents=True, exist_ok=True)
+                (stage / "selected.txt").write_text(
+                    f"generation-{kind}", encoding="utf-8"
+                )
+            (stages["client"] / "client-0").mkdir()
+            (stages["client"] / "client-0" / "shard.txt").write_text(
+                "generation-client-0", encoding="utf-8"
+            )
+
+            try:
+                _publish_prepared_roots(roots, stages)
+
+                selected_public = resolve_prepared_artifact_dir(
+                    roots["public"], "public"
+                )
+                selected_client = resolve_prepared_artifact_dir(
+                    roots["client"], "client"
+                )
+                self.assertEqual(
+                    (selected_public / "selected.txt").read_text(encoding="utf-8"),
+                    "generation-public",
+                )
+                self.assertEqual(
+                    (selected_client / "client-0" / "shard.txt").read_text(
+                        encoding="utf-8"
+                    ),
+                    "generation-client-0",
+                )
+
+                compose = Path("compose.yaml").read_text(encoding="utf-8")
+                public_source = next(
+                    line.strip().removeprefix("- ")
+                    for line in compose.splitlines()
+                    if line.strip().startswith(
+                        "- ./artifacts/.prepared-current/public:"
+                    )
+                ).split(":", maxsplit=1)[0]
+                client_source = next(
+                    line.split("source: ", maxsplit=1)[1].strip()
+                    for line in compose.splitlines()
+                    if "source: ./artifacts/.prepared-current/client/client-0" in line
+                )
+                deployment_public = root / Path(public_source).relative_to("artifacts")
+                deployment_client = root / Path(client_source).relative_to("artifacts")
+                self.assertEqual(
+                    (deployment_public / "selected.txt").read_text(encoding="utf-8"),
+                    "generation-public",
+                )
+                self.assertEqual(
+                    (deployment_client / "shard.txt").read_text(encoding="utf-8"),
+                    "generation-client-0",
+                )
+
+                archive = next((root / ".prepared-legacy").iterdir())
+                self.assertEqual(
+                    (archive / "public" / "selected.txt").read_text(encoding="utf-8"),
+                    "legacy-public",
+                )
+                self.assertEqual(
+                    (archive / "clients" / "client-0" / "shard.txt").read_text(
+                        encoding="utf-8"
+                    ),
+                    "legacy-client-0",
+                )
+                public_file = os.open(
+                    "selected.txt", os.O_RDONLY, dir_fd=legacy_public_descriptor
+                )
+                client_file = os.open(
+                    "shard.txt", os.O_RDONLY, dir_fd=legacy_client_descriptor
+                )
+                try:
+                    self.assertEqual(os.read(public_file, 100), b"legacy-public")
+                    self.assertEqual(os.read(client_file, 100), b"legacy-client-0")
+                finally:
+                    os.close(public_file)
+                    os.close(client_file)
+            finally:
+                os.close(legacy_public_descriptor)
+                os.close(legacy_client_descriptor)
+
+    def test_preparation_rejects_unsupported_platform_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with (
+                patch("src.artifact_compatibility.sys.platform", "win32"),
+                patch("src.data_prep.load_verified_imdb_dataset") as load_dataset,
+                self.assertRaisesRegex(RuntimeError, "require Linux"),
+            ):
+                prepare_all(
+                    2,
+                    root / "clients",
+                    root / "public",
+                    root / "evaluation",
+                )
+
+            load_dataset.assert_not_called()
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_legacy_migration_rolls_back_all_roots_when_activation_fails(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            roots = {
+                "client": root / "clients",
+                "public": root / "public",
+                "evaluation": root / "evaluation",
+            }
+            generations = root / ".prepared-generations"
+            stage_root = generations / ".prepare-rollback.staging"
+            stages = {kind: stage_root / kind for kind in roots}
+            for kind, logical_root in roots.items():
+                logical_root.mkdir()
+                (logical_root / "legacy.txt").write_text(kind, encoding="utf-8")
+                stages[kind].mkdir(parents=True, exist_ok=True)
+                (stages[kind] / "new.txt").write_text(kind, encoding="utf-8")
+
+            original_replace = os.replace
+
+            def reject_pointer(source: str | Path, destination: str | Path) -> None:
+                if Path(destination).name == ".prepared-current":
+                    raise OSError("injected pointer failure")
+                original_replace(source, destination)
+
+            with (
+                patch("src.data_prep.os.replace", side_effect=reject_pointer),
+                self.assertRaisesRegex(OSError, "pointer failure"),
+            ):
+                _publish_prepared_roots(roots, stages)
+
+            for kind, logical_root in roots.items():
+                with self.subTest(kind=kind):
+                    self.assertTrue(logical_root.is_dir())
+                    self.assertFalse(logical_root.is_symlink())
+                    self.assertEqual(
+                        (logical_root / "legacy.txt").read_text(encoding="utf-8"),
+                        kind,
+                    )
+            self.assertFalse((root / ".prepared-current").exists())
+            self.assertEqual(list((root / ".prepared-legacy").iterdir()), [])
 
     def test_preparation_rejects_overlapping_artifact_boundaries_before_loading(
         self,

@@ -6,7 +6,9 @@ import hashlib
 import hmac
 import json
 import os
+import shutil
 import stat
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +45,34 @@ _SERVER_BINDING_FIELDS = {
     "model_dimensions",
 }
 _MODEL_DIMENSION_FIELDS = {"vocabulary_size", "sequence_length", "embedding_dim"}
+
+
+def require_secure_artifact_platform() -> None:
+    """Require the Linux filesystem primitives used by artifact boundaries.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    RuntimeError
+        If the process cannot enforce descriptor-relative, no-follow artifact
+        publication and validation.
+    """
+    required_dir_fd = (os.open, os.stat, os.mkdir, os.rename)
+    if (
+        sys.platform != "linux"
+        or not hasattr(os, "O_NOFOLLOW")
+        or not hasattr(os, "O_DIRECTORY")
+        or any(function not in os.supports_dir_fd for function in required_dir_fd)
+        or os.stat not in os.supports_follow_symlinks
+        or not shutil.rmtree.avoids_symlink_attacks
+    ):
+        raise RuntimeError(
+            "secure artifact publication and validation require Linux; use the "
+            "documented Linux-container workflow on Windows or macOS"
+        )
 
 
 @dataclass(frozen=True)
@@ -156,23 +186,23 @@ def read_regular_file(path: Path, *, parent: Path) -> bytes:
 
     Raises
     ------
+    RuntimeError
+        If the process cannot enforce the Linux artifact filesystem contract.
     ValueError
         If the path escapes its parent or is not a regular file.
     """
+    require_secure_artifact_platform()
     canonical_parent = parent.resolve(strict=True)
     if path.parent.resolve(strict=True) != canonical_parent or path.is_symlink():
         raise ValueError(f"artifact must be a contained regular file: {path.name}")
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     parent_descriptor = -1
     try:
-        if os.open in os.supports_dir_fd:
-            parent_descriptor = os.open(
-                canonical_parent,
-                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-            )
-            descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
-        else:
-            descriptor = os.open(path, flags)
+        parent_descriptor = os.open(
+            canonical_parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
     except OSError as error:
         if parent_descriptor >= 0:
             os.close(parent_descriptor)

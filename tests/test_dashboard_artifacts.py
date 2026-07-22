@@ -52,6 +52,11 @@ class DashboardArtifactTests(unittest.TestCase):
             )
             with (
                 patch.object(dashboard, "ARTIFACT_ROOT", root),
+                patch.object(
+                    dashboard,
+                    "load_public_snapshot",
+                    return_value=fake_app_manifest(),
+                ),
                 self.assertRaisesRegex(ValueError, "no valid schema_version"),
             ):
                 dashboard.load_metrics()
@@ -60,6 +65,11 @@ class DashboardArtifactTests(unittest.TestCase):
             (root / "current.json").write_text("not-json", encoding="utf-8")
             with (
                 patch.object(dashboard, "ARTIFACT_ROOT", root),
+                patch.object(
+                    dashboard,
+                    "load_public_snapshot",
+                    return_value=fake_app_manifest(),
+                ),
                 self.assertRaisesRegex(ValueError, "invalid current-run index"),
             ):
                 dashboard.load_metrics()
@@ -78,7 +88,9 @@ class DashboardArtifactTests(unittest.TestCase):
 
                 with (
                     patch.object(
-                        dashboard, "load_app_manifest", return_value=fake_app_manifest()
+                        dashboard,
+                        "load_public_snapshot",
+                        return_value=fake_app_manifest(),
                     ),
                     patch.object(dashboard.keras.models, "load_model") as load_model,
                     self.assertRaisesRegex(ValueError, error),
@@ -94,7 +106,9 @@ class DashboardArtifactTests(unittest.TestCase):
             sentinel = compatible_model()
             with (
                 patch.object(
-                    dashboard, "load_app_manifest", return_value=fake_app_manifest()
+                    dashboard,
+                    "load_public_snapshot",
+                    return_value=fake_app_manifest(),
                 ),
                 patch.object(
                     dashboard.keras.models, "load_model", return_value=sentinel
@@ -116,7 +130,14 @@ class DashboardArtifactTests(unittest.TestCase):
                 )
                 write_server_manifest(path, version)
 
-                with self.assertRaisesRegex(ValueError, error):
+                with (
+                    patch.object(
+                        dashboard,
+                        "load_public_snapshot",
+                        return_value=fake_app_manifest(),
+                    ),
+                    self.assertRaisesRegex(ValueError, error),
+                ):
                     dashboard.load_metrics(metrics_path)
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -127,7 +148,12 @@ class DashboardArtifactTests(unittest.TestCase):
             )
             write_server_manifest(path, SERVER_ARTIFACT_SCHEMA_VERSION)
 
-            metrics = dashboard.load_metrics(metrics_path)
+            with patch.object(
+                dashboard,
+                "load_public_snapshot",
+                return_value=fake_app_manifest(),
+            ):
+                metrics = dashboard.load_metrics(metrics_path)
 
             self.assertIsNotNone(metrics)
             assert metrics is not None
@@ -156,7 +182,9 @@ class DashboardArtifactTests(unittest.TestCase):
 
             with (
                 patch.object(
-                    dashboard, "load_app_manifest", return_value=fake_app_manifest()
+                    dashboard,
+                    "load_public_snapshot",
+                    return_value=fake_app_manifest(),
                 ),
                 patch.object(
                     dashboard.keras.models,
@@ -176,7 +204,9 @@ class DashboardArtifactTests(unittest.TestCase):
             incompatible.manifest_bytes = b"different public manifest\n"
 
             with (
-                patch.object(dashboard, "load_app_manifest", return_value=incompatible),
+                patch.object(
+                    dashboard, "load_public_snapshot", return_value=incompatible
+                ),
                 patch.object(dashboard.keras.models, "load_model") as load_model,
                 self.assertRaisesRegex(ValueError, "does not match"),
             ):
@@ -195,7 +225,9 @@ class DashboardArtifactTests(unittest.TestCase):
 
             with (
                 patch.object(
-                    dashboard, "load_app_manifest", return_value=fake_app_manifest()
+                    dashboard,
+                    "load_public_snapshot",
+                    return_value=fake_app_manifest(),
                 ),
                 patch.object(
                     dashboard.keras.models,
@@ -220,12 +252,69 @@ class DashboardArtifactTests(unittest.TestCase):
         load_snapshot.assert_not_called()
         load_model.assert_not_called()
 
+    def test_both_metrics_files_reject_mismatched_public_for_current_and_explicit_paths(
+        self,
+    ) -> None:
+        for filename in ("metrics.csv", "client_metrics.csv"):
+            for explicit in (False, True):
+                with (
+                    self.subTest(filename=filename, explicit=explicit),
+                    tempfile.TemporaryDirectory() as tmpdir,
+                ):
+                    root = Path(tmpdir)
+                    (root / filename).write_text(
+                        "round,loss,accuracy\n1,0.5,0.75\n", encoding="utf-8"
+                    )
+                    write_server_manifest(root, SERVER_ARTIFACT_SCHEMA_VERSION)
+                    incompatible = fake_app_manifest()
+                    incompatible.manifest_bytes = b"different public manifest\n"
+                    path = root / filename if explicit else None
+
+                    with (
+                        patch.object(dashboard, "ARTIFACT_ROOT", root),
+                        patch.object(
+                            dashboard,
+                            "load_public_snapshot",
+                            return_value=incompatible,
+                        ),
+                        self.assertRaisesRegex(ValueError, "does not match"),
+                    ):
+                        dashboard.load_metrics(path, filename=filename)
+
+    def test_public_snapshot_cache_is_keyed_by_immutable_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            first = Path(tmpdir) / "first" / "public"
+            second = Path(tmpdir) / "second" / "public"
+            first.mkdir(parents=True)
+            second.mkdir(parents=True)
+            first_snapshot = fake_app_manifest()
+            second_snapshot = fake_app_manifest()
+            dashboard._load_public_snapshot_at.clear()
+            with (
+                patch.object(
+                    dashboard,
+                    "resolve_public_artifact_dir",
+                    side_effect=(first, first, second),
+                ),
+                patch.object(
+                    dashboard,
+                    "load_app_manifest",
+                    side_effect=(first_snapshot, second_snapshot),
+                ) as load_manifest,
+            ):
+                self.assertIs(dashboard.load_public_snapshot(), first_snapshot)
+                self.assertIs(dashboard.load_public_snapshot(), first_snapshot)
+                self.assertIs(dashboard.load_public_snapshot(), second_snapshot)
+
+            dashboard._load_public_snapshot_at.clear()
+            self.assertEqual(load_manifest.call_count, 2)
+
     def test_vectorizer_rejects_conflicting_preimport_environment(self) -> None:
         with (
             patch.dict(os.environ, {"KERAS_BACKEND": "jax"}),
             patch.object(
                 dashboard,
-                "load_app_manifest",
+                "load_public_snapshot",
                 return_value=SimpleNamespace(
                     payload={"sequence_length": 500}, vocabulary_terms=("", "[UNK]")
                 ),

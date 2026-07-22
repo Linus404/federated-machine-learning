@@ -7,7 +7,7 @@ import uuid
 from pathlib import Path
 from typing import BinaryIO
 
-from src.artifact_compatibility import read_regular_file
+from src.artifact_compatibility import canonical_json_bytes, read_regular_file
 
 PUBLIC_ARTIFACT_DIR_ENV = "FML_PUBLIC_ARTIFACT_DIR"
 SERVER_ARTIFACT_DIR_ENV = "FML_SERVER_ARTIFACT_DIR"
@@ -17,6 +17,7 @@ DEFAULT_SERVER_ARTIFACT_DIR = Path("artifacts/server")
 DEFAULT_EVALUATION_ARTIFACT_DIR = Path("artifacts/evaluation")
 PREPARED_CURRENT_FILENAME = ".prepared-current"
 PREPARED_GENERATIONS_DIRECTORY = ".prepared-generations"
+PREPARED_LEGACY_DIRECTORY = ".prepared-legacy"
 PREPARED_GENERATION_SCHEMA_VERSION = 1
 PREPARED_ARTIFACT_KINDS = frozenset({"client", "public", "evaluation"})
 
@@ -95,14 +96,31 @@ def resolve_prepared_artifact_dir(value: str | Path, artifact_kind: str) -> Path
         raise ValueError("prepared artifact parent must be a regular directory")
     if not pointer.is_symlink():
         raise ValueError("prepared generation pointer must be an atomic directory link")
-    target = Path(os.readlink(pointer))
+    expected_alias = Path(PREPARED_CURRENT_FILENAME) / artifact_kind
+    if (
+        not logical_root.is_symlink()
+        or Path(os.readlink(logical_root)) != expected_alias
+    ):
+        raise ValueError("prepared logical root does not select the current generation")
+    target_text = os.readlink(pointer)
+    target = Path(target_text)
     if target.is_absolute() or len(target.parts) != 2:
         raise ValueError("prepared generation pointer target is invalid")
-    generations_name, generation_id = target.parts
+    generations_name, pointer_generation_id = target.parts
     if generations_name != PREPARED_GENERATIONS_DIRECTORY:
         raise ValueError("prepared generation pointer target is invalid")
+    try:
+        parsed_pointer_id = uuid.UUID(pointer_generation_id)
+    except ValueError as error:
+        raise ValueError("prepared generation pointer identity is invalid") from error
+    if (
+        parsed_pointer_id.version != 4
+        or str(parsed_pointer_id) != pointer_generation_id
+        or target_text != f"{PREPARED_GENERATIONS_DIRECTORY}/{pointer_generation_id}"
+    ):
+        raise ValueError("prepared generation pointer identity is invalid")
     generations = parent / PREPARED_GENERATIONS_DIRECTORY
-    generation = generations / generation_id
+    generation = generations / pointer_generation_id
     index_path = generation / "index.json"
     if generations.is_symlink() or generation.is_symlink() or not generation.is_dir():
         raise ValueError("selected prepared generation is missing or unsafe")
@@ -111,9 +129,8 @@ def resolve_prepared_artifact_dir(value: str | Path, artifact_kind: str) -> Path
     if canonical_generation.parent != canonical_generations:
         raise ValueError("selected prepared generation escapes its artifact root")
     try:
-        payload = json.loads(
-            read_regular_file(index_path, parent=canonical_generation).decode("utf-8")
-        )
+        index_bytes = read_regular_file(index_path, parent=canonical_generation)
+        payload = json.loads(index_bytes.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         raise ValueError("prepared generation index is invalid or unsafe") from error
     if not isinstance(payload, dict) or set(payload) != {
@@ -122,6 +139,8 @@ def resolve_prepared_artifact_dir(value: str | Path, artifact_kind: str) -> Path
         "logical_roots",
     }:
         raise ValueError("prepared generation index has an invalid field set")
+    if index_bytes != canonical_json_bytes(payload):
+        raise ValueError("prepared generation index bytes are not canonical")
     if payload["schema_version"] != PREPARED_GENERATION_SCHEMA_VERSION:
         raise ValueError("prepared generation index has an unsupported schema_version")
     logical_roots = payload["logical_roots"]
@@ -137,15 +156,25 @@ def resolve_prepared_artifact_dir(value: str | Path, artifact_kind: str) -> Path
         or logical_roots[artifact_kind] != logical_root.name
     ):
         raise ValueError("prepared generation index does not match configured roots")
-    generation_id = payload["generation_id"]
+    index_generation_id = payload["generation_id"]
     try:
-        parsed_id = uuid.UUID(generation_id) if isinstance(generation_id, str) else None
+        parsed_id = (
+            uuid.UUID(index_generation_id)
+            if isinstance(index_generation_id, str)
+            else None
+        )
     except ValueError as error:
         raise ValueError(
             "prepared generation index has an invalid generation_id"
         ) from error
-    if parsed_id is None or parsed_id.version != 4 or str(parsed_id) != generation_id:
+    if (
+        parsed_id is None
+        or parsed_id.version != 4
+        or str(parsed_id) != index_generation_id
+    ):
         raise ValueError("prepared generation index has an invalid generation_id")
+    if index_generation_id != pointer_generation_id:
+        raise ValueError("prepared generation pointer and index identities differ")
 
     selected = generation / artifact_kind
     if selected.is_symlink() or not selected.is_dir():

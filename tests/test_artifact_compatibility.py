@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from src.app_manifest import load_app_manifest
 from src.artifact_compatibility import (
@@ -14,6 +15,8 @@ from src.artifact_compatibility import (
     canonical_json_bytes,
     load_server_artifact_manifest,
     load_server_artifact_snapshot,
+    read_regular_file,
+    require_secure_artifact_platform,
     validate_artifact_schema,
     write_server_artifact_manifest,
 )
@@ -21,6 +24,27 @@ from tests.artifact_helpers import fake_app_manifest
 
 
 class ArtifactCompatibilityTests(unittest.TestCase):
+    def test_secure_artifact_platform_rejects_windows(self) -> None:
+        with (
+            patch("src.artifact_compatibility.sys.platform", "win32"),
+            self.assertRaisesRegex(RuntimeError, "require Linux"),
+        ):
+            require_secure_artifact_platform()
+
+    def test_reader_has_no_unsafe_fallback_on_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            artifact = root / "artifact.json"
+            artifact.write_text("{}", encoding="utf-8")
+            with (
+                patch("src.artifact_compatibility.sys.platform", "win32"),
+                patch("src.artifact_compatibility.os.open") as open_file,
+                self.assertRaisesRegex(RuntimeError, "require Linux"),
+            ):
+                read_regular_file(artifact, parent=root)
+
+            open_file.assert_not_called()
+
     def test_compatibility_policy_records_client_schema_two_migration(self) -> None:
         policy = (
             Path(__file__).resolve().parent.parent / "COMPATIBILITY.md"

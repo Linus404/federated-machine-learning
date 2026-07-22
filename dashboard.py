@@ -14,7 +14,11 @@ from src.protocol_runtime import validate_protocol_runtime
 import keras
 import tensorflow as tf
 
-from src.app_manifest import AppManifest, load_app_manifest
+from src.app_manifest import (
+    AppManifest,
+    load_app_manifest,
+    resolve_public_artifact_dir,
+)
 from src.artifact_history import CURRENT_RUN_FILENAME, load_current_run_snapshot
 from src.artifact_compatibility import (
     SERVER_ARTIFACT_MANIFEST_FILENAME,
@@ -77,8 +81,44 @@ def load_model(path: Path | None = None) -> Any:
         If no trained model artifact exists.
     """
     validate_protocol_runtime()
-    app_manifest = load_app_manifest(public_artifact_dir=PUBLIC_ARTIFACT_DIR)
+    app_manifest = load_public_snapshot()
     return _load_bound_model(app_manifest, path)
+
+
+@st.cache_resource
+def _load_public_snapshot_at(public_dir: Path) -> AppManifest:
+    """Load and cache one immutable public generation directory.
+
+    Parameters
+    ----------
+    public_dir : pathlib.Path
+        Canonical immutable public generation directory.
+
+    Returns
+    -------
+    AppManifest
+        Validated public artifact snapshot.
+    """
+    return load_app_manifest(public_artifact_dir=public_dir)
+
+
+def load_public_snapshot() -> AppManifest:
+    """Load the currently selected validated public artifact snapshot.
+
+    Returns
+    -------
+    AppManifest
+        Cached snapshot keyed by its immutable generation directory.
+
+    Raises
+    ------
+    ValueError
+        If the selected generation or public artifacts are unsafe or incompatible.
+    """
+    public_dir = resolve_public_artifact_dir(
+        public_artifact_dir=PUBLIC_ARTIFACT_DIR
+    ).resolve(strict=True)
+    return _load_public_snapshot_at(public_dir)
 
 
 def _load_bound_model(app_manifest: AppManifest, path: Path | None = None) -> Any:
@@ -178,7 +218,7 @@ def load_vectorizer() -> keras.layers.TextVectorization:
     ValueError
         If the public manifest or vocabulary artifact is invalid.
     """
-    app_manifest = load_app_manifest(public_artifact_dir=PUBLIC_ARTIFACT_DIR)
+    app_manifest = load_public_snapshot()
     return create_text_vectorizer(
         sequence_length=app_manifest.payload["sequence_length"],
         vocabulary=app_manifest.vocabulary_terms[2:],
@@ -186,7 +226,10 @@ def load_vectorizer() -> keras.layers.TextVectorization:
 
 
 def load_metrics(
-    path: Path | None = None, *, filename: str = "metrics.csv"
+    path: Path | None = None,
+    *,
+    filename: str = "metrics.csv",
+    app_manifest: AppManifest | None = None,
 ) -> pd.DataFrame | None:
     """Load metrics from a compatible server artifact directory.
 
@@ -196,6 +239,9 @@ def load_metrics(
         Metrics CSV path.
     filename : str, optional
         Current-run artifact filename used when ``path`` is ``None``.
+    app_manifest : AppManifest or None, optional
+        Validated public snapshot that the server artifacts must match. The
+        currently selected snapshot is loaded when omitted.
 
     Returns
     -------
@@ -209,10 +255,11 @@ def load_metrics(
     """
     if path is None and _is_fresh_artifact_root(ARTIFACT_ROOT):
         return None
+    public_snapshot = app_manifest or load_public_snapshot()
     snapshot = (
-        load_current_run_snapshot(ARTIFACT_ROOT)
+        load_current_run_snapshot(ARTIFACT_ROOT, app_manifest=public_snapshot)
         if path is None
-        else load_server_artifact_snapshot(path.parent)
+        else load_server_artifact_snapshot(path.parent, app_manifest=public_snapshot)
     )
     content = snapshot.files.get(path.name if path is not None else filename)
     if content is None:
@@ -245,7 +292,7 @@ def predict_sentiment(review_text: str) -> tuple[float, str]:
         If runtime or artifact compatibility validation fails.
     """
     validate_protocol_runtime()
-    app_manifest = load_app_manifest(public_artifact_dir=PUBLIC_ARTIFACT_DIR)
+    app_manifest = load_public_snapshot()
     model = _load_bound_model(app_manifest)
     vectorizer = create_text_vectorizer(
         sequence_length=app_manifest.payload["sequence_length"],
@@ -345,7 +392,8 @@ def main() -> None:
     with col_right:
         st.subheader("Training metrics")
 
-        df_metrics = load_metrics()
+        app_manifest = load_public_snapshot()
+        df_metrics = load_metrics(app_manifest=app_manifest)
         if df_metrics is None:
             st.info(
                 "Noch keine Trainingsmetriken gefunden. Wenn gerade ein neuer Lauf startet, "
@@ -367,7 +415,9 @@ def main() -> None:
                 )
 
             st.subheader("Client evaluation accuracy")
-            df_client_metrics = load_metrics(filename="client_metrics.csv")
+            df_client_metrics = load_metrics(
+                filename="client_metrics.csv", app_manifest=app_manifest
+            )
             client_columns = {"round", "client_id", "accuracy"}
             if df_client_metrics is None:
                 st.info("Per-client metrics will appear during the next training run.")

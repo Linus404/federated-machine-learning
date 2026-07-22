@@ -62,6 +62,17 @@ def test_protocol(rows: list[dict[str, object]]) -> dict[str, object]:
 
 
 class EvaluationArtifactTests(unittest.TestCase):
+    def test_publication_rejects_unsupported_platform_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "missing" / "evaluation"
+            with (
+                patch("src.artifact_compatibility.sys.platform", "win32"),
+                self.assertRaisesRegex(RuntimeError, "require Linux"),
+            ):
+                publish_evaluation_artifact(self.rows, output, protocol=self.protocol)
+
+            self.assertFalse(output.parent.exists())
+
     def setUp(self) -> None:
         self.rows = [
             {"text": "first\nreview", "label": 0},

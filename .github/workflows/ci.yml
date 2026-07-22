@@ -8,6 +8,22 @@ permissions:
   contents: read
 
 jobs:
+  platform-contract:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Reject native Windows artifact handling before mutation
+        shell: python
+        run: |
+          from src.artifact_compatibility import require_secure_artifact_platform
+
+          try:
+              require_secure_artifact_platform()
+          except RuntimeError as error:
+              assert "require Linux" in str(error)
+          else:
+              raise AssertionError("native Windows artifact handling was accepted")
+
   quality:
     runs-on: ubuntu-latest
     steps:

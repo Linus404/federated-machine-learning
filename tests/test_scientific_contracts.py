@@ -102,9 +102,11 @@ class ScientificContractTests(unittest.TestCase):
         ]["flwr"]["app"]["config"]
         artifact_dir = config["server-artifact-dir"]
         readme = Path("README.md").read_text(encoding="utf-8")
+        compose = Path("compose.yaml").read_text(encoding="utf-8")
 
         self.assertIn(f"FML_SERVER_ARTIFACT_DIR={artifact_dir} ", readme)
-        self.assertIn(f'$env:FML_SERVER_ARTIFACT_DIR = "{artifact_dir}"', readme)
+        self.assertNotIn(f'$env:FML_SERVER_ARTIFACT_DIR = "{artifact_dir}"', readme)
+        self.assertIn("FML_SERVER_ARTIFACT_DIR: /app/artifacts/server", compose)
 
     def test_huber_aggregation_result_is_stable(self) -> None:
         result = huber_aggregate(

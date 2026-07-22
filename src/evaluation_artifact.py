@@ -18,6 +18,7 @@ from src.artifact_compatibility import (
     canonical_json_bytes,
     deep_freeze,
     read_regular_file,
+    require_secure_artifact_platform,
     sha256_bytes,
 )
 from src.paths import RunArtifactLock, resolve_prepared_artifact_dir
@@ -526,10 +527,12 @@ def publish_evaluation_artifact(
     FileExistsError
         If the immutable destination already exists.
     RuntimeError
-        If another writer owns the same destination.
+        If another writer owns the same destination or direct publication runs
+        outside the supported Linux platform.
     ValueError
         If owned residue, rows, or paths are invalid.
     """
+    require_secure_artifact_platform()
     parent, output_name, parent_descriptor = _open_new_artifact_parent(output_dir)
     lock = _acquire_evaluation_lock(parent_descriptor, output_name)
     try:

@@ -26,7 +26,8 @@ evaluation artifacts, run provenance, and current-run index use schema `1`:
 - `.prepared-current/index.json` uses `schema_version: 1`; the atomic
   `.prepared-current` directory link selects one
   immutable directory under `.prepared-generations/<generation-id>`. Its client,
-  public, and evaluation children are always selected as one generation.
+  public, and evaluation children are always selected as one generation. The
+  canonical index bytes must record the same UUIDv4 as the selected directory.
 - `artifacts/evaluation/manifest.json` uses `schema_version: 1` and strictly
   versions and checksums the immutable official test-split JSONL artifact.
 - Each completed `server/runs/<run_id>` directory has schema-2
@@ -70,6 +71,22 @@ uv run --env-file .env.protocol flwr run . --stream --federation-config "num-sup
 Do not edit a schema version or checksum by hand: that bypasses compatibility
 checks without converting the data. A newer artifact requires newer application
 code.
+
+Direct artifact preparation and validation require Linux. Windows operators must
+run the Linux `data-prep` Compose profile from a WSL2 Linux-filesystem checkout;
+NTFS bind mounts are not supported for prepared links. macOS operators use the
+same Linux-container profile. Unsupported native execution fails before
+filesystem mutation. The profile binds the repository `artifacts` path unchanged,
+accepts the invoking Linux user's UID/GID, and keeps `artifacts/server` read-only.
+
+When generation publication first encounters real legacy logical directories,
+it retains them under `.prepared-legacy/<generation-id>/` and replaces the
+logical names with links to `.prepared-current`. This controlled migration never
+deletes legacy bytes. Inspect and remove an archive only with all consumers
+stopped. Compose mounts public and per-client inputs directly through
+`.prepared-current`; evaluation remains unmounted. Because bind sources are
+resolved when containers are created, stop containers before regeneration and
+recreate them afterward.
 
 An interrupted preparation can leave an immutable, unselected directory under
 `.prepared-generations`; consumers ignore it because only `.prepared-current`

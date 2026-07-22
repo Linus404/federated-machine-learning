@@ -1,14 +1,20 @@
+import json
 import os
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 
+from src.artifact_compatibility import canonical_json_bytes
 from src.paths import (
     EVALUATION_ARTIFACT_DIR_ENV,
+    PREPARED_CURRENT_FILENAME,
+    PREPARED_GENERATIONS_DIRECTORY,
+    PREPARED_GENERATION_SCHEMA_VERSION,
     SERVER_ARTIFACT_DIR_ENV,
     acquire_run_artifact_lock,
     client_metrics_path,
@@ -16,8 +22,62 @@ from src.paths import (
     default_server_artifact_dir,
     global_model_path,
     metrics_path,
+    resolve_prepared_artifact_dir,
     run_manifest_path,
 )
+
+
+def write_prepared_generation(
+    root: Path,
+    *,
+    pointer_generation_id: str | None = None,
+    index_generation_id: str | None = None,
+) -> tuple[Path, str]:
+    """Create one selected prepared generation for resolver tests.
+
+    Parameters
+    ----------
+    root : pathlib.Path
+        Shared parent of the logical and immutable prepared roots.
+    pointer_generation_id : str or None, optional
+        Directory identity selected by the pointer.
+    index_generation_id : str or None, optional
+        Identity serialized inside ``index.json``.
+
+    Returns
+    -------
+    tuple of pathlib.Path and str
+        Generation directory and pointer identity.
+    """
+    selected_id = pointer_generation_id or str(uuid.uuid4())
+    serialized_id = index_generation_id or selected_id
+    generation = root / PREPARED_GENERATIONS_DIRECTORY / selected_id
+    generation.mkdir(parents=True)
+    logical_roots = {
+        "client": "clients",
+        "public": "public",
+        "evaluation": "evaluation",
+    }
+    for kind, logical_name in logical_roots.items():
+        (generation / kind).mkdir()
+        (root / logical_name).symlink_to(
+            Path(PREPARED_CURRENT_FILENAME) / kind,
+            target_is_directory=True,
+        )
+    (generation / "index.json").write_bytes(
+        canonical_json_bytes(
+            {
+                "schema_version": PREPARED_GENERATION_SCHEMA_VERSION,
+                "generation_id": serialized_id,
+                "logical_roots": logical_roots,
+            }
+        )
+    )
+    (root / PREPARED_CURRENT_FILENAME).symlink_to(
+        Path(PREPARED_GENERATIONS_DIRECTORY) / selected_id,
+        target_is_directory=True,
+    )
+    return generation, selected_id
 
 
 class RunArtifactLockTests(unittest.TestCase):
@@ -62,6 +122,127 @@ class RunArtifactLockTests(unittest.TestCase):
 
 
 class ArtifactPathContractTests(unittest.TestCase):
+    def test_prepared_generation_requires_matching_canonical_identities(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            generation, _ = write_prepared_generation(root)
+
+            self.assertEqual(
+                resolve_prepared_artifact_dir(root / "public", "public"),
+                generation / "public",
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            write_prepared_generation(root, index_generation_id=str(uuid.uuid4()))
+
+            with self.assertRaisesRegex(ValueError, "identities differ"):
+                resolve_prepared_artifact_dir(root / "public", "public")
+
+    def test_prepared_generation_rejects_noncanonical_or_transplanted_index(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            generation, _ = write_prepared_generation(root)
+            index_path = generation / "index.json"
+            payload = json.loads(index_path.read_text(encoding="utf-8"))
+            index_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "not canonical"):
+                resolve_prepared_artifact_dir(root / "public", "public")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            first_id = str(uuid.uuid4())
+            second_id = str(uuid.uuid4())
+            generation, _ = write_prepared_generation(
+                root,
+                pointer_generation_id=second_id,
+                index_generation_id=first_id,
+            )
+            self.assertEqual(
+                json.loads((generation / "index.json").read_text(encoding="utf-8"))[
+                    "generation_id"
+                ],
+                first_id,
+            )
+
+            with self.assertRaisesRegex(ValueError, "identities differ"):
+                resolve_prepared_artifact_dir(root / "clients", "client")
+
+    def test_prepared_generation_rejects_pointer_swap_and_hostile_entries(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _, generation_id = write_prepared_generation(root)
+            pointer = root / PREPARED_CURRENT_FILENAME
+            pointer.unlink()
+            pointer.symlink_to(
+                f"./{PREPARED_GENERATIONS_DIRECTORY}/{generation_id}",
+                target_is_directory=True,
+            )
+
+            with self.assertRaisesRegex(ValueError, "pointer identity"):
+                resolve_prepared_artifact_dir(root / "evaluation", "evaluation")
+
+        for hostile_entry in (
+            "pointer",
+            "logical",
+            "generations",
+            "generation",
+            "index",
+            "selected",
+        ):
+            with (
+                self.subTest(hostile_entry=hostile_entry),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                generation, _ = write_prepared_generation(root)
+                external = root / "external"
+                external.mkdir()
+                if hostile_entry == "pointer":
+                    pointer = root / PREPARED_CURRENT_FILENAME
+                    pointer.unlink()
+                    pointer.write_text(generation.name, encoding="utf-8")
+                    expected_error = "atomic directory link"
+                elif hostile_entry == "logical":
+                    logical = root / "public"
+                    logical.unlink()
+                    logical.mkdir()
+                    expected_error = "logical root"
+                elif hostile_entry == "generations":
+                    generations = root / PREPARED_GENERATIONS_DIRECTORY
+                    renamed = root / "real-generations"
+                    generations.rename(renamed)
+                    generations.symlink_to(renamed, target_is_directory=True)
+                    expected_error = "missing or unsafe"
+                elif hostile_entry == "generation":
+                    for child in generation.iterdir():
+                        if child.is_dir():
+                            child.rmdir()
+                        else:
+                            child.unlink()
+                    generation.rmdir()
+                    generation.symlink_to(external, target_is_directory=True)
+                    expected_error = "missing or unsafe"
+                elif hostile_entry == "index":
+                    index = generation / "index.json"
+                    index.unlink()
+                    index.symlink_to(external / "index.json")
+                    (external / "index.json").write_text("{}", encoding="utf-8")
+                    expected_error = "invalid or unsafe"
+                else:
+                    selected = generation / "public"
+                    selected.rmdir()
+                    selected.symlink_to(external, target_is_directory=True)
+                    expected_error = "missing or unsafe"
+
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    resolve_prepared_artifact_dir(root / "public", "public")
+
     def test_default_evaluation_artifact_dir_prefers_evaluation_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             evaluation_dir = Path(tmpdir) / "evaluation-artifacts"

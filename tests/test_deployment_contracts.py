@@ -46,7 +46,7 @@ class DistributedDeploymentContractTests(unittest.TestCase):
             and not line.startswith("    ")
             and line.endswith(":")
         }
-        expected = {"superlink", "serverapp", "dashboard"}
+        expected = {"data-prep", "superlink", "serverapp", "dashboard"}
         expected.update(f"supernode-{index}" for index in range(4))
         expected.update(f"clientapp-{index}" for index in range(4))
         self.assertEqual(services, expected)
@@ -92,6 +92,7 @@ class DistributedDeploymentContractTests(unittest.TestCase):
 
     def test_distributed_stack_uses_separate_flower_roles_with_one_image(self) -> None:
         expected_commands = {
+            "data-prep": "python -m src.data_prep",
             "superlink": "flower-superlink",
             "serverapp": "flower-superexec",
             "dashboard": "streamlit run dashboard.py",
@@ -156,9 +157,10 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         for index in range(4):
             clientapp = service_block(self.compose, f"clientapp-{index}")
             with self.subTest(index=index):
-                self.assertIn(f"source: ./artifacts/clients/client-{index}", clientapp)
+                source = f"source: ./artifacts/.prepared-current/client/client-{index}"
+                self.assertIn(source, clientapp)
                 self.assertEqual(
-                    self.compose.count(f"source: ./artifacts/clients/client-{index}"),
+                    self.compose.count(source),
                     1,
                 )
                 self.assertIn("target: /app/client-data", clientapp)
@@ -191,7 +193,7 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         for service in consumers:
             with self.subTest(service=service):
                 self.assertIn(
-                    "./artifacts/public:/app/artifacts/public:ro",
+                    "./artifacts/.prepared-current/public:/app/artifacts/public:ro",
                     service_block(self.compose, service),
                 )
         for service in ["superlink"] + [f"supernode-{index}" for index in range(4)]:
@@ -203,8 +205,16 @@ class DistributedDeploymentContractTests(unittest.TestCase):
     def test_untouched_evaluation_artifact_is_not_exposed_to_runtime_services(
         self,
     ) -> None:
-        self.assertNotIn("artifacts/evaluation", self.compose)
-        self.assertNotIn("FML_EVALUATION_ARTIFACT_DIR", self.compose)
+        runtime_services = (
+            ["superlink", "serverapp", "dashboard"]
+            + [f"supernode-{index}" for index in range(4)]
+            + [f"clientapp-{index}" for index in range(4)]
+        )
+        for service in runtime_services:
+            with self.subTest(service=service):
+                block = service_block(self.compose, service)
+                self.assertNotIn("artifacts/evaluation", block)
+                self.assertNotIn("FML_EVALUATION_ARTIFACT_DIR", block)
 
     def test_server_outputs_have_one_writer_and_read_only_dashboard(self) -> None:
         self.assertIn(
@@ -215,6 +225,44 @@ class DistributedDeploymentContractTests(unittest.TestCase):
             "./artifacts/server:/app/artifacts/server:ro",
             service_block(self.compose, "dashboard"),
         )
+        self.assertIn(
+            "./artifacts/server:/app/artifacts/server:ro",
+            service_block(self.compose, "data-prep"),
+        )
+
+    def test_offline_container_preparation_preserves_host_paths_and_ownership(
+        self,
+    ) -> None:
+        data_prep = service_block(self.compose, "data-prep")
+        readme = Path("README.md").read_text(encoding="utf-8")
+
+        self.assertIn("profiles:\n      - prepare", data_prep)
+        self.assertIn("${FML_HOST_UID:-1000}:${FML_HOST_GID:-1000}", data_prep)
+        self.assertIn("./artifacts:/app/artifacts", data_prep)
+        self.assertIn("--client-shard-dir artifacts/clients", data_prep)
+        self.assertIn("--public-artifact-dir artifacts/public", data_prep)
+        self.assertIn("--evaluation-artifact-dir artifacts/evaluation", data_prep)
+        self.assertIn(
+            "docker compose --profile prepare run --rm --build data-prep", readme
+        )
+        self.assertIn("FML_HOST_UID", readme)
+        self.assertIn("WSL2 Linux filesystem", readme)
+        self.assertIn("not `/mnt/c/", readme)
+
+    def test_prepared_mounts_bypass_legacy_directories_and_require_recreation(
+        self,
+    ) -> None:
+        readme = Path("README.md").read_text(encoding="utf-8")
+
+        self.assertNotIn("./artifacts/public:/app/artifacts/public:ro", self.compose)
+        self.assertEqual(
+            self.compose.count(
+                "./artifacts/.prepared-current/public:/app/artifacts/public:ro"
+            ),
+            6,
+        )
+        self.assertIn("already-running containers", readme.lower())
+        self.assertIn("docker compose down", readme)
 
     def test_local_superlink_profile_uses_user_flower_config(self) -> None:
         pyproject = Path("pyproject.toml").read_text(encoding="utf-8")

@@ -21,6 +21,7 @@ from src.artifact_compatibility import (
     PUBLIC_ARTIFACT_SCHEMA_VERSION,
     canonical_json_bytes,
     read_regular_file,
+    require_secure_artifact_platform,
     sha256_file,
     write_json_atomically,
 )
@@ -41,6 +42,7 @@ from src.paths import (
     PREPARED_CURRENT_FILENAME,
     PREPARED_GENERATIONS_DIRECTORY,
     PREPARED_GENERATION_SCHEMA_VERSION,
+    PREPARED_LEGACY_DIRECTORY,
     RunArtifactLock,
     default_evaluation_artifact_dir,
     default_public_artifact_dir,
@@ -307,6 +309,31 @@ def _copy_preserved_children(source: Path, staging: Path, owned: set[str]) -> No
         )
 
 
+def _preparation_source(root: Path, artifact_kind: str) -> Path:
+    """Select a legacy directory or the active immutable generation as input.
+
+    Parameters
+    ----------
+    root : pathlib.Path
+        Validated logical preparation root.
+    artifact_kind : str
+        Prepared artifact kind selected below an active generation.
+
+    Returns
+    -------
+    pathlib.Path
+        Existing source directory, or the absent logical root for a first run.
+
+    Raises
+    ------
+    ValueError
+        If an existing logical link does not safely select the active generation.
+    """
+    if root.is_symlink():
+        return resolve_prepared_artifact_dir(root, artifact_kind)
+    return root
+
+
 def _fsync_directory(path: Path) -> None:
     """Flush one directory entry set on platforms that support it.
 
@@ -401,16 +428,49 @@ def _publish_prepared_roots(
     pointer = parent / PREPARED_CURRENT_FILENAME
     if pointer.exists() and not pointer.is_symlink():
         raise ValueError("prepared generation pointer is unsafe")
+    legacy_roots = {
+        name: root
+        for name, root in roots.items()
+        if root.exists() and not root.is_symlink()
+    }
+    for name, root in roots.items():
+        expected_alias = Path(PREPARED_CURRENT_FILENAME) / name
+        if root.is_symlink() and Path(os.readlink(root)) != expected_alias:
+            raise ValueError(f"{name} artifact root has an unsafe prepared alias")
+
+    legacy_archive: Path | None = None
+    if legacy_roots:
+        legacy_root = parent / PREPARED_LEGACY_DIRECTORY
+        if legacy_root.is_symlink() or (
+            legacy_root.exists() and not legacy_root.is_dir()
+        ):
+            raise ValueError("prepared legacy archive must be a regular directory")
+        legacy_root.mkdir(mode=0o755, exist_ok=True)
+        legacy_archive = legacy_root / generation_id
+        legacy_archive.mkdir(mode=0o700)
+        _fsync_directory(legacy_root)
+
     aliases_created: list[Path] = []
+    roots_archived: list[tuple[Path, Path]] = []
     temporary_pointer = parent / f".{PREPARED_CURRENT_FILENAME}.{uuid.uuid4().hex}.tmp"
     try:
         for name, root in roots.items():
-            if not root.exists() and not root.is_symlink():
+            if root in legacy_roots.values():
+                if legacy_archive is None:
+                    raise RuntimeError("legacy archive was not initialized")
+                archived = legacy_archive / root.name
+                os.rename(root, archived)
+                roots_archived.append((root, archived))
+            if not root.is_symlink():
                 root.symlink_to(
                     Path(PREPARED_CURRENT_FILENAME) / name,
                     target_is_directory=True,
                 )
                 aliases_created.append(root)
+        if legacy_archive is not None:
+            _fsync_directory(legacy_archive)
+            _fsync_directory(legacy_archive.parent)
+            _fsync_directory(parent)
         temporary_pointer.symlink_to(
             Path(PREPARED_GENERATIONS_DIRECTORY) / generation_id,
             target_is_directory=True,
@@ -418,8 +478,12 @@ def _publish_prepared_roots(
         os.replace(temporary_pointer, pointer)
     except BaseException:
         temporary_pointer.unlink(missing_ok=True)
-        for alias in aliases_created:
+        for alias in reversed(aliases_created):
             alias.unlink(missing_ok=True)
+        for root, archived in reversed(roots_archived):
+            os.rename(archived, root)
+        if legacy_archive is not None:
+            legacy_archive.rmdir()
         raise
     _fsync_directory(parent)
 
@@ -861,7 +925,13 @@ def prepare_all(
     Returns
     -------
     None
+
+    Raises
+    ------
+    RuntimeError
+        If direct preparation runs outside the supported Linux platform.
     """
+    require_secure_artifact_platform()
     client_dir = _preflight_output_root(
         client_shard_dir, "client", reusable=True, allow_prepared_alias=True
     )
@@ -919,8 +989,8 @@ def prepare_all(
         stages = {name: generation_stage / name for name in roots}
         stages["public"].mkdir()
         stages["client"].mkdir()
-        public_source = resolve_prepared_artifact_dir(public_dir, "public")
-        client_source = resolve_prepared_artifact_dir(client_dir, "client")
+        public_source = _preparation_source(public_dir, "public")
+        client_source = _preparation_source(client_dir, "client")
         _copy_preserved_children(
             public_source, stages["public"], {"manifest.json", "vocab.txt"}
         )
