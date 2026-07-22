@@ -19,7 +19,7 @@ federated learning system.
 ## P0 — Scientific validation
 
 - [x] Define a fixed, untouched global test set.
-- [ ] Add a centralized-training baseline.
+- [x] Add a centralized-training baseline.
 - [ ] Compare local-only, FedAvg, FedProx, and FedProx plus Huber aggregation.
 - [ ] Compare IID and multiple non-IID partition settings.
 - [ ] Run experiments with multiple random seeds and report mean and variance.
