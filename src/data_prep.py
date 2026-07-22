@@ -539,6 +539,117 @@ def _load_migration_journal(roots: Mapping[str, Path]) -> dict[str, Any] | None:
     return _validate_migration_journal(roots, journal_bytes)
 
 
+class _PreparedGenerationValidationError(ValueError):
+    """Identify recovery validation failures that must retain their journal."""
+
+
+def _validate_recovery_generation(
+    generation: Path, transaction: Mapping[str, Any]
+) -> None:
+    """Securely validate one complete journaled generation candidate.
+
+    Parameters
+    ----------
+    generation : pathlib.Path
+        Staged or final generation directory owned by the recovery journal.
+    transaction : mapping of str to Any
+        Validated canonical migration journal.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    _PreparedGenerationValidationError
+        If the index or any public, client, or evaluation artifact is incomplete,
+        corrupt, unsafe, or inconsistent.
+    """
+    try:
+        generations = generation.parent
+        if (
+            generations.is_symlink()
+            or not generations.is_dir()
+            or generation.is_symlink()
+            or not generation.is_dir()
+        ):
+            raise ValueError("prepared migration generation is unsafe")
+        canonical_generations = generations.resolve(strict=True)
+        canonical_generation = generation.resolve(strict=True)
+        if canonical_generation.parent != canonical_generations:
+            raise ValueError("prepared migration generation escapes its root")
+
+        expected_index = {
+            "schema_version": PREPARED_GENERATION_SCHEMA_VERSION,
+            "generation_id": transaction["generation_id"],
+            "logical_roots": transaction["logical_roots"],
+        }
+        index_bytes = read_regular_file(
+            generation / "index.json", parent=canonical_generation
+        )
+        if index_bytes != canonical_json_bytes(expected_index):
+            raise ValueError(
+                "prepared migration generation index differs from its journal"
+            )
+
+        protocol = load_scientific_protocol()
+        app_manifest = load_app_manifest(
+            public_artifact_dir=generation / "public", protocol=protocol
+        )
+        client_root = generation / "client"
+        if client_root.is_symlink() or not client_root.is_dir():
+            raise ValueError("prepared migration client generation is unsafe")
+        canonical_client_root = client_root.resolve(strict=True)
+        if canonical_client_root.parent != canonical_generation:
+            raise ValueError("prepared migration client generation escapes its root")
+
+        client_ids: list[int] = []
+        for child in client_root.iterdir():
+            if child.is_symlink():
+                raise ValueError("prepared migration client child is unsafe")
+            if not child.is_dir():
+                _validate_output_child(child, canonical_client_root, directory=False)
+                continue
+            prefix, separator, identifier = child.name.partition("-")
+            if (
+                prefix != "client"
+                or separator != "-"
+                or not identifier.isascii()
+                or not identifier.isdigit()
+                or str(int(identifier)) != identifier
+            ):
+                raise ValueError("prepared migration client directory is invalid")
+            client_ids.append(int(identifier))
+        client_ids.sort()
+        if client_ids != list(range(len(client_ids))) or not client_ids:
+            raise ValueError("prepared migration client generation is incomplete")
+
+        from src.local_training import load_client_shard_snapshot
+
+        identities: set[str] = set()
+        for client_id in client_ids:
+            snapshot = load_client_shard_snapshot(
+                client_root / f"client-{client_id}", app_manifest, client_id
+            )
+            shard_identities = {row[0] for row in snapshot.rows}
+            if identities & shard_identities:
+                raise ValueError("prepared migration client row identities overlap")
+            identities.update(shard_identities)
+        if identities != {
+            f"train:{index}" for index in range(app_manifest.payload["dataset"]["rows"])
+        }:
+            raise ValueError(
+                "prepared migration clients do not exactly partition the train split"
+            )
+        load_evaluation_artifact_snapshot(generation / "evaluation", protocol=protocol)
+    except _PreparedGenerationValidationError:
+        raise
+    except Exception as error:
+        raise _PreparedGenerationValidationError(
+            "prepared migration generation validation failed"
+        ) from error
+
+
 def _recover_prepared_migration(roots: Mapping[str, Path]) -> bool:
     """Finish one journaled prepared-root publication after process death.
 
@@ -570,19 +681,20 @@ def _recover_prepared_migration(roots: Mapping[str, Path]) -> bool:
     if stage_exists and generation_exists:
         raise ValueError("prepared migration has both staged and final generations")
     if stage_exists:
-        if stage.is_symlink() or not stage.is_dir():
-            raise ValueError("prepared migration stage is unsafe")
+        _validate_recovery_generation(stage, transaction)
         os.rename(stage, generation)
         _publication_checkpoint("generation:renamed")
     elif not generation_exists:
         raise ValueError("prepared migration generation data is missing")
-    if generation.is_symlink() or not generation.is_dir():
-        raise ValueError("prepared migration generation is unsafe")
+    else:
+        _validate_recovery_generation(generation, transaction)
     _fsync_directory(generations)
     _publication_checkpoint("generations:fsynced")
+    _validate_recovery_generation(generation, transaction)
 
     legacy_names = transaction["legacy_roots"]
     archive: Path | None = None
+    roots_mutated = False
     if legacy_names:
         legacy_root = parent / PREPARED_LEGACY_DIRECTORY
         if legacy_root.is_symlink() or (
@@ -615,6 +727,7 @@ def _recover_prepared_migration(roots: Mapping[str, Path]) -> bool:
                 if not root.is_dir():
                     raise ValueError(f"prepared {name} legacy root is unsafe")
                 os.rename(root, archived)
+                roots_mutated = True
                 _publication_checkpoint(f"archive:{name}:renamed")
             elif not root.is_symlink():
                 raise ValueError(f"prepared {name} legacy data is missing")
@@ -633,6 +746,7 @@ def _recover_prepared_migration(roots: Mapping[str, Path]) -> bool:
             raise ValueError(f"{name} artifact root was not archived")
         else:
             root.symlink_to(expected, target_is_directory=True)
+            roots_mutated = True
             _publication_checkpoint(f"alias:{name}:created")
         _fsync_directory(parent)
         _publication_checkpoint(f"parent:alias-{name}-fsynced")
@@ -646,6 +760,12 @@ def _recover_prepared_migration(roots: Mapping[str, Path]) -> bool:
     if current_target not in {previous_target, new_target}:
         raise ValueError("prepared generation pointer changed during migration")
     temporary_pointer = parent / f".{PREPARED_CURRENT_FILENAME}.{generation_id}.tmp"
+    try:
+        _validate_recovery_generation(generation, transaction)
+    except _PreparedGenerationValidationError:
+        if roots_mutated:
+            _rollback_prepared_migration(roots, transaction, retain_journal=True)
+        raise
     if current_target != new_target:
         if temporary_pointer.exists() or temporary_pointer.is_symlink():
             if (
@@ -658,6 +778,13 @@ def _recover_prepared_migration(roots: Mapping[str, Path]) -> bool:
             _publication_checkpoint("pointer-temporary:created")
             _fsync_directory(parent)
             _publication_checkpoint("parent:pointer-temporary-fsynced")
+        try:
+            _validate_recovery_generation(generation, transaction)
+        except _PreparedGenerationValidationError:
+            temporary_pointer.unlink(missing_ok=True)
+            if roots_mutated:
+                _rollback_prepared_migration(roots, transaction, retain_journal=True)
+            raise
         os.replace(temporary_pointer, pointer)
         _publication_checkpoint("pointer:replaced")
     else:
@@ -674,7 +801,10 @@ def _recover_prepared_migration(roots: Mapping[str, Path]) -> bool:
 
 
 def _rollback_prepared_migration(
-    roots: Mapping[str, Path], transaction: Mapping[str, Any]
+    roots: Mapping[str, Path],
+    transaction: Mapping[str, Any],
+    *,
+    retain_journal: bool = False,
 ) -> None:
     """Restore pre-transaction visibility after an in-process publication error.
 
@@ -684,6 +814,8 @@ def _rollback_prepared_migration(
         Configured logical artifact roots.
     transaction : mapping of str to Any
         Validated durable migration transaction.
+    retain_journal : bool, optional
+        Preserve the durable journal so corrected generation contents can retry.
 
     Returns
     -------
@@ -723,7 +855,8 @@ def _rollback_prepared_migration(
         if not any(archive.iterdir()):
             archive.rmdir()
             _fsync_directory(archive.parent)
-    (parent / PREPARED_MIGRATION_FILENAME).unlink(missing_ok=True)
+    if not retain_journal:
+        (parent / PREPARED_MIGRATION_FILENAME).unlink(missing_ok=True)
     _fsync_directory(parent)
 
 
@@ -805,6 +938,9 @@ def _publish_prepared_roots(
     try:
         if not _recover_prepared_migration(roots):
             raise RuntimeError("prepared migration journal disappeared")
+    except _PreparedGenerationValidationError:
+        _rollback_prepared_migration(roots, transaction, retain_journal=True)
+        raise
     except BaseException:
         _rollback_prepared_migration(roots, transaction)
         raise

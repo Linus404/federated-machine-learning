@@ -55,6 +55,22 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         expected.update(f"clientapp-{index}" for index in range(4))
         self.assertEqual(services, expected)
 
+    def test_ci_matrix_uses_protocol_environment_before_coverage_startup(
+        self,
+    ) -> None:
+        workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+        self.assertIn('python-version: ["3.11", "3.12", "3.13"]', workflow)
+        self.assertIn(
+            "uv run --env-file .env.protocol coverage run -m unittest discover -s tests -v",
+            workflow,
+        )
+        self.assertIn(
+            "uv run --env-file .env.protocol coverage report",
+            workflow,
+        )
+        self.assertNotIn("uv run coverage ", workflow)
+
     def test_host_ports_are_published_on_loopback_only(self) -> None:
         self.assertIn('"127.0.0.1:9093:9093"', service_block(self.compose, "superlink"))
         self.assertIn('"127.0.0.1:8501:8501"', service_block(self.compose, "dashboard"))

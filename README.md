@@ -60,7 +60,9 @@ adapted on that same split. It writes the official test split in ascending sourc
 order to the selected prepared generation, with stable `test:<row-index>`
 identities and a strict checksum manifest. One atomic `.prepared-current`
 switch selects the matching client, public, and evaluation directories together;
-an interruption leaves the prior generation selected. The unsupervised split is
+after an interruption, either the prior generation or the fully prepared new
+generation remains selected, depending on whether the atomic pointer replacement
+completed. The unsupervised split is
 verified and excluded. The
 generated directories simulate client-scoped
 storage only after this centralized preparation; they are not evidence that data

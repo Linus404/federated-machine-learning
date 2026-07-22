@@ -24,13 +24,17 @@ from src.data_prep import (
     _acquire_preparation_lock,
     _publish_prepared_roots,
     _recover_prepared_migration,
+    _validate_recovery_generation,
     build_vectorizer,
     main,
     package_raw_client_shards,
     prepare_all,
     publish_public_artifacts,
 )
-from src.evaluation_artifact import canonical_source_row_bytes
+from src.evaluation_artifact import (
+    canonical_source_row_bytes,
+    publish_evaluation_artifact,
+)
 from src.local_training import (
     build_model_from_manifest,
     load_client_shard,
@@ -86,6 +90,14 @@ def public_protocol(sequence_length: int = 4) -> dict[str, object]:
         Dataset and vocabulary identity matching ``write_public_artifacts``.
     """
     vocabulary = b"\n[UNK]\ngood\nbad\nmovie\n"
+    evaluation_rows = [
+        {"text": "untouched negative", "label": 0},
+        {"text": "untouched positive", "label": 1},
+    ]
+    evaluation_content = b"".join(
+        canonical_source_row_bytes(str(row["text"]), int(row["label"]))
+        for row in evaluation_rows
+    )
     return {
         "dataset": {
             "id": "example/imdb",
@@ -97,7 +109,13 @@ def public_protocol(sequence_length: int = 4) -> dict[str, object]:
                     "rows": 4,
                     "raw_parquet_sha256": "1" * 64,
                     "content_sha256": "2" * 64,
-                }
+                },
+                "test": {
+                    "rows": 2,
+                    "label_counts": [1, 1],
+                    "raw_parquet_sha256": "3" * 64,
+                    "content_sha256": hashlib.sha256(evaluation_content).hexdigest(),
+                },
             },
         },
         "preprocessing": {
@@ -112,6 +130,95 @@ def public_protocol(sequence_length: int = 4) -> dict[str, object]:
             "embedding_dimension": 100,
         },
     }
+
+
+def write_complete_prepared_stage(path: Path) -> dict[str, object]:
+    """Write one complete prepared generation candidate for recovery tests.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        New generation staging or final directory.
+
+    Returns
+    -------
+    dict of str to object
+        Frozen-protocol fixture matching every generated artifact.
+    """
+    protocol = public_protocol()
+    public = path / "public"
+    public.mkdir(parents=True)
+    manifest = write_public_artifacts(public)
+    client = path / "client"
+    client.mkdir()
+    write_client_artifacts(
+        client / "client-0",
+        manifest,
+        [
+            {"text": "bad", "label": 0},
+            {"text": "good", "label": 1},
+            {"text": "bad movie", "label": 0},
+            {"text": "good movie", "label": 1},
+        ],
+    )
+    publish_evaluation_artifact(
+        [
+            {"text": "untouched negative", "label": 0},
+            {"text": "untouched positive", "label": 1},
+        ],
+        path / "evaluation",
+        protocol=protocol,
+    )
+    return protocol
+
+
+def write_pending_prepared_recovery(
+    root: Path, *, final: bool
+) -> tuple[dict[str, Path], Path, dict[str, object]]:
+    """Create one journaled stage or final generation recovery fixture.
+
+    Parameters
+    ----------
+    root : pathlib.Path
+        Empty temporary artifact parent.
+    final : bool
+        Write the candidate under its final UUID name instead of its stage name.
+
+    Returns
+    -------
+    tuple
+        Logical roots, candidate generation path, and matching protocol fixture.
+    """
+    roots = {
+        "client": root / "clients",
+        "public": root / "public",
+        "evaluation": root / "evaluation",
+    }
+    for name, logical_root in roots.items():
+        logical_root.mkdir()
+        (logical_root / "legacy.txt").write_text(name, encoding="utf-8")
+    generation_id = "4c03285d-83b3-45d1-bc29-00a516eeef93"
+    stage_name = ".prepare-recovery.staging"
+    generations = root / ".prepared-generations"
+    candidate = generations / (generation_id if final else stage_name)
+    protocol = write_complete_prepared_stage(candidate)
+    index = {
+        "schema_version": 1,
+        "generation_id": generation_id,
+        "logical_roots": {name: roots[name].name for name in sorted(roots)},
+    }
+    (candidate / "index.json").write_bytes(canonical_json_bytes(index))
+    journal = {
+        "schema_version": 1,
+        "generation_id": generation_id,
+        "stage_name": stage_name,
+        "logical_roots": {name: roots[name].name for name in sorted(roots)},
+        "legacy_roots": sorted(roots),
+        "alias_roots": sorted(roots),
+        "previous_pointer_target": None,
+    }
+    (root / ".prepared-migration.json").write_bytes(canonical_json_bytes(journal))
+    return roots, candidate, protocol
 
 
 def write_client_artifacts(
@@ -440,6 +547,173 @@ def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> No
 
 
 class ArtifactFlowTests(unittest.TestCase):
+    def test_recovery_rejects_invalid_stage_and_final_without_visible_mutation(
+        self,
+    ) -> None:
+        mutations = {
+            "missing-index": (lambda candidate: candidate / "index.json", "missing"),
+            "corrupt-index": (lambda candidate: candidate / "index.json", "corrupt"),
+            "tampered-index": (
+                lambda candidate: candidate / "index.json",
+                "tampered",
+            ),
+            "missing-public": (
+                lambda candidate: candidate / "public" / "manifest.json",
+                "missing",
+            ),
+            "corrupt-public": (
+                lambda candidate: candidate / "public" / "vocab.txt",
+                "corrupt",
+            ),
+            "missing-client": (
+                lambda candidate: (
+                    candidate / "client" / "client-0" / "client_metadata.json"
+                ),
+                "missing",
+            ),
+            "corrupt-client": (
+                lambda candidate: candidate / "client" / "client-0" / "reviews.jsonl",
+                "corrupt",
+            ),
+            "missing-evaluation": (
+                lambda candidate: candidate / "evaluation" / "test.jsonl",
+                "missing",
+            ),
+            "corrupt-evaluation": (
+                lambda candidate: candidate / "evaluation" / "test.jsonl",
+                "corrupt",
+            ),
+        }
+        for final in (False, True):
+            for mutation, (target_for, operation) in mutations.items():
+                with (
+                    self.subTest(
+                        location="final" if final else "stage", mutation=mutation
+                    ),
+                    tempfile.TemporaryDirectory() as tmpdir,
+                ):
+                    root = Path(tmpdir)
+                    roots, candidate, protocol = write_pending_prepared_recovery(
+                        root, final=final
+                    )
+                    target = target_for(candidate)
+                    original = target.read_bytes()
+                    if operation == "missing":
+                        target.unlink()
+                    elif operation == "corrupt":
+                        target.write_bytes(b"corrupt\n")
+                    else:
+                        tampered = json.loads(original)
+                        tampered["generation_id"] = (
+                            "e9c739c6-c67e-43e5-b570-6d5f48fe09b4"
+                        )
+                        target.write_bytes(canonical_json_bytes(tampered))
+
+                    with (
+                        patch(
+                            "src.data_prep.load_scientific_protocol",
+                            return_value=protocol,
+                        ),
+                        self.assertRaisesRegex(ValueError, "generation validation"),
+                    ):
+                        _recover_prepared_migration(roots)
+
+                    self.assertTrue((root / ".prepared-migration.json").is_file())
+                    self.assertFalse((root / ".prepared-current").exists())
+                    for name, logical_root in roots.items():
+                        self.assertTrue(logical_root.is_dir())
+                        self.assertFalse(logical_root.is_symlink())
+                        self.assertEqual(
+                            (logical_root / "legacy.txt").read_text(encoding="utf-8"),
+                            name,
+                        )
+                    self.assertTrue(candidate.exists())
+
+                    target.write_bytes(original)
+                    with patch(
+                        "src.data_prep.load_scientific_protocol",
+                        return_value=protocol,
+                    ):
+                        self.assertTrue(_recover_prepared_migration(roots))
+
+                    self.assertFalse((root / ".prepared-migration.json").exists())
+                    self.assertTrue((root / ".prepared-current").is_symlink())
+                    for name, logical_root in roots.items():
+                        selected = resolve_prepared_artifact_dir(logical_root, name)
+                        self.assertEqual(
+                            selected.parent.name,
+                            "4c03285d-83b3-45d1-bc29-00a516eeef93",
+                        )
+
+    def test_recovery_revalidates_immediately_before_pointer_replacement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            roots, _, protocol = write_pending_prepared_recovery(root, final=False)
+            generation = (
+                root / ".prepared-generations" / "4c03285d-83b3-45d1-bc29-00a516eeef93"
+            )
+            calls = 0
+            original_records: bytes | None = None
+
+            def tamper_at_activation(path, transaction):
+                """Corrupt evaluation bytes at the final recovery validation.
+
+                Parameters
+                ----------
+                path : pathlib.Path
+                    Final generation path supplied by recovery.
+                transaction : mapping
+                    Validated migration journal supplied by recovery.
+
+                Returns
+                -------
+                None
+                """
+                nonlocal calls, original_records
+                calls += 1
+                if calls == 4:
+                    records = path / "evaluation" / "test.jsonl"
+                    original_records = records.read_bytes()
+                    records.write_bytes(b"tampered\n")
+                _validate_recovery_generation(path, transaction)
+
+            with (
+                patch(
+                    "src.data_prep.load_scientific_protocol",
+                    return_value=protocol,
+                ),
+                patch(
+                    "src.data_prep._validate_recovery_generation",
+                    side_effect=tamper_at_activation,
+                ),
+                self.assertRaisesRegex(ValueError, "generation validation"),
+            ):
+                _recover_prepared_migration(roots)
+
+            self.assertEqual(calls, 4)
+            self.assertIsNotNone(original_records)
+            self.assertTrue((root / ".prepared-migration.json").is_file())
+            self.assertFalse((root / ".prepared-current").exists())
+            for name, logical_root in roots.items():
+                self.assertTrue(logical_root.is_dir())
+                self.assertFalse(logical_root.is_symlink())
+                self.assertEqual(
+                    (logical_root / "legacy.txt").read_text(encoding="utf-8"),
+                    name,
+                )
+
+            (generation / "evaluation" / "test.jsonl").write_bytes(original_records)
+            with patch(
+                "src.data_prep.load_scientific_protocol",
+                return_value=protocol,
+            ):
+                self.assertTrue(_recover_prepared_migration(roots))
+
+            self.assertTrue((root / ".prepared-current").is_symlink())
+            self.assertFalse((root / ".prepared-migration.json").exists())
+
     def test_frozen_standardizer_matches_producer_and_every_consumer(self) -> None:
         import keras
         import tensorflow as tf
@@ -797,18 +1071,19 @@ class ArtifactFlowTests(unittest.TestCase):
             generations = root / ".prepared-generations"
             generation_stage = generations / ".prepare-integration.staging"
             stages = {kind: generation_stage / kind for kind in roots}
-            for kind, stage in stages.items():
-                stage.mkdir(parents=True, exist_ok=True)
+            protocol = write_complete_prepared_stage(generation_stage)
+            for kind in ("client", "public"):
+                stage = stages[kind]
                 (stage / "selected.txt").write_text(
                     f"generation-{kind}", encoding="utf-8"
                 )
-            (stages["client"] / "client-0").mkdir()
-            (stages["client"] / "client-0" / "shard.txt").write_text(
-                "generation-client-0", encoding="utf-8"
-            )
 
             try:
-                _publish_prepared_roots(roots, stages)
+                with patch(
+                    "src.data_prep.load_scientific_protocol",
+                    return_value=protocol,
+                ):
+                    _publish_prepared_roots(roots, stages)
 
                 selected_public = resolve_prepared_artifact_dir(
                     roots["public"], "public"
@@ -821,10 +1096,8 @@ class ArtifactFlowTests(unittest.TestCase):
                     "generation-public",
                 )
                 self.assertEqual(
-                    (selected_client / "client-0" / "shard.txt").read_text(
-                        encoding="utf-8"
-                    ),
-                    "generation-client-0",
+                    (selected_client / "selected.txt").read_text(encoding="utf-8"),
+                    "generation-client",
                 )
 
                 compose = Path("compose.yaml").read_text(encoding="utf-8")
@@ -845,8 +1118,8 @@ class ArtifactFlowTests(unittest.TestCase):
                     "generation-public",
                 )
                 self.assertEqual(
-                    (deployment_client / "shard.txt").read_text(encoding="utf-8"),
-                    "generation-client-0",
+                    (deployment_client / "reviews.jsonl").read_bytes(),
+                    (selected_client / "client-0" / "reviews.jsonl").read_bytes(),
                 )
 
                 archive = next((root / ".prepared-legacy").iterdir())
@@ -907,11 +1180,10 @@ class ArtifactFlowTests(unittest.TestCase):
             generations = root / ".prepared-generations"
             stage_root = generations / ".prepare-rollback.staging"
             stages = {kind: stage_root / kind for kind in roots}
+            protocol = write_complete_prepared_stage(stage_root)
             for kind, logical_root in roots.items():
                 logical_root.mkdir()
                 (logical_root / "legacy.txt").write_text(kind, encoding="utf-8")
-                stages[kind].mkdir(parents=True, exist_ok=True)
-                (stages[kind] / "new.txt").write_text(kind, encoding="utf-8")
 
             original_replace = os.replace
 
@@ -921,6 +1193,10 @@ class ArtifactFlowTests(unittest.TestCase):
                 original_replace(source, destination)
 
             with (
+                patch(
+                    "src.data_prep.load_scientific_protocol",
+                    return_value=protocol,
+                ),
                 patch("src.data_prep.os.replace", side_effect=reject_pointer),
                 self.assertRaisesRegex(OSError, "pointer failure"),
             ):
@@ -973,6 +1249,7 @@ class ArtifactFlowTests(unittest.TestCase):
         child_code = textwrap.dedent(
             """
             import os
+            import json
             import sys
             from pathlib import Path
 
@@ -987,6 +1264,8 @@ class ArtifactFlowTests(unittest.TestCase):
             }
             stage = root / ".prepared-generations" / ".prepare-crash.staging"
             stages = {name: stage / name for name in roots}
+            protocol = json.loads((root / "protocol.json").read_text(encoding="utf-8"))
+            data_prep.load_scientific_protocol = lambda: protocol
 
             def crash_at(value):
                 if value == phase:
@@ -1006,10 +1285,14 @@ class ArtifactFlowTests(unittest.TestCase):
                     "evaluation": root / "evaluation",
                 }
                 stage = root / ".prepared-generations" / ".prepare-crash.staging"
+                protocol = write_complete_prepared_stage(stage)
+                (root / "protocol.json").write_text(
+                    json.dumps(protocol), encoding="utf-8"
+                )
                 for name, logical_root in roots.items():
                     logical_root.mkdir()
                     (logical_root / "legacy.txt").write_text(name, encoding="utf-8")
-                    (stage / name).mkdir(parents=True)
+                for name in ("client", "public"):
                     (stage / name / "new.txt").write_text(name, encoding="utf-8")
 
                 completed = subprocess.run(
@@ -1021,12 +1304,20 @@ class ArtifactFlowTests(unittest.TestCase):
                 )
 
                 self.assertEqual(completed.returncode, 91, completed.stderr)
-                _recover_prepared_migration(roots)
+                with patch(
+                    "src.data_prep.load_scientific_protocol",
+                    return_value=protocol,
+                ):
+                    _recover_prepared_migration(roots)
                 for name, logical_root in roots.items():
                     selected = resolve_prepared_artifact_dir(logical_root, name)
-                    self.assertEqual(
-                        (selected / "new.txt").read_text(encoding="utf-8"), name
-                    )
+                    if name == "evaluation":
+                        self.assertTrue((selected / "manifest.json").is_file())
+                    else:
+                        self.assertEqual(
+                            (selected / "new.txt").read_text(encoding="utf-8"),
+                            name,
+                        )
                 archive = next((root / ".prepared-legacy").iterdir())
                 for name, logical_root in roots.items():
                     self.assertEqual(
@@ -1045,13 +1336,15 @@ class ArtifactFlowTests(unittest.TestCase):
                 "evaluation": root / "evaluation",
             }
             stage = root / ".prepared-generations" / ".prepare-retry.staging"
+            protocol = write_complete_prepared_stage(stage)
+            (root / "protocol.json").write_text(json.dumps(protocol), encoding="utf-8")
             for name, logical_root in roots.items():
                 logical_root.mkdir()
                 (logical_root / "legacy.txt").write_text(name, encoding="utf-8")
-                (stage / name).mkdir(parents=True)
-                (stage / name / "new.txt").write_text(name, encoding="utf-8")
+            (stage / "public" / "new.txt").write_text("public", encoding="utf-8")
             child_code = textwrap.dedent(
                 """
+                import json
                 import os
                 import sys
                 from pathlib import Path
@@ -1066,6 +1359,8 @@ class ArtifactFlowTests(unittest.TestCase):
                 }
                 stage = root / ".prepared-generations" / ".prepare-retry.staging"
                 stages = {name: stage / name for name in roots}
+                protocol = json.loads((root / "protocol.json").read_text(encoding="utf-8"))
+                data_prep.load_scientific_protocol = lambda: protocol
 
                 def crash_at(value):
                     if value == "archive:client:renamed":
@@ -1085,6 +1380,10 @@ class ArtifactFlowTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 92, completed.stderr)
 
             with (
+                patch(
+                    "src.data_prep.load_scientific_protocol",
+                    return_value=protocol,
+                ),
                 patch("src.data_prep._validated_frameworks") as frameworks,
                 patch("src.data_prep.load_verified_imdb_dataset") as load_dataset,
             ):
