@@ -206,6 +206,137 @@ def rewrite_current_artifact_manifest(root: Path, run_dir: Path) -> None:
 
 
 class ArtifactHistoryTests(unittest.TestCase):
+    def test_completed_loaders_retain_required_files_through_final_selection(
+        self,
+    ) -> None:
+        """Reject exact and invalid model replacement at every final boundary."""
+        from src import app_manifest as app_manifest_module
+        from src import artifact_compatibility, artifact_history
+
+        for loader_name in ("current", "historical"):
+            boundaries = [
+                "artifact read",
+                "public validation",
+                "provenance",
+                "return",
+            ]
+            if loader_name == "current":
+                boundaries.append("current pointer")
+            for boundary in boundaries:
+                for replacement_kind in ("exact", "invalid"):
+                    with (
+                        self.subTest(
+                            loader=loader_name,
+                            boundary=boundary,
+                            replacement_kind=replacement_kind,
+                        ),
+                        tempfile.TemporaryDirectory() as tmpdir,
+                    ):
+                        root = Path(tmpdir) / "root"
+                        root.mkdir()
+                        run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+                        publish_completed_run(root, run)
+                        model = run / "global_model.keras"
+                        replacement = Path(tmpdir) / "replacement.keras"
+                        replacement.write_bytes(
+                            model.read_bytes()
+                            if replacement_kind == "exact"
+                            else b"invalid replacement"
+                        )
+                        parked = Path(tmpdir) / "parked.keras"
+                        replaced = False
+                        pointer_reads = 0
+                        real_read = artifact_compatibility.read_regular_file_snapshot_at
+                        real_public = app_manifest_module.validate_app_manifest_bytes
+                        real_provenance = (
+                            artifact_compatibility._validate_completed_run_provenance
+                        )
+                        real_freeze = artifact_compatibility.deep_freeze
+                        real_pointer = artifact_history._load_current_index_at
+                        descriptor_baseline = len(os.listdir("/proc/self/fd"))
+
+                        def replace() -> None:
+                            nonlocal replaced
+                            if replaced:
+                                return
+                            replaced = True
+                            model.replace(parked)
+                            replacement.replace(model)
+
+                        def replace_after_read(*args, **kwargs):
+                            result = real_read(*args, **kwargs)
+                            if boundary == "artifact read" and args[1] == model.name:
+                                replace()
+                            return result
+
+                        def replace_after_public(*args, **kwargs):
+                            result = real_public(*args, **kwargs)
+                            if boundary == "public validation":
+                                replace()
+                            return result
+
+                        def replace_after_provenance(*args, **kwargs):
+                            result = real_provenance(*args, **kwargs)
+                            if boundary == "provenance":
+                                replace()
+                            return result
+
+                        def replace_before_return(value):
+                            result = real_freeze(value)
+                            if boundary == "return":
+                                replace()
+                            return result
+
+                        def replace_at_pointer_recheck(*args, **kwargs):
+                            nonlocal pointer_reads
+                            result = real_pointer(*args, **kwargs)
+                            pointer_reads += 1
+                            if boundary == "current pointer" and pointer_reads == 2:
+                                replace()
+                            return result
+
+                        loader = (
+                            load_current_run_snapshot
+                            if loader_name == "current"
+                            else load_server_artifact_snapshot
+                        )
+                        with (
+                            patch.object(
+                                artifact_compatibility,
+                                "read_regular_file_snapshot_at",
+                                side_effect=replace_after_read,
+                            ),
+                            patch.object(
+                                app_manifest_module,
+                                "validate_app_manifest_bytes",
+                                side_effect=replace_after_public,
+                            ),
+                            patch.object(
+                                artifact_compatibility,
+                                "_validate_completed_run_provenance",
+                                side_effect=replace_after_provenance,
+                            ),
+                            patch.object(
+                                artifact_compatibility,
+                                "deep_freeze",
+                                side_effect=replace_before_return,
+                            ),
+                            patch.object(
+                                artifact_history,
+                                "_load_current_index_at",
+                                side_effect=replace_at_pointer_recheck,
+                            ),
+                            self.assertRaisesRegex(
+                                ValueError, "changed while retained"
+                            ),
+                        ):
+                            loader(root if loader_name == "current" else run)
+
+                        self.assertTrue(replaced)
+                        self.assertEqual(
+                            len(os.listdir("/proc/self/fd")), descriptor_baseline
+                        )
+
     def test_completed_loaders_retain_every_selected_directory_edge(self) -> None:
         """Reject exact replacements across reads, public checks, provenance, and return."""
         from src import app_manifest as app_manifest_module
@@ -2415,6 +2546,91 @@ with patch("src.app_manifest.load_scientific_protocol", return_value=_TEST_PROTO
                 expected = [oldest.resolve()] if failure == "runs fsync" else []
                 self.assertEqual(prune_run_history(root, 1), expected)
                 self.assertFalse(state_path.exists())
+
+    def test_pruning_retries_private_partial_tombstones_without_public_restore(
+        self,
+    ) -> None:
+        """Keep a partial run private, preserve replacements, and finish on retry."""
+        from src import artifact_compatibility
+
+        for install_replacement in (False, True):
+            with (
+                self.subTest(install_replacement=install_replacement),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                oldest = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+                current = create_run(root, RUN_IDS[1], "2026-01-02T00:00:00Z")
+                publish_completed_run(root, oldest)
+                publish_completed_run(root, current)
+                real_unlink = artifact_compatibility.os.unlink
+                failed = False
+
+                def fail_after_detachment(name, *args, **kwargs):
+                    nonlocal failed
+                    if not failed and str(name).endswith(".deleting"):
+                        failed = True
+                        if install_replacement:
+                            oldest.mkdir()
+                            (oldest / "replacement").write_bytes(b"replacement")
+                        raise OSError("injected partial prune failure")
+                    return real_unlink(name, *args, **kwargs)
+
+                with (
+                    patch.object(
+                        artifact_compatibility.os,
+                        "unlink",
+                        side_effect=fail_after_detachment,
+                    ),
+                    self.assertRaisesRegex(OSError, "partial prune failure"),
+                ):
+                    prune_run_history(root, 1)
+
+                self.assertEqual(oldest.exists(), install_replacement)
+                tombstones = list((root / "runs").glob(f".{RUN_IDS[0]}.*.deleting"))
+                self.assertEqual(len(tombstones), 1)
+                self.assertTrue((root / f".{RUN_IDS[0]}.finalize.state").is_file())
+                self.assertTrue((root / f".{RUN_IDS[0]}.prune.state").is_file())
+
+                self.assertEqual(prune_run_history(root, 1), [oldest.resolve()])
+                self.assertFalse(tombstones[0].exists())
+                self.assertFalse((root / f".{RUN_IDS[0]}.finalize.state").exists())
+                self.assertFalse((root / f".{RUN_IDS[0]}.prune.state").exists())
+                if install_replacement:
+                    self.assertEqual(
+                        (oldest / "replacement").read_bytes(), b"replacement"
+                    )
+                else:
+                    self.assertFalse(oldest.exists())
+
+    def test_pruning_binds_tombstone_ownership_and_preserves_collisions(self) -> None:
+        """Never consume an unbound deletion-name collision during prune or retry."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            oldest = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            current = create_run(root, RUN_IDS[1], "2026-01-02T00:00:00Z")
+            publish_completed_run(root, oldest)
+            publish_completed_run(root, current)
+            identity = oldest.stat()
+            tombstone = (
+                root
+                / "runs"
+                / f".{RUN_IDS[0]}.{identity.st_dev:x}-{identity.st_ino:x}.deleting"
+            )
+            tombstone.mkdir()
+            (tombstone / "collision").write_bytes(b"collision")
+
+            with self.assertRaises(ValueError):
+                prune_run_history(root, 1)
+
+            self.assertTrue(oldest.is_dir())
+            self.assertEqual((tombstone / "collision").read_bytes(), b"collision")
+            self.assertTrue((root / f".{RUN_IDS[0]}.prune.state").is_file())
+            shutil.rmtree(tombstone)
+
+            self.assertEqual(prune_run_history(root, 1), [oldest.resolve()])
+            self.assertFalse(oldest.exists())
+            self.assertFalse((root / f".{RUN_IDS[0]}.prune.state").exists())
 
     def test_pruning_rejects_every_detached_artifact_root_ancestor(self) -> None:
         """Never delete a run after any higher root ancestor is replaced."""

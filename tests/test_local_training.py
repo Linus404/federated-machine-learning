@@ -1,5 +1,7 @@
 import argparse
 import hashlib
+import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,7 +13,11 @@ from src.artifact_compatibility import (
     PUBLIC_ARTIFACT_SCHEMA_VERSION,
     canonical_json_bytes,
 )
-from tests.test_artifact_flow import write_client_artifacts
+from tests.test_artifact_flow import (
+    public_protocol,
+    write_client_artifacts,
+    write_public_artifacts,
+)
 from src.artifact_history import resolve_current_run_dir
 from src.local_training import (
     DEFAULT_VALIDATION_SEED,
@@ -25,6 +31,135 @@ from src.run_provenance import (
 
 
 class LocalTrainingTests(unittest.TestCase):
+    def test_public_loader_rejects_exact_ancestor_and_inventory_replacements(
+        self,
+    ) -> None:
+        """Retain the full public chain and exact two-file inventory to return."""
+        from src import app_manifest
+
+        for component in ("ancestor", "directory"):
+            for replacement_kind in ("exact", "extra", "missing", "changed"):
+                with (
+                    self.subTest(
+                        component=component,
+                        replacement_kind=replacement_kind,
+                    ),
+                    tempfile.TemporaryDirectory() as tmpdir,
+                ):
+                    root = Path(tmpdir)
+                    outer = root / "outer"
+                    public = outer / "public"
+                    public.mkdir(parents=True)
+                    write_public_artifacts(public)
+                    selected = outer if component == "ancestor" else public
+                    replacement = root / "replacement"
+                    shutil.copytree(selected, replacement)
+                    replacement_public = (
+                        replacement / "public"
+                        if component == "ancestor"
+                        else replacement
+                    )
+                    if replacement_kind == "extra":
+                        (replacement_public / "unexpected.bin").write_bytes(b"extra")
+                    elif replacement_kind == "missing":
+                        (replacement_public / "vocab.txt").unlink()
+                    elif replacement_kind == "changed":
+                        (replacement_public / "vocab.txt").write_bytes(b"changed")
+                    parked = root / "parked"
+                    real_validate = app_manifest.validate_app_manifest_bytes
+                    descriptor_baseline = len(os.listdir("/proc/self/fd"))
+
+                    def replace_after_validation(*args, **kwargs):
+                        result = real_validate(*args, **kwargs)
+                        selected.rename(parked)
+                        replacement.rename(selected)
+                        return result
+
+                    with (
+                        patch.object(
+                            app_manifest,
+                            "validate_app_manifest_bytes",
+                            side_effect=replace_after_validation,
+                        ),
+                        self.assertRaisesRegex(ValueError, "chain changed"),
+                    ):
+                        load_app_manifest(
+                            public_artifact_dir=public,
+                            protocol=public_protocol(),
+                        )
+
+                    self.assertEqual(
+                        len(os.listdir("/proc/self/fd")), descriptor_baseline
+                    )
+
+    def test_client_loader_rejects_exact_ancestor_and_inventory_replacements(
+        self,
+    ) -> None:
+        """Retain the full private-shard chain and exact inventory to return."""
+        from src import local_training
+
+        for component in ("ancestor", "directory"):
+            for replacement_kind in ("exact", "extra", "missing", "changed"):
+                with (
+                    self.subTest(
+                        component=component,
+                        replacement_kind=replacement_kind,
+                    ),
+                    tempfile.TemporaryDirectory() as tmpdir,
+                ):
+                    root = Path(tmpdir)
+                    public = root / "public"
+                    public.mkdir()
+                    manifest = write_public_artifacts(public)
+                    outer = root / "outer"
+                    shard = outer / "clients" / "client-0"
+                    shard.parent.mkdir(parents=True)
+                    write_client_artifacts(
+                        shard,
+                        manifest,
+                        [
+                            {"text": "bad", "label": 0},
+                            {"text": "good", "label": 1},
+                        ],
+                    )
+                    selected = outer if component == "ancestor" else shard
+                    replacement = root / "replacement"
+                    shutil.copytree(selected, replacement)
+                    replacement_shard = (
+                        replacement / "clients" / "client-0"
+                        if component == "ancestor"
+                        else replacement
+                    )
+                    if replacement_kind == "extra":
+                        (replacement_shard / "unexpected.bin").write_bytes(b"extra")
+                    elif replacement_kind == "missing":
+                        (replacement_shard / "reviews.jsonl").unlink()
+                    elif replacement_kind == "changed":
+                        (replacement_shard / "reviews.jsonl").write_bytes(b"changed")
+                    parked = root / "parked"
+                    real_freeze = local_training.deep_freeze
+                    descriptor_baseline = len(os.listdir("/proc/self/fd"))
+
+                    def replace_before_return(value):
+                        result = real_freeze(value)
+                        selected.rename(parked)
+                        replacement.rename(selected)
+                        return result
+
+                    with (
+                        patch.object(
+                            local_training,
+                            "deep_freeze",
+                            side_effect=replace_before_return,
+                        ),
+                        self.assertRaisesRegex(ValueError, "chain changed"),
+                    ):
+                        load_client_shard_snapshot(shard, manifest, 0)
+
+                    self.assertEqual(
+                        len(os.listdir("/proc/self/fd")), descriptor_baseline
+                    )
+
     def test_train_binds_validated_private_shard_in_immutable_run_manifest(
         self,
     ) -> None:

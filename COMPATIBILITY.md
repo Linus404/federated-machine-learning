@@ -165,7 +165,10 @@ the root, but protects recoverable pending or malformed state and its run. A fai
 deletion leaves its state untouched. Recursive deletion first detaches only the name
 that still selects the retained inode, traverses from retained descriptors without
 following links, flushes child removals before parent removal, and never deletes a
-replacement installed at the public name.
+replacement installed at the public name. Once child removal begins, failure leaves
+only an inode-bound private deletion tombstone; the next prune under the same retained
+root lock finishes that tombstone before removing finalization and pruning state, and
+never restores a partial tree to the public run name.
 
 For a schema change, update the producer, every shared loader, rejection and
 acceptance tests, this policy, and the schema constant in the same pull request.

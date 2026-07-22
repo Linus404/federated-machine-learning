@@ -231,10 +231,10 @@ class ArtifactCompatibilityTests(unittest.TestCase):
                 b"replacement",
             )
 
-    def test_retained_recursive_removal_restores_partial_failure_for_retry(
+    def test_retained_recursive_removal_keeps_partial_failure_private_for_retry(
         self,
     ) -> None:
-        """Restore a detached entry after failure so the same retained tree can retry."""
+        """Keep a partial tree private and finish it without restoring its name."""
         from src import artifact_compatibility
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -268,8 +268,11 @@ class ArtifactCompatibilityTests(unittest.TestCase):
                         self.assertRaisesRegex(OSError, "unlink failure"),
                     ):
                         chain.remove_child_tree("target", descriptor)
-                    self.assertEqual((target / "file").read_bytes(), b"owned")
-                    chain.remove_child_tree("target", descriptor)
+                    self.assertFalse(target.exists())
+                    tombstones = list(parent.glob("*.deleting"))
+                    self.assertEqual(len(tombstones), 1)
+                    self.assertEqual((tombstones[0] / "file").read_bytes(), b"owned")
+                    chain.remove_detached_child_tree(tombstones[0].name, descriptor)
                 finally:
                     os.close(descriptor)
 

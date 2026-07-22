@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import hmac
 import os
 import stat
 import uuid
@@ -31,7 +30,6 @@ from src.artifact_compatibility import (
     load_server_artifact_snapshot,
     read_regular_file,
     read_regular_file_snapshot,
-    read_regular_file_snapshot_at,
     require_secure_artifact_platform,
     sha256_bytes,
     strict_json_loads,
@@ -51,6 +49,7 @@ DEFAULT_ARTIFACT_RETENTION_RUNS = 10
 _PUBLICATION_PENDING = "pending"
 _PUBLICATION_COMPLETE = "complete"
 _FINALIZATION_STATE_SCHEMA_VERSION = 1
+_PRUNE_STATE_SCHEMA_VERSION = 1
 _TEMPORARY_NAME_ATTEMPTS = 128
 _ACTIVE_HISTORY_CHAIN: ContextVar[RetainedDirectoryChain | None] = ContextVar(
     "active_history_chain", default=None
@@ -706,6 +705,32 @@ class _FinalizationState:
         return _FinalizationState(_PUBLICATION_COMPLETE, self.candidate, self.previous)
 
 
+@dataclass(frozen=True)
+class _PruneState:
+    """Durably bind one run deletion tombstone to its original inode."""
+
+    run_id: str
+    tombstone_name: str
+    device: int
+    inode: int
+
+    def payload(self) -> Mapping[str, Any]:
+        """Return the exact-schema JSON representation.
+
+        Returns
+        -------
+        collections.abc.Mapping
+            Canonical pruning-state payload.
+        """
+        return {
+            "schema_version": _PRUNE_STATE_SCHEMA_VERSION,
+            "run_id": self.run_id,
+            "tombstone_name": self.tombstone_name,
+            "device": self.device,
+            "inode": self.inode,
+        }
+
+
 @contextmanager
 def _finalization_lock(
     root_descriptor: int,
@@ -1105,6 +1130,152 @@ def _finalization_state_run_id(name: str) -> str | None:
     if parsed.version != 4 or str(parsed) != run_id:
         return None
     return run_id
+
+
+def _prune_state_name(run_id: str) -> str:
+    """Return the direct-child pruning-state filename for one run.
+
+    Parameters
+    ----------
+    run_id : str
+        Canonical run identity.
+
+    Returns
+    -------
+    str
+        Per-run pruning-state filename.
+    """
+    return f".{run_id}.prune.state"
+
+
+def _prune_state_run_id(name: str) -> str | None:
+    """Return the canonical UUID4 encoded by a pruning-state filename.
+
+    Parameters
+    ----------
+    name : str
+        Direct artifact-root entry name.
+
+    Returns
+    -------
+    str or None
+        Canonical run identity, or ``None`` for unrelated names.
+    """
+    suffix = ".prune.state"
+    if not name.startswith(".") or not name.endswith(suffix):
+        return None
+    run_id = name[1 : -len(suffix)]
+    try:
+        parsed = uuid.UUID(run_id)
+    except ValueError:
+        return None
+    return run_id if parsed.version == 4 and str(parsed) == run_id else None
+
+
+def _deletion_tombstone_name(run_id: str, device: int, inode: int) -> str:
+    """Return the recognizable tombstone bound to one retained run inode.
+
+    Parameters
+    ----------
+    run_id : str
+        Canonical run identity.
+    device : int
+        Retained filesystem device.
+    inode : int
+        Retained filesystem inode.
+
+    Returns
+    -------
+    str
+        Descriptor-relative private deletion name.
+    """
+    return f".{run_id}.{device:x}-{inode:x}.deleting"
+
+
+def _parse_prune_state(document: bytes) -> _PruneState:
+    """Parse strict canonical pruning state and its inode binding.
+
+    Parameters
+    ----------
+    document : bytes
+        Exact state-file bytes.
+
+    Returns
+    -------
+    _PruneState
+        Validated durable deletion state.
+
+    Raises
+    ------
+    ValueError
+        If syntax, canonical encoding, identity, or fields are invalid.
+    """
+    payload = strict_json_loads(document, source="run pruning state")
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload)
+        != {"schema_version", "run_id", "tombstone_name", "device", "inode"}
+        or type(payload["schema_version"]) is not int
+        or payload["schema_version"] != _PRUNE_STATE_SCHEMA_VERSION
+        or type(payload["device"]) is not int
+        or payload["device"] < 0
+        or type(payload["inode"]) is not int
+        or payload["inode"] < 1
+        or canonical_json_bytes(payload) != document
+    ):
+        raise ValueError("run pruning state is unsafe")
+    run_id = payload["run_id"]
+    if (
+        not isinstance(run_id, str)
+        or _prune_state_run_id(_prune_state_name(run_id)) != run_id
+    ):
+        raise ValueError("run pruning state is unsafe")
+    tombstone = payload["tombstone_name"]
+    if tombstone != _deletion_tombstone_name(
+        run_id, payload["device"], payload["inode"]
+    ):
+        raise ValueError("run pruning state is unsafe")
+    return _PruneState(
+        run_id,
+        str(tombstone),
+        payload["device"],
+        payload["inode"],
+    )
+
+
+def _load_prune_state_at(
+    root_descriptor: int, run_id: str
+) -> tuple[_PruneState, bytes] | None:
+    """Load one no-follow, single-link, private pruning-state file.
+
+    Parameters
+    ----------
+    root_descriptor : int
+        Retained artifact-root descriptor.
+    run_id : str
+        Canonical run identity.
+
+    Returns
+    -------
+    tuple of _PruneState and bytes or None
+        Validated state and exact bytes, or ``None`` when absent.
+    """
+    name = _prune_state_name(run_id)
+    try:
+        retained = _open_retained_file(root_descriptor, name)
+    except ValueError as error:
+        try:
+            os.stat(name, dir_fd=root_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        raise ValueError("run pruning state is unsafe") from error
+    try:
+        if stat.S_IMODE(os.fstat(retained.descriptor).st_mode) != 0o600:
+            raise ValueError("run pruning state is unsafe")
+        document = retained.snapshot.content
+        return _parse_prune_state(document), document
+    finally:
+        os.close(retained.descriptor)
 
 
 def _load_finalization_state_at(
@@ -1648,18 +1819,22 @@ def load_current_run_snapshot(
         current_record = _load_current_index_at(root, root_chain.directory.descriptor)
         root_chain.verify()
         if current_record is None:
-            snapshot = load_server_artifact_snapshot(
+
+            def verify_legacy_selection() -> None:
+                """Require the legacy layout to remain unselected through return."""
+                if (
+                    _load_current_index_at(root, root_chain.directory.descriptor)
+                    is not None
+                ):
+                    raise ValueError("current-run index changed while loading")
+                root_chain.verify()
+
+            return load_server_artifact_snapshot(
                 root,
                 app_manifest=app_manifest,
                 _retained_chain=root_chain,
+                _final_check=verify_legacy_selection,
             )
-            if (
-                _load_current_index_at(root, root_chain.directory.descriptor)
-                is not None
-            ):
-                raise ValueError("current-run index changed while loading")
-            root_chain.verify()
-            return snapshot
 
         index, index_bytes = current_record
         run_dir = runs_root / str(index["run_id"])
@@ -1669,36 +1844,23 @@ def load_current_run_snapshot(
         )
         with run_chain:
             root_chain.verify()
-            manifest_path = run_dir / SERVER_ARTIFACT_MANIFEST_FILENAME
-            try:
-                manifest_bytes = read_regular_file_snapshot_at(
-                    run_chain.directory.descriptor,
-                    SERVER_ARTIFACT_MANIFEST_FILENAME,
-                ).content
-            except ValueError as error:
-                raise ValueError(
-                    f"current run artifact manifest is missing or unsafe: {manifest_path}"
-                ) from error
-            run_chain.verify()
-            if not hmac.compare_digest(
-                sha256_bytes(manifest_bytes), index["artifact_manifest_checksum"]
-            ):
-                raise ValueError(
-                    "current-run artifact manifest checksum does not match"
-                )
-            snapshot = load_server_artifact_snapshot(
+
+            def verify_current_selection() -> None:
+                """Recheck the selected pointer before retained files return."""
+                run_chain.verify()
+                current = _load_current_index_at(root, root_chain.directory.descriptor)
+                if current is None or current[1] != index_bytes:
+                    raise ValueError("current-run index changed while loading")
+                root_chain.verify()
+                run_chain.verify()
+
+            return load_server_artifact_snapshot(
                 run_dir,
-                manifest_bytes=manifest_bytes,
                 app_manifest=app_manifest,
                 _retained_chain=run_chain,
+                _manifest_checksum=str(index["artifact_manifest_checksum"]),
+                _final_check=verify_current_selection,
             )
-            run_chain.verify()
-            current = _load_current_index_at(root, root_chain.directory.descriptor)
-            if current is None or current[1] != index_bytes:
-                raise ValueError("current-run index changed while loading")
-            root_chain.verify()
-            run_chain.verify()
-            return snapshot
 
 
 def publish_completed_run(
@@ -2006,7 +2168,7 @@ def publish_completed_run(
 
 def _state_allows_prune(
     root_descriptor: int, run_id: str, current_bytes: bytes
-) -> tuple[bool, bool]:
+) -> bool:
     """Classify whether a run and its finalization state may be pruned.
 
     Parameters
@@ -2020,22 +2182,310 @@ def _state_allows_prune(
 
     Returns
     -------
-    tuple of bool and bool
-        Whether the run may be pruned and whether its state must then be removed.
+    bool
+        Whether the run may be pruned.
     """
     try:
         state_record = _load_finalization_state_at(root_descriptor, run_id)
     except ValueError:
-        return False, False
+        return False
     if state_record is None:
-        return True, False
+        return True
     state = state_record[0]
     if state.status == _PUBLICATION_COMPLETE:
-        return True, True
+        return True
     previous_bytes = None if state.previous is None else state.previous.content
     if current_bytes in {state.candidate.content, previous_bytes}:
-        return False, False
-    return True, True
+        return False
+    return True
+
+
+def _record_prune_state(
+    root: _RetainedDirectory,
+    state: _PruneState,
+    *,
+    chain: RetainedDirectoryChain,
+) -> None:
+    """Durably install one exact inode-bound pruning state before detachment.
+
+    Parameters
+    ----------
+    root : _RetainedDirectory
+        Retained artifact root owning private state.
+    state : _PruneState
+        Exact run identity, tombstone name, and inode binding.
+    chain : RetainedDirectoryChain
+        Complete visible root-to-runs chain.
+
+    Returns
+    -------
+    None
+    """
+    chain.verify()
+    document = canonical_json_bytes(state.payload())
+    existing = _load_prune_state_at(root.descriptor, state.run_id)
+    if existing is not None:
+        if existing != (state, document):
+            raise ValueError("run pruning state is unsafe")
+        return
+    _replace_bytes_at(
+        root.descriptor,
+        _prune_state_name(state.run_id),
+        document,
+        mode=0o600,
+        chain=chain,
+    )
+    _sync_visible_directory(root, chain)
+    if _load_prune_state_at(root.descriptor, state.run_id) != (state, document):
+        raise ValueError("run pruning state changed during pruning")
+    chain.verify()
+
+
+def _remove_prune_state(
+    root: _RetainedDirectory,
+    state: _PruneState,
+    *,
+    chain: RetainedDirectoryChain,
+) -> None:
+    """Durably remove one exact pruning state after deletion completion.
+
+    Parameters
+    ----------
+    root : _RetainedDirectory
+        Retained artifact root owning private state.
+    state : _PruneState
+        Exact completed deletion state.
+    chain : RetainedDirectoryChain
+        Complete visible root-to-runs chain.
+
+    Returns
+    -------
+    None
+    """
+    record = _load_prune_state_at(root.descriptor, state.run_id)
+    if record is None:
+        return
+    persisted, document = record
+    if persisted != state:
+        raise ValueError("run pruning state changed during pruning")
+    name = _prune_state_name(state.run_id)
+    retained = _open_retained_file(root.descriptor, name)
+    removed = False
+    try:
+        chain.verify()
+        if retained.snapshot.content != document or not _unlink_retained_file_entry(
+            root.descriptor,
+            name,
+            retained,
+            document,
+        ):
+            raise ValueError("run pruning state changed during pruning")
+        removed = True
+        _sync_visible_directory(root, chain)
+    except BaseException:
+        chain.verify()
+        if removed:
+            try:
+                os.stat(name, dir_fd=root.descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                _replace_bytes_at(
+                    root.descriptor,
+                    name,
+                    document,
+                    mode=0o600,
+                    chain=chain,
+                )
+                try:
+                    _sync_visible_directory(root, chain)
+                except OSError:
+                    pass
+        raise
+    finally:
+        os.close(retained.descriptor)
+
+
+def _open_prune_directory(
+    parent_descriptor: int,
+    name: str,
+    state: _PruneState,
+) -> int:
+    """Open one deletion entry only when it matches durable pruning state.
+
+    Parameters
+    ----------
+    parent_descriptor : int
+        Retained runs-directory descriptor.
+    name : str
+        Public run or private tombstone name.
+    state : _PruneState
+        Expected device and inode binding.
+
+    Returns
+    -------
+    int
+        Caller-owned retained directory descriptor.
+
+    Raises
+    ------
+    ValueError
+        If the entry is unsafe or differs from durable state.
+    """
+    try:
+        entry = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_descriptor,
+        )
+    except OSError as error:
+        raise ValueError("run pruning ownership changed") from error
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(entry.st_mode)
+            or not stat.S_ISDIR(opened.st_mode)
+            or entry.st_nlink < 1
+            or opened.st_nlink < 1
+            or (entry.st_dev, entry.st_ino) != (state.device, state.inode)
+            or (opened.st_dev, opened.st_ino) != (state.device, state.inode)
+        ):
+            raise ValueError("run pruning ownership changed")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _finish_pruned_run(
+    root: Path,
+    descriptors: _HistoryRootDescriptors,
+    state: _PruneState,
+    current_record: tuple[Mapping[str, Any], bytes] | None,
+) -> bool:
+    """Finish one public or tombstoned deletion and then remove its states.
+
+    Parameters
+    ----------
+    root : pathlib.Path
+        Canonical artifact root used for pointer diagnostics.
+    descriptors : _HistoryRootDescriptors
+        Retained root and runs directory chain.
+    state : _PruneState
+        Durable ownership binding for the selected run.
+    current_record : tuple of mapping and bytes or None
+        Exact current-pointer record observed under the pruning lock.
+
+    Returns
+    -------
+    bool
+        Whether this call removed a remaining public or tombstoned tree.
+    """
+    if current_record is not None and current_record[0]["run_id"] == state.run_id:
+        raise ValueError("current run cannot be pruned")
+    current_bytes = None if current_record is None else current_record[1]
+    tombstone_exists = True
+    try:
+        os.stat(
+            state.tombstone_name,
+            dir_fd=descriptors.runs.descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        tombstone_exists = False
+
+    public_exists = True
+    try:
+        os.stat(
+            state.run_id,
+            dir_fd=descriptors.runs.descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        public_exists = False
+
+    removed_tree = False
+    if tombstone_exists:
+        descriptor = _open_prune_directory(
+            descriptors.runs.descriptor,
+            state.tombstone_name,
+            state,
+        )
+        try:
+            descriptors.chain.remove_detached_child_tree(
+                state.tombstone_name,
+                descriptor,
+            )
+            removed_tree = True
+        finally:
+            os.close(descriptor)
+    elif public_exists:
+        descriptor = _open_prune_directory(
+            descriptors.runs.descriptor,
+            state.run_id,
+            state,
+        )
+        try:
+            descriptors.chain.remove_child_tree(
+                state.run_id,
+                descriptor,
+                tombstone_name=state.tombstone_name,
+            )
+            removed_tree = True
+        finally:
+            os.close(descriptor)
+
+    _verify_history_root(descriptors)
+    current = _load_current_index_at(root, descriptors.root.descriptor)
+    if (None if current is None else current[1]) != current_bytes:
+        raise ValueError("current-run index changed during pruning")
+    _remove_finalization_state(
+        descriptors.root,
+        state.run_id,
+        current_bytes,
+    )
+    _remove_prune_state(descriptors.root, state, chain=descriptors.chain)
+    _verify_history_root(descriptors)
+    return removed_tree
+
+
+def _recover_prune_states(
+    root: Path,
+    descriptors: _HistoryRootDescriptors,
+    current_record: tuple[Mapping[str, Any], bytes] | None,
+) -> list[Path]:
+    """Recover durable incomplete deletions under the pruning lock.
+
+    Parameters
+    ----------
+    root : pathlib.Path
+        Canonical artifact root.
+    descriptors : _HistoryRootDescriptors
+        Retained root and runs directory chain.
+    current_record : tuple of mapping and bytes or None
+        Exact current pointer observed under the same lock.
+
+    Returns
+    -------
+    list of pathlib.Path
+        Public run paths whose remaining trees were deleted by recovery.
+    """
+    recovered: list[Path] = []
+    for name in sorted(os.listdir(descriptors.root.descriptor)):
+        run_id = _prune_state_run_id(name)
+        if run_id is None:
+            continue
+        try:
+            record = _load_prune_state_at(descriptors.root.descriptor, run_id)
+        except ValueError:
+            continue
+        if record is None:
+            continue
+        state = record[0]
+        if current_record is not None and current_record[0]["run_id"] == run_id:
+            continue
+        if _finish_pruned_run(root, descriptors, state, current_record):
+            recovered.append(root / RUNS_DIRECTORY / run_id)
+    return recovered
 
 
 def _remove_finalization_state(
@@ -2145,6 +2595,12 @@ def _recover_absent_run_states(
         if run_id is None:
             continue
         try:
+            prune_record = _load_prune_state_at(descriptors.root.descriptor, run_id)
+        except ValueError:
+            continue
+        if prune_record is not None:
+            continue
+        try:
             os.stat(
                 run_id,
                 dir_fd=descriptors.runs.descriptor,
@@ -2226,13 +2682,15 @@ def prune_run_history(
         with _finalization_lock(descriptors.root.descriptor):
             _verify_history_root(descriptors)
             current_record = _load_current_index_at(root, descriptors.root.descriptor)
+            deleted = _recover_prune_states(root, descriptors, current_record)
+            current_record = _load_current_index_at(root, descriptors.root.descriptor)
             _recover_absent_run_states(
                 root,
                 descriptors,
                 None if current_record is None else current_record[1],
             )
             if current_record is None:
-                return []
+                return deleted
             current_bytes = current_record[1]
             protected = {load_current_run_snapshot(root).directory}
             if active_run_dir is not None:
@@ -2251,7 +2709,7 @@ def prune_run_history(
                 if active is not None:
                     protected.add(active)
 
-            candidates: list[tuple[datetime, str, Path, bool, int, int]] = []
+            candidates: list[tuple[datetime, str, Path, int, int]] = []
             for name in os.listdir(descriptors.runs.descriptor):
                 try:
                     entry = os.stat(
@@ -2277,7 +2735,7 @@ def prune_run_history(
                     continue
                 if manifest["run_id"] != name:
                     continue
-                may_prune, remove_state = _state_allows_prune(
+                may_prune = _state_allows_prune(
                     descriptors.root.descriptor, name, current_bytes
                 )
                 if not may_prune:
@@ -2290,7 +2748,6 @@ def prune_run_history(
                         created_at,
                         name,
                         canonical_path,
-                        remove_state,
                         entry.st_dev,
                         entry.st_ino,
                     )
@@ -2298,14 +2755,13 @@ def prune_run_history(
 
             candidates.sort(reverse=True)
             keep = set(protected)
-            for _, _, path, _, _, _ in candidates:
+            for _, _, path, _, _ in candidates:
                 if path in keep:
                     continue
                 if len(keep) < retention_runs:
                     keep.add(path)
 
-            deleted: list[Path] = []
-            for _, name, path, remove_state, device, inode in reversed(candidates):
+            for _, name, path, device, inode in reversed(candidates):
                 if path in keep:
                     continue
                 _verify_history_root(descriptors)
@@ -2322,28 +2778,17 @@ def prune_run_history(
                     entry.st_ino,
                 ) != (device, inode):
                     raise ValueError("run history changed during pruning")
-                run_descriptor = os.open(
+                prune_state = _PruneState(
                     name,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                    dir_fd=descriptors.runs.descriptor,
+                    _deletion_tombstone_name(name, device, inode),
+                    device,
+                    inode,
                 )
-                try:
-                    opened = os.fstat(run_descriptor)
-                    if (
-                        not stat.S_ISDIR(opened.st_mode)
-                        or opened.st_nlink < 1
-                        or (opened.st_dev, opened.st_ino) != (device, inode)
-                    ):
-                        raise ValueError("run history changed during pruning")
-                    descriptors.chain.remove_child_tree(name, run_descriptor)
-                finally:
-                    os.close(run_descriptor)
-                if remove_state:
-                    _remove_finalization_state(
-                        descriptors.root,
-                        name,
-                        current_bytes,
-                    )
-                _verify_history_root(descriptors)
+                _record_prune_state(
+                    descriptors.root,
+                    prune_state,
+                    chain=descriptors.chain,
+                )
+                _finish_pruned_run(root, descriptors, prune_state, current)
                 deleted.append(path)
             return deleted

@@ -9,6 +9,7 @@ import stat
 import tomllib
 import uuid
 from collections import Counter
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -394,6 +395,61 @@ def _destination_exists(parent_descriptor: int, output_name: str) -> bool:
     return True
 
 
+def _evaluation_deletion_tombstone(output_name: str, descriptor: int) -> str:
+    """Bind a recognizable private deletion name to one retained directory.
+
+    Parameters
+    ----------
+    output_name : str
+        Public evaluation destination basename.
+    descriptor : int
+        Retained staged or installed directory descriptor.
+
+    Returns
+    -------
+    str
+        Private tombstone containing the retained device and inode.
+    """
+    current = os.fstat(descriptor)
+    if not stat.S_ISDIR(current.st_mode) or current.st_nlink < 1:
+        raise ValueError("evaluation deletion ownership changed")
+    return f".{output_name}.{current.st_dev:x}-{current.st_ino:x}.deleting"
+
+
+def _evaluation_tombstone_identity(
+    output_name: str, name: str
+) -> tuple[int, int] | None:
+    """Parse one canonical evaluation deletion tombstone identity.
+
+    Parameters
+    ----------
+    output_name : str
+        Public evaluation destination basename.
+    name : str
+        Candidate direct-child residue name.
+
+    Returns
+    -------
+    tuple of int or None
+        Encoded device and inode, or ``None`` for unrelated names.
+    """
+    prefix = f".{output_name}."
+    suffix = ".deleting"
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        return None
+    encoded = name[len(prefix) : -len(suffix)]
+    parts = encoded.split("-")
+    if len(parts) != 2 or any(
+        not part or any(character not in "0123456789abcdef" for character in part)
+        for part in parts
+    ):
+        return None
+    device, inode = (int(part, 16) for part in parts)
+    if inode < 1 or name != f".{output_name}.{device:x}-{inode:x}.deleting":
+        return None
+    return device, inode
+
+
 def _read_retained_evaluation_file(
     directory_descriptor: int, name: str
 ) -> _RetainedEvaluationFile:
@@ -760,6 +816,10 @@ def _publish_evaluation_artifact_unlocked(
                         owned_name,
                         staging_descriptor,
                         require_visible_chain=False,
+                        tombstone_name=_evaluation_deletion_tombstone(
+                            output_name,
+                            staging_descriptor,
+                        ),
                     )
                     break
         except (FileNotFoundError, OSError, ValueError):
@@ -812,8 +872,16 @@ def publish_evaluation_artifact(
             _verify_evaluation_parent(parent)
             prefix = f".{output_name}."
             for residue_name in os.listdir(parent.descriptor):
-                if not residue_name.startswith(prefix) or not residue_name.endswith(
+                staged = residue_name.startswith(prefix) and residue_name.endswith(
                     ".staging"
+                )
+                tombstone_identity = _evaluation_tombstone_identity(
+                    output_name, residue_name
+                )
+                if not staged and tombstone_identity is None:
+                    continue
+                if tombstone_identity is not None and _destination_exists(
+                    parent.descriptor, output_name
                 ):
                     continue
                 residue_stat = os.stat(
@@ -827,10 +895,23 @@ def publish_evaluation_artifact(
                     os.O_RDONLY | os.O_DIRECTORY,
                 )
                 try:
-                    parent.chain.remove_child_tree(
-                        residue_name,
-                        residue_descriptor,
-                    )
+                    if tombstone_identity is None:
+                        parent.chain.remove_child_tree(
+                            residue_name,
+                            residue_descriptor,
+                            tombstone_name=_evaluation_deletion_tombstone(
+                                output_name,
+                                residue_descriptor,
+                            ),
+                        )
+                    else:
+                        current = os.fstat(residue_descriptor)
+                        if (current.st_dev, current.st_ino) != tombstone_identity:
+                            raise ValueError("evaluation deletion residue is unsafe")
+                        parent.chain.remove_detached_child_tree(
+                            residue_name,
+                            residue_descriptor,
+                        )
                 finally:
                     os.close(residue_descriptor)
             _verify_evaluation_parent(parent)
@@ -974,77 +1055,113 @@ def load_evaluation_artifact_snapshot(
     with chain:
         canonical_dir = chain.path
         descriptor = chain.directory.descriptor
-        try:
-            chain.verify()
-            manifest_bytes = read_regular_file_snapshot_at(
-                descriptor,
-                EVALUATION_MANIFEST_FILENAME,
-            ).content
-            chain.verify()
-            decoded_manifest = json.loads(manifest_bytes.decode("utf-8"))
-            payload = _validate_manifest(decoded_manifest, frozen)
-            chain.verify()
-            canonical_manifest = (
-                json.dumps(decoded_manifest, indent=2, allow_nan=False) + "\n"
-            ).encode("utf-8")
-            if manifest_bytes != canonical_manifest:
-                raise ValueError("evaluation manifest bytes are not canonical")
-            chain.verify()
-            if set(os.listdir(descriptor)) != {
-                EVALUATION_MANIFEST_FILENAME,
-                EVALUATION_RECORDS_FILENAME,
-            }:
-                raise ValueError("evaluation artifact contains unexpected files")
-            chain.verify()
-            records = read_regular_file_snapshot_at(
-                descriptor,
-                EVALUATION_RECORDS_FILENAME,
-            ).content
-            chain.verify()
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError) as error:
-            raise ValueError("invalid evaluation artifact") from error
-
-        expected_checksum = payload["checksums"][EVALUATION_RECORDS_FILENAME]
-        if sha256_bytes(records) != expected_checksum:
-            raise ValueError("evaluation record checksum mismatch")
-        chain.verify()
-
-        content_hash = hashlib.sha256()
-        label_counts: Counter[int] = Counter()
-        lines = records.splitlines(keepends=True)
-        if len(lines) != payload["records"]["row_count"]:
-            raise ValueError("evaluation record row count mismatch")
-        for index, line in enumerate(lines):
-            if not line.endswith(b"\n"):
-                raise ValueError("evaluation records must end every row with LF")
+        expected_inventory = {
+            EVALUATION_MANIFEST_FILENAME,
+            EVALUATION_RECORDS_FILENAME,
+        }
+        with ExitStack() as retained_files:
             try:
-                row = json.loads(line)
-            except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                raise ValueError(f"invalid evaluation record at row {index}") from error
-            if not isinstance(row, Mapping) or set(row) != {"label", "row_id", "text"}:
-                raise ValueError(f"invalid evaluation record fields at row {index}")
-            text, label = _validate_row(
-                row["text"], row["label"], split="test", index=index
+                chain.verify()
+                retained_manifest = retained_files.enter_context(
+                    read_regular_file_snapshot_at(
+                        descriptor,
+                        EVALUATION_MANIFEST_FILENAME,
+                        retain=True,
+                    )
+                )
+                manifest_bytes = retained_manifest.snapshot.content
+                chain.verify()
+                decoded_manifest = json.loads(manifest_bytes.decode("utf-8"))
+                payload = _validate_manifest(decoded_manifest, frozen)
+                chain.verify()
+                canonical_manifest = (
+                    json.dumps(decoded_manifest, indent=2, allow_nan=False) + "\n"
+                ).encode("utf-8")
+                if manifest_bytes != canonical_manifest:
+                    raise ValueError("evaluation manifest bytes are not canonical")
+                chain.verify()
+                if set(os.listdir(descriptor)) != expected_inventory:
+                    raise ValueError("evaluation artifact contains unexpected files")
+                chain.verify()
+                retained_records = retained_files.enter_context(
+                    read_regular_file_snapshot_at(
+                        descriptor,
+                        EVALUATION_RECORDS_FILENAME,
+                        retain=True,
+                    )
+                )
+                records = retained_records.snapshot.content
+                chain.verify()
+            except (
+                OSError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                KeyError,
+            ) as error:
+                raise ValueError("invalid evaluation artifact") from error
+
+            expected_checksum = payload["checksums"][EVALUATION_RECORDS_FILENAME]
+            if sha256_bytes(records) != expected_checksum:
+                raise ValueError("evaluation record checksum mismatch")
+            chain.verify()
+
+            content_hash = hashlib.sha256()
+            label_counts: Counter[int] = Counter()
+            lines = records.splitlines(keepends=True)
+            if len(lines) != payload["records"]["row_count"]:
+                raise ValueError("evaluation record row count mismatch")
+            for index, line in enumerate(lines):
+                if not line.endswith(b"\n"):
+                    raise ValueError("evaluation records must end every row with LF")
+                try:
+                    row = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise ValueError(
+                        f"invalid evaluation record at row {index}"
+                    ) from error
+                if not isinstance(row, Mapping) or set(row) != {
+                    "label",
+                    "row_id",
+                    "text",
+                }:
+                    raise ValueError(f"invalid evaluation record fields at row {index}")
+                text, label = _validate_row(
+                    row["text"], row["label"], split="test", index=index
+                )
+                chain.verify()
+                if row["row_id"] != f"test:{index}":
+                    raise ValueError(
+                        f"evaluation row identity or order mismatch at row {index}"
+                    )
+                if line != canonical_evaluation_row_bytes(index, text, label):
+                    raise ValueError(
+                        f"evaluation record is not canonical at row {index}"
+                    )
+                content_hash.update(canonical_source_row_bytes(text, label))
+                label_counts[label] += 1
+
+            dataset = payload["dataset"]
+            if [label_counts[0], label_counts[1]] != dataset["label_counts"]:
+                raise ValueError("evaluation label counts differ from the manifest")
+            if content_hash.hexdigest() != dataset["content_sha256"]:
+                raise ValueError("evaluation content SHA-256 differs from the manifest")
+            snapshot = EvaluationArtifactSnapshot(
+                canonical_dir,
+                deep_freeze(payload),
+                records,
             )
             chain.verify()
-            if row["row_id"] != f"test:{index}":
-                raise ValueError(
-                    f"evaluation row identity or order mismatch at row {index}"
-                )
-            if line != canonical_evaluation_row_bytes(index, text, label):
-                raise ValueError(f"evaluation record is not canonical at row {index}")
-            content_hash.update(canonical_source_row_bytes(text, label))
-            label_counts[label] += 1
-
-        dataset = payload["dataset"]
-        if [label_counts[0], label_counts[1]] != dataset["label_counts"]:
-            raise ValueError("evaluation label counts differ from the manifest")
-        if content_hash.hexdigest() != dataset["content_sha256"]:
-            raise ValueError("evaluation content SHA-256 differs from the manifest")
-        snapshot = EvaluationArtifactSnapshot(
-            canonical_dir,
-            deep_freeze(payload),
-            records,
-        )
-        chain.verify()
-        return snapshot
+            if set(os.listdir(descriptor)) != expected_inventory:
+                raise ValueError("evaluation artifact inventory changed while loading")
+            retained_manifest.verify(
+                descriptor,
+                EVALUATION_MANIFEST_FILENAME,
+                expected_content=manifest_bytes,
+            )
+            retained_records.verify(
+                descriptor,
+                EVALUATION_RECORDS_FILENAME,
+                expected_content=records,
+            )
+            chain.verify()
+            return snapshot

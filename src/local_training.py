@@ -4,11 +4,12 @@ import argparse
 import csv
 import json
 import math
+import os
 import warnings
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, TypeAlias
+from typing import Any, Callable, Mapping, TypeAlias
 
 from src.protocol_runtime import validate_protocol_runtime
 
@@ -18,9 +19,10 @@ import numpy as np
 from src.app_manifest import AppManifest, load_app_manifest
 from src.artifact_compatibility import (
     CLIENT_SHARD_SCHEMA_VERSION,
+    RetainedDirectoryChain,
     canonical_json_bytes,
     deep_freeze,
-    read_regular_file,
+    read_regular_file_snapshot_at,
     sha256_bytes,
     validate_artifact_schema,
     write_server_artifact_manifest,
@@ -185,21 +187,90 @@ def load_client_shard_snapshot(
     logical_directory = resolve_dir(client_data_dir)
     client_root = resolve_prepared_artifact_dir(logical_directory.parent, "client")
     directory = client_root / logical_directory.name
-    if directory.is_symlink() or not directory.is_dir():
-        raise ValueError("client shard directory must be a regular directory")
-    canonical_dir = directory.resolve(strict=True)
-    if {path.name for path in directory.iterdir()} != {
-        CLIENT_METADATA_FILENAME,
-        CLIENT_REVIEWS_FILENAME,
-    }:
-        raise ValueError("client shard contains unexpected files")
+    chain = RetainedDirectoryChain.open(
+        directory,
+        error_message="client shard directory chain changed while loading",
+    )
+    with chain:
+        canonical_dir = chain.path
+        descriptor = chain.directory.descriptor
+        expected_inventory = {CLIENT_METADATA_FILENAME, CLIENT_REVIEWS_FILENAME}
+        if set(os.listdir(descriptor)) != expected_inventory:
+            raise ValueError("client shard contains unexpected files")
+        chain.verify()
+        retained_metadata = read_regular_file_snapshot_at(
+            descriptor,
+            CLIENT_METADATA_FILENAME,
+            retain=True,
+        )
+        with retained_metadata:
+            metadata_bytes = retained_metadata.snapshot.content
+            chain.verify()
+            retained_records = read_regular_file_snapshot_at(
+                descriptor,
+                CLIENT_REVIEWS_FILENAME,
+                retain=True,
+            )
+            with retained_records:
+                records_bytes = retained_records.snapshot.content
+                chain.verify()
+                snapshot = _validate_client_shard_bytes(
+                    canonical_dir,
+                    metadata_bytes,
+                    records_bytes,
+                    manifest,
+                    expected_client_id,
+                    verify=chain.verify,
+                )
+                chain.verify()
+                if set(os.listdir(descriptor)) != expected_inventory:
+                    raise ValueError("client shard inventory changed while loading")
+                retained_metadata.verify(
+                    descriptor,
+                    CLIENT_METADATA_FILENAME,
+                    expected_content=metadata_bytes,
+                )
+                retained_records.verify(
+                    descriptor,
+                    CLIENT_REVIEWS_FILENAME,
+                    expected_content=records_bytes,
+                )
+                chain.verify()
+                return snapshot
+
+
+def _validate_client_shard_bytes(
+    canonical_dir: Path,
+    metadata_bytes: bytes,
+    records_bytes: bytes,
+    manifest: AppManifest,
+    expected_client_id: int,
+    *,
+    verify: Callable[[], None],
+) -> ClientShardSnapshot:
+    """Validate retained client-shard bytes under repeated ownership checks.
+
+    Parameters
+    ----------
+    canonical_dir : pathlib.Path
+        Retained shard directory used for diagnostics.
+    metadata_bytes : bytes
+        Exact retained metadata bytes.
+    records_bytes : bytes
+        Exact retained canonical record bytes.
+    manifest : AppManifest
+        Validated public artifact snapshot bound by shard metadata.
+    expected_client_id : int
+        Client identity assigned by the caller.
+    verify : callable
+        Complete visible-chain validation run at material boundaries.
+
+    Returns
+    -------
+    ClientShardSnapshot
+        Fully validated immutable shard snapshot.
+    """
     try:
-        metadata_bytes = read_regular_file(
-            directory / CLIENT_METADATA_FILENAME, parent=canonical_dir
-        )
-        records_bytes = read_regular_file(
-            directory / CLIENT_REVIEWS_FILENAME, parent=canonical_dir
-        )
         decoded = json.loads(metadata_bytes.decode("utf-8"))
         metadata = _require_exact_mapping_fields(
             validate_artifact_schema(
@@ -212,6 +283,7 @@ def load_client_shard_snapshot(
         )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError) as error:
         raise ValueError("invalid client shard") from error
+    verify()
     if metadata_bytes != canonical_json_bytes(metadata):
         raise ValueError("client shard metadata bytes are not canonical")
     if metadata["artifact_type"] != "private_client_train_shard":
@@ -228,6 +300,7 @@ def load_client_shard_snapshot(
         or metadata["row_identity"] != CLIENT_ROW_IDENTITY
     ):
         raise ValueError("client shard row identity contract is invalid")
+    verify()
     if (
         type(metadata["split_seed"]) is not int
         or metadata["split_seed"] < 0
@@ -246,6 +319,7 @@ def load_client_shard_snapshot(
         for label, count in histogram.items()
     ):
         raise ValueError("client shard label histogram is invalid")
+    verify()
     records_contract = _require_exact_mapping_fields(
         metadata["records"],
         {"filename", "format", "encoding", "newline", "trailing_newline", "checksum"},
@@ -271,6 +345,7 @@ def load_client_shard_snapshot(
         "checksum": sha256_bytes(manifest.manifest_bytes),
     }:
         raise ValueError("client shard public manifest binding is invalid")
+    verify()
 
     rows: list[tuple[str, str, int]] = []
     counts: Counter[int] = Counter()
@@ -305,18 +380,21 @@ def load_client_shard_snapshot(
         identities.add(row_id)
         counts[label] += 1
         rows.append((row_id, text, label))
+        verify()
     if len(rows) != metadata["sample_count"]:
         raise ValueError("client shard sample count differs from its records")
     actual_histogram = {str(label): count for label, count in sorted(counts.items())}
     if actual_histogram != dict(histogram):
         raise ValueError("client shard label histogram differs from its records")
-    return ClientShardSnapshot(
+    snapshot = ClientShardSnapshot(
         canonical_dir,
         deep_freeze(metadata),
         metadata_bytes,
         records_bytes,
         tuple(rows),
     )
+    verify()
+    return snapshot
 
 
 def _stratified_split_indices(

@@ -12,11 +12,11 @@ import stat
 import sys
 import tempfile
 import uuid
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Callable, Mapping, Never
+from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Never, overload
 
 if TYPE_CHECKING:
     from src.app_manifest import AppManifest
@@ -433,6 +433,7 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
         descriptor: int,
         *,
         require_visible_chain: bool = True,
+        tombstone_name: str | None = None,
     ) -> None:
         """Remove one retained direct-child tree without reopening its path.
 
@@ -445,6 +446,8 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
         require_visible_chain : bool, optional
             Require the configured parent path to remain visible. Owned rollback may
             disable this while still retaining and proving the detached parent inode.
+        tombstone_name : str or None, optional
+            Caller-bound private deletion name, or a random private name.
 
         Returns
         -------
@@ -486,7 +489,16 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
             directory=True,
             verify_before=verify,
             verify_after=verify_parent,
+            temporary_name=tombstone_name,
         )
+        destructive = False
+
+        def begin_destructive() -> None:
+            nonlocal destructive
+            if destructive:
+                return
+            destructive = True
+
         try:
 
             def verify_detached() -> None:
@@ -498,19 +510,88 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
                     directory=True,
                 )
 
-            self._remove_directory_contents(descriptor, verify=verify_detached)
+            self._remove_directory_contents(
+                descriptor,
+                verify=verify_detached,
+                before_remove=begin_destructive,
+            )
             verify_detached()
+            begin_destructive()
             os.rmdir(temporary, dir_fd=parent.descriptor)
             verify_parent()
             os.fsync(parent.descriptor)
             verify_parent()
         except BaseException:
-            self._restore_detached_name(
-                parent.descriptor,
-                temporary,
-                name,
-            )
+            if not destructive:
+                try:
+                    verify_detached()
+                except (OSError, ValueError):
+                    pass
+                else:
+                    self._restore_detached_name(
+                        parent.descriptor,
+                        temporary,
+                        name,
+                    )
             raise
+
+    def remove_detached_child_tree(
+        self,
+        tombstone_name: str,
+        descriptor: int,
+        *,
+        require_visible_chain: bool = True,
+    ) -> None:
+        """Finish deletion of one retained private tombstone without restoration.
+
+        Parameters
+        ----------
+        tombstone_name : str
+            Direct child deletion residue bound by the caller's durable state.
+        descriptor : int
+            Caller-owned no-follow descriptor for that exact directory.
+        require_visible_chain : bool, optional
+            Require the configured parent path to remain visible.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If the chain or retained tombstone identity changes.
+        """
+        self._require_child_name(tombstone_name)
+        parent = self.directory
+
+        def verify_parent() -> None:
+            if require_visible_chain:
+                self.verify()
+                return
+            current = os.fstat(parent.descriptor)
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or current.st_nlink < 1
+                or (current.st_dev, current.st_ino) != (parent.device, parent.inode)
+            ):
+                raise ValueError(self._error_message)
+
+        def verify() -> None:
+            verify_parent()
+            self._require_entry_identity(
+                parent.descriptor,
+                tombstone_name,
+                descriptor,
+                directory=True,
+            )
+
+        self._remove_directory_contents(descriptor, verify=verify)
+        verify()
+        os.rmdir(tombstone_name, dir_fd=parent.descriptor)
+        verify_parent()
+        os.fsync(parent.descriptor)
+        verify_parent()
 
     def _verify_identity(
         self, entry: os.stat_result, retained: RetainedDirectory
@@ -564,7 +645,11 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
             self._verify_identity(entry, self._directories[index])
 
     def _remove_directory_contents(
-        self, directory_descriptor: int, *, verify: Callable[[], None]
+        self,
+        directory_descriptor: int,
+        *,
+        verify: Callable[[], None],
+        before_remove: Callable[[], None] | None = None,
     ) -> None:
         """Delete a retained directory's captured children descriptor-relatively.
 
@@ -574,6 +659,8 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
             Retained directory whose direct entries may be removed.
         verify : callable
             Ownership check run around every traversal, mutation, and barrier.
+        before_remove : callable or None, optional
+            Notification immediately before any irreversible entry removal.
 
         Returns
         -------
@@ -619,7 +706,10 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
                     self._remove_directory_contents(
                         child_descriptor,
                         verify=verify,
+                        before_remove=before_remove,
                     )
+                    if before_remove is not None:
+                        before_remove()
                     self._remove_retained_name(
                         directory_descriptor,
                         name,
@@ -645,6 +735,8 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
                         != (entry.st_dev, entry.st_ino)
                     ):
                         raise ValueError(self._error_message)
+                    if before_remove is not None:
+                        before_remove()
                     self._remove_retained_name(
                         directory_descriptor,
                         name,
@@ -732,6 +824,7 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
         directory: bool,
         verify_before: Callable[[], None],
         verify_after: Callable[[], None],
+        temporary_name: str | None = None,
     ) -> str:
         """Detach a proven entry to an exclusive private name.
 
@@ -749,13 +842,16 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
             Validation while the public name remains visible.
         verify_after : callable
             Parent validation after detachment.
+        temporary_name : str or None, optional
+            Exact private name selected by a caller with durable ownership state.
 
         Returns
         -------
         str
             Private direct child name selecting the retained inode.
         """
-        temporary = f".{name}.{uuid.uuid4().hex}.deleting"
+        temporary = temporary_name or f".{name}.{uuid.uuid4().hex}.deleting"
+        self._require_child_name(temporary)
         try:
             os.stat(
                 temporary,
@@ -1259,6 +1355,116 @@ class RegularFileSnapshot:
     changed_ns: int
 
 
+class RetainedRegularFile(AbstractContextManager["RetainedRegularFile"]):
+    """Own one securely read regular-file descriptor until final validation.
+
+    Parameters
+    ----------
+    descriptor : int
+        Open no-follow descriptor owned by this instance.
+    snapshot : RegularFileSnapshot
+        Exact bytes and identity captured from the descriptor.
+    """
+
+    def __init__(self, descriptor: int, snapshot: RegularFileSnapshot) -> None:
+        self.descriptor = descriptor
+        self.snapshot = snapshot
+        self._closed = False
+
+    def verify(
+        self,
+        parent_descriptor: int,
+        name: str,
+        *,
+        expected_content: bytes | None = None,
+    ) -> None:
+        """Require the visible name and retained descriptor to remain exact.
+
+        Parameters
+        ----------
+        parent_descriptor : int
+            Retained owning-directory descriptor.
+        name : str
+            Direct child filename.
+        expected_content : bytes or None, optional
+            Additional exact byte contract, or the originally captured bytes.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If the entry, descriptor, metadata, size, or bytes changed.
+        """
+        RetainedDirectoryChain._require_child_name(name)
+        if self._closed:
+            raise ValueError(f"artifact changed while retained: {name}")
+        try:
+            entry = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+            current = _read_regular_file_descriptor(self.descriptor)
+        except (OSError, ValueError) as error:
+            raise ValueError(f"artifact changed while retained: {name}") from error
+        captured = self.snapshot
+        identity = (
+            captured.device,
+            captured.inode,
+            captured.size_bytes,
+            captured.modified_ns,
+            captured.changed_ns,
+        )
+        visible_identity = (
+            entry.st_dev,
+            entry.st_ino,
+            entry.st_size,
+            entry.st_mtime_ns,
+            entry.st_ctime_ns,
+        )
+        if (
+            not stat.S_ISREG(entry.st_mode)
+            or entry.st_nlink != 1
+            or visible_identity != identity
+            or (
+                current.device,
+                current.inode,
+                current.size_bytes,
+                current.modified_ns,
+                current.changed_ns,
+            )
+            != identity
+            or current.content != captured.content
+            or current.content
+            != (captured.content if expected_content is None else expected_content)
+        ):
+            raise ValueError(f"artifact changed while retained: {name}")
+
+    def close(self) -> None:
+        """Close the retained descriptor exactly once.
+
+        Returns
+        -------
+        None
+        """
+        if not self._closed:
+            os.close(self.descriptor)
+            self._closed = True
+
+    def __exit__(self, *exc_info: object) -> None:
+        """Close the retained descriptor on context exit.
+
+        Parameters
+        ----------
+        *exc_info : object
+            Standard context-manager exception details.
+
+        Returns
+        -------
+        None
+        """
+        self.close()
+
+
 @dataclass(frozen=True)
 class ServerFinalizationSnapshot:
     """Retain every finalizable server file from one secure capture pass.
@@ -1423,12 +1629,88 @@ def read_regular_file_snapshot(
             os.close(parent_descriptor)
 
 
+def _read_regular_file_descriptor(
+    descriptor: int, *, sync: bool = False
+) -> RegularFileSnapshot:
+    """Read stable exact bytes and metadata from one open regular file.
+
+    Parameters
+    ----------
+    descriptor : int
+        Open regular-file descriptor.
+    sync : bool, optional
+        Flush the file before the final metadata capture.
+
+    Returns
+    -------
+    RegularFileSnapshot
+        Exact bytes and stable identity from the descriptor.
+
+    Raises
+    ------
+    ValueError
+        If the descriptor is unsafe or changes during the read.
+    """
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise ValueError("artifact must be a contained regular file")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    while chunk := os.read(descriptor, 1024 * 1024):
+        chunks.append(chunk)
+    content = b"".join(chunks)
+    if sync:
+        os.fsync(descriptor)
+    after = os.fstat(descriptor)
+    identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    if (
+        identity
+        != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        or len(content) != after.st_size
+    ):
+        raise ValueError("artifact changed while reading")
+    return RegularFileSnapshot(content, *identity)
+
+
+@overload
 def read_regular_file_snapshot_at(
     parent_descriptor: int,
     name: str,
     *,
     sync: bool = False,
-) -> RegularFileSnapshot:
+    retain: Literal[False] = False,
+) -> RegularFileSnapshot: ...
+
+
+@overload
+def read_regular_file_snapshot_at(
+    parent_descriptor: int,
+    name: str,
+    *,
+    sync: bool = False,
+    retain: Literal[True],
+) -> RetainedRegularFile: ...
+
+
+def read_regular_file_snapshot_at(
+    parent_descriptor: int,
+    name: str,
+    *,
+    sync: bool = False,
+    retain: bool = False,
+) -> RegularFileSnapshot | RetainedRegularFile:
     """Read one stable single-link regular file below a retained directory.
 
     Parameters
@@ -1439,11 +1721,13 @@ def read_regular_file_snapshot_at(
         Direct child filename.
     sync : bool, optional
         Flush the opened regular file before returning its snapshot.
+    retain : bool, optional
+        Transfer descriptor ownership to a retained-file result.
 
     Returns
     -------
-    RegularFileSnapshot
-        Exact bytes and stable descriptor identity from the same read.
+    RegularFileSnapshot or RetainedRegularFile
+        Exact bytes and identity, optionally with the descriptor retained.
 
     Raises
     ------
@@ -1459,38 +1743,21 @@ def read_regular_file_snapshot_at(
             f"artifact must be a contained regular file: {name}"
         ) from error
     try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-            raise ValueError(f"artifact must be a contained regular file: {name}")
-        chunks: list[bytes] = []
-        while chunk := os.read(descriptor, 1024 * 1024):
-            chunks.append(chunk)
-        content = b"".join(chunks)
-        if sync:
-            os.fsync(descriptor)
-        after = os.fstat(descriptor)
-        identity = (
-            before.st_dev,
-            before.st_ino,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-        )
-        if (
-            identity
-            != (
-                after.st_dev,
-                after.st_ino,
-                after.st_size,
-                after.st_mtime_ns,
-                after.st_ctime_ns,
-            )
-            or len(content) != after.st_size
-        ):
-            raise ValueError(f"artifact changed while reading: {name}")
-        return RegularFileSnapshot(content, *identity)
-    finally:
+        snapshot = _read_regular_file_descriptor(descriptor, sync=sync)
+    except ValueError as error:
         os.close(descriptor)
+        if str(error) == "artifact must be a contained regular file":
+            raise ValueError(
+                f"artifact must be a contained regular file: {name}"
+            ) from error
+        raise ValueError(f"artifact changed while reading: {name}") from error
+    except BaseException:
+        os.close(descriptor)
+        raise
+    if retain:
+        return RetainedRegularFile(descriptor, snapshot)
+    os.close(descriptor)
+    return snapshot
 
 
 def sha256_file(path: Path) -> str:
@@ -2088,6 +2355,8 @@ def load_server_artifact_snapshot(
     manifest_bytes: bytes | None = None,
     app_manifest: AppManifest | None = None,
     _retained_chain: RetainedDirectoryChain | None = None,
+    _manifest_checksum: str | None = None,
+    _final_check: Callable[[], None] | None = None,
 ) -> ServerArtifactSnapshot:
     """Load validated artifact bytes without reopening them after verification.
 
@@ -2101,6 +2370,10 @@ def load_server_artifact_snapshot(
         Configured public snapshot that the server artifact must exactly match.
     _retained_chain : RetainedDirectoryChain or None, optional
         Existing complete chain retained by a current-run selection.
+    _manifest_checksum : str or None, optional
+        Current-pointer checksum that the retained manifest must match.
+    _final_check : callable or None, optional
+        Current-pointer recheck run before the final retained-file validation.
 
     Returns
     -------
@@ -2126,6 +2399,8 @@ def load_server_artifact_snapshot(
                 chain,
                 manifest_bytes=manifest_bytes,
                 app_manifest=app_manifest,
+                manifest_checksum=_manifest_checksum,
+                final_check=_final_check,
             )
     if _retained_chain.path != canonical_dir:
         raise ValueError("retained server artifact chain selects another directory")
@@ -2133,6 +2408,8 @@ def load_server_artifact_snapshot(
         _retained_chain,
         manifest_bytes=manifest_bytes,
         app_manifest=app_manifest,
+        manifest_checksum=_manifest_checksum,
+        final_check=_final_check,
     )
 
 
@@ -2141,6 +2418,8 @@ def _load_server_artifact_snapshot_from_chain(
     *,
     manifest_bytes: bytes | None,
     app_manifest: AppManifest | None,
+    manifest_checksum: str | None,
+    final_check: Callable[[], None] | None,
 ) -> ServerArtifactSnapshot:
     """Load server artifacts through one complete retained directory chain.
 
@@ -2152,6 +2431,10 @@ def _load_server_artifact_snapshot_from_chain(
         Exact manifest bytes already bound by a current-run pointer.
     app_manifest : AppManifest or None
         Configured public snapshot that the server artifact must exactly match.
+    manifest_checksum : str or None
+        Current-pointer checksum required for the retained manifest.
+    final_check : callable or None
+        Current-pointer recheck run before the final retained-file validation.
 
     Returns
     -------
@@ -2160,142 +2443,177 @@ def _load_server_artifact_snapshot_from_chain(
     """
     canonical_dir = chain.path
     directory_descriptor = chain.directory.descriptor
-    chain.verify()
     path = canonical_dir / SERVER_ARTIFACT_MANIFEST_FILENAME
-    if manifest_bytes is None:
+    with ExitStack() as retained_files:
         try:
-            manifest_bytes = read_regular_file_snapshot_at(
-                directory_descriptor,
-                SERVER_ARTIFACT_MANIFEST_FILENAME,
-            ).content
+            retained_manifest = retained_files.enter_context(
+                read_regular_file_snapshot_at(
+                    directory_descriptor,
+                    SERVER_ARTIFACT_MANIFEST_FILENAME,
+                    retain=True,
+                )
+            )
         except ValueError as error:
             raise ValueError(
                 "server artifact manifest has no valid schema_version; regenerate its "
                 "artifacts"
             ) from error
-        chain.verify()
-    payload = validate_artifact_schema(
-        strict_json_loads(
-            manifest_bytes,
-            source=f"server artifact manifest: {path}",
-        ),
-        "server artifact manifest",
-        supported_version=SERVER_ARTIFACT_SCHEMA_VERSION,
-    )
-    artifacts = payload.get("artifacts")
-    mismatch_message = (
-        "server artifact manifest does not match schema_version "
-        f"{SERVER_ARTIFACT_SCHEMA_VERSION}; regenerate its artifacts"
-    )
-    if not isinstance(artifacts, Mapping):
-        raise ValueError(mismatch_message)
-    for name, layout in SERVER_ARTIFACTS.items():
-        artifact = artifacts.get(name)
-        if not isinstance(artifact, Mapping) or any(
-            artifact.get(key) != value for key, value in layout.items()
+        captured_manifest_bytes = retained_manifest.snapshot.content
+        if manifest_bytes is not None and not hmac.compare_digest(
+            captured_manifest_bytes, manifest_bytes
         ):
-            raise ValueError(mismatch_message)
-    _validate_server_binding(payload.get("binding"), app_manifest=app_manifest)
-
-    lifecycle = payload.get("lifecycle")
-    checksums = payload.get("checksums")
-    sizes = payload.get("sizes")
-    if lifecycle is None and checksums is None and sizes is None:
-        filenames = set()
-        for layout in SERVER_ARTIFACTS.values():
-            filename = str(layout["filename"])
-            try:
-                os.stat(
-                    filename,
-                    dir_fd=directory_descriptor,
-                    follow_symlinks=False,
-                )
-            except FileNotFoundError:
-                continue
-            filenames.add(filename)
-        chain.verify()
-    else:
-        if (
-            lifecycle != "complete"
-            or not isinstance(checksums, Mapping)
-            or not isinstance(sizes, Mapping)
-            or set(sizes) != set(checksums)
+            raise ValueError("server artifact manifest changed while loading")
+        manifest_bytes = captured_manifest_bytes
+        if manifest_checksum is not None and not hmac.compare_digest(
+            sha256_bytes(manifest_bytes), manifest_checksum
         ):
-            raise ValueError("server artifact manifest has invalid completion metadata")
-        if not REQUIRED_COMPLETED_ARTIFACTS <= checksums.keys():
-            raise ValueError("server artifact manifest is missing required checksums")
-        filenames = set(checksums)
-        inventory = set(os.listdir(directory_descriptor))
+            raise ValueError("current-run artifact manifest checksum does not match")
         chain.verify()
-        expected_inventory = {SERVER_ARTIFACT_MANIFEST_FILENAME, *filenames}
-        if inventory != expected_inventory:
-            raise ValueError("completed server artifact inventory does not match")
-
-    files: dict[str, bytes] = {}
-    for filename in filenames:
-        expected = checksums.get(filename) if isinstance(checksums, Mapping) else None
-        expected_size = sizes.get(filename) if isinstance(sizes, Mapping) else None
-        if (
-            not isinstance(filename, str)
-            or Path(filename).name != filename
-            or (
-                expected is not None
-                and (
-                    not isinstance(expected, str)
-                    or len(expected) != 71
-                    or not expected.startswith("sha256:")
-                )
-            )
-            or (expected_size is not None and type(expected_size) is not int)
-        ):
-            raise ValueError("server artifact manifest has an invalid checksum")
-        try:
-            content = read_regular_file_snapshot_at(
-                directory_descriptor,
-                filename,
-            ).content
-        except ValueError as error:
-            raise ValueError(
-                f"server artifact is missing or unsafe: {filename}"
-            ) from error
-        chain.verify()
-        if expected is not None and not hmac.compare_digest(
-            sha256_bytes(content), expected
-        ):
-            raise ValueError(f"server artifact checksum does not match: {filename}")
-        if expected_size is not None and len(content) != expected_size:
-            raise ValueError(f"server artifact size does not match: {filename}")
-        files[filename] = content
-    if lifecycle == "complete":
-        from src.app_manifest import validate_app_manifest_bytes
-
-        retained_manifest = validate_app_manifest_bytes(
-            files["manifest.json"],
-            files["vocab.txt"],
-            vocabulary_path=canonical_dir / "vocab.txt",
+        payload = validate_artifact_schema(
+            strict_json_loads(
+                manifest_bytes,
+                source=f"server artifact manifest: {path}",
+            ),
+            "server artifact manifest",
+            supported_version=SERVER_ARTIFACT_SCHEMA_VERSION,
         )
+        artifacts = payload.get("artifacts")
+        mismatch_message = (
+            "server artifact manifest does not match schema_version "
+            f"{SERVER_ARTIFACT_SCHEMA_VERSION}; regenerate its artifacts"
+        )
+        if not isinstance(artifacts, Mapping):
+            raise ValueError(mismatch_message)
+        for name, layout in SERVER_ARTIFACTS.items():
+            artifact = artifacts.get(name)
+            if not isinstance(artifact, Mapping) or any(
+                artifact.get(key) != value for key, value in layout.items()
+            ):
+                raise ValueError(mismatch_message)
+        _validate_server_binding(payload.get("binding"), app_manifest=app_manifest)
+
+        lifecycle = payload.get("lifecycle")
+        checksums = payload.get("checksums")
+        sizes = payload.get("sizes")
+        initial_inventory = set(os.listdir(directory_descriptor))
         chain.verify()
-        _validate_server_binding(payload.get("binding"), app_manifest=retained_manifest)
+        if lifecycle is None and checksums is None and sizes is None:
+            filenames = {
+                str(layout["filename"])
+                for layout in SERVER_ARTIFACTS.values()
+                if str(layout["filename"]) in initial_inventory
+            }
+            expected_inventory = initial_inventory
+        else:
+            if (
+                lifecycle != "complete"
+                or not isinstance(checksums, Mapping)
+                or not isinstance(sizes, Mapping)
+                or set(sizes) != set(checksums)
+            ):
+                raise ValueError(
+                    "server artifact manifest has invalid completion metadata"
+                )
+            if not REQUIRED_COMPLETED_ARTIFACTS <= checksums.keys():
+                raise ValueError(
+                    "server artifact manifest is missing required checksums"
+                )
+            filenames = set(checksums)
+            expected_inventory = {SERVER_ARTIFACT_MANIFEST_FILENAME, *filenames}
+            if initial_inventory != expected_inventory:
+                raise ValueError("completed server artifact inventory does not match")
+
+        files: dict[str, bytes] = {}
+        retained_artifacts: dict[str, RetainedRegularFile] = {}
+        for filename in filenames:
+            expected = (
+                checksums.get(filename) if isinstance(checksums, Mapping) else None
+            )
+            expected_size = sizes.get(filename) if isinstance(sizes, Mapping) else None
+            if (
+                not isinstance(filename, str)
+                or Path(filename).name != filename
+                or (
+                    expected is not None
+                    and (
+                        not isinstance(expected, str)
+                        or len(expected) != 71
+                        or not expected.startswith("sha256:")
+                    )
+                )
+                or (expected_size is not None and type(expected_size) is not int)
+            ):
+                raise ValueError("server artifact manifest has an invalid checksum")
+            try:
+                retained = retained_files.enter_context(
+                    read_regular_file_snapshot_at(
+                        directory_descriptor,
+                        filename,
+                        retain=True,
+                    )
+                )
+            except ValueError as error:
+                raise ValueError(
+                    f"server artifact is missing or unsafe: {filename}"
+                ) from error
+            content = retained.snapshot.content
+            retained_artifacts[filename] = retained
+            chain.verify()
+            if expected is not None and not hmac.compare_digest(
+                sha256_bytes(content), expected
+            ):
+                raise ValueError(f"server artifact checksum does not match: {filename}")
+            if expected_size is not None and len(content) != expected_size:
+                raise ValueError(f"server artifact size does not match: {filename}")
+            files[filename] = content
+        if lifecycle == "complete":
+            from src.app_manifest import validate_app_manifest_bytes
+
+            retained_public_manifest = validate_app_manifest_bytes(
+                files["manifest.json"],
+                files["vocab.txt"],
+                vocabulary_path=canonical_dir / "vocab.txt",
+            )
+            chain.verify()
+            _validate_server_binding(
+                payload.get("binding"), app_manifest=retained_public_manifest
+            )
+            chain.verify()
+            if set(os.listdir(directory_descriptor)) != expected_inventory:
+                raise ValueError(
+                    "completed server artifact inventory changed while loading"
+                )
+            chain.verify()
+            _validate_completed_run_provenance(
+                canonical_dir,
+                payload,
+                files,
+                retained_public_manifest,
+            )
+            chain.verify()
+        snapshot = ServerArtifactSnapshot(
+            directory=canonical_dir,
+            manifest=deep_freeze(payload),
+            files=MappingProxyType(files),
+        )
+        if final_check is not None:
+            final_check()
         chain.verify()
         if set(os.listdir(directory_descriptor)) != expected_inventory:
-            raise ValueError(
-                "completed server artifact inventory changed while loading"
+            raise ValueError("server artifact inventory changed while loading")
+        retained_manifest.verify(
+            directory_descriptor,
+            SERVER_ARTIFACT_MANIFEST_FILENAME,
+            expected_content=manifest_bytes,
+        )
+        for filename, retained in retained_artifacts.items():
+            retained.verify(
+                directory_descriptor,
+                filename,
+                expected_content=files[filename],
             )
         chain.verify()
-        _validate_completed_run_provenance(
-            canonical_dir,
-            payload,
-            files,
-            retained_manifest,
-        )
-        chain.verify()
-    snapshot = ServerArtifactSnapshot(
-        directory=canonical_dir,
-        manifest=deep_freeze(payload),
-        files=MappingProxyType(files),
-    )
-    chain.verify()
-    return snapshot
+        return snapshot
 
 
 def load_server_artifact_manifest(artifact_dir: Path) -> Mapping[str, Any]:

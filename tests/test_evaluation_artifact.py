@@ -617,6 +617,52 @@ os._exit(72)
             self.assertTrue(artifact.is_dir())
             self.assertFalse(residue.exists())
 
+    def test_publication_recovers_private_partial_deletion_tombstone(self) -> None:
+        """Retry a failed rollback without restoring a partial public artifact."""
+        from src import artifact_compatibility
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            output = root / "evaluation"
+            real_unlink = artifact_compatibility.os.unlink
+            failed = False
+
+            def fail_after_detachment(name, *args, **kwargs):
+                nonlocal failed
+                if not failed and str(name).endswith(".deleting"):
+                    failed = True
+                    raise OSError("injected evaluation rollback failure")
+                return real_unlink(name, *args, **kwargs)
+
+            with (
+                patch.object(
+                    artifact_compatibility.os,
+                    "unlink",
+                    side_effect=fail_after_detachment,
+                ),
+                self.assertRaisesRegex(ValueError, "row count mismatch"),
+            ):
+                publish_evaluation_artifact(
+                    self.rows[:1],
+                    output,
+                    protocol=self.protocol,
+                )
+
+            self.assertFalse(output.exists())
+            tombstones = list(root.glob(".evaluation.*.deleting"))
+            self.assertEqual(len(tombstones), 1)
+            self.assertFalse(any(root.glob(".evaluation.*.staging")))
+
+            self.assertEqual(
+                publish_evaluation_artifact(
+                    self.rows,
+                    output,
+                    protocol=self.protocol,
+                ),
+                output,
+            )
+            self.assertFalse(tombstones[0].exists())
+
     def test_publication_rejects_symlinked_ancestor_before_external_cleanup(
         self,
     ) -> None:
@@ -746,6 +792,88 @@ os._exit(72)
 
             with self.assertRaisesRegex(ValueError, "unexpected files"):
                 load_evaluation_artifact_snapshot(artifact, protocol=self.protocol)
+
+    def test_loader_retains_both_files_through_final_return(self) -> None:
+        """Reject exact and invalid file replacement after reads and validation."""
+        from src import evaluation_artifact
+
+        for filename in (
+            EVALUATION_MANIFEST_FILENAME,
+            EVALUATION_RECORDS_FILENAME,
+        ):
+            for boundary in ("read", "return"):
+                for replacement_kind in ("exact", "invalid"):
+                    with (
+                        self.subTest(
+                            filename=filename,
+                            boundary=boundary,
+                            replacement_kind=replacement_kind,
+                        ),
+                        tempfile.TemporaryDirectory() as tmpdir,
+                    ):
+                        root = Path(tmpdir)
+                        artifact = publish_evaluation_artifact(
+                            self.rows,
+                            root / "evaluation",
+                            protocol=self.protocol,
+                        )
+                        selected = artifact / filename
+                        replacement = root / "replacement"
+                        replacement.write_bytes(
+                            selected.read_bytes()
+                            if replacement_kind == "exact"
+                            else b"invalid replacement"
+                        )
+                        parked = root / "parked"
+                        replaced = False
+                        real_read = evaluation_artifact.read_regular_file_snapshot_at
+                        real_freeze = evaluation_artifact.deep_freeze
+                        descriptor_baseline = len(os.listdir("/proc/self/fd"))
+
+                        def replace() -> None:
+                            nonlocal replaced
+                            if replaced:
+                                return
+                            replaced = True
+                            selected.replace(parked)
+                            replacement.replace(selected)
+
+                        def replace_after_read(*args, **kwargs):
+                            result = real_read(*args, **kwargs)
+                            if boundary == "read" and args[1] == filename:
+                                replace()
+                            return result
+
+                        def replace_before_return(value):
+                            result = real_freeze(value)
+                            if boundary == "return":
+                                replace()
+                            return result
+
+                        with (
+                            patch.object(
+                                evaluation_artifact,
+                                "read_regular_file_snapshot_at",
+                                side_effect=replace_after_read,
+                            ),
+                            patch.object(
+                                evaluation_artifact,
+                                "deep_freeze",
+                                side_effect=replace_before_return,
+                            ),
+                            self.assertRaisesRegex(
+                                ValueError, "changed while retained"
+                            ),
+                        ):
+                            load_evaluation_artifact_snapshot(
+                                artifact,
+                                protocol=self.protocol,
+                            )
+
+                        self.assertTrue(replaced)
+                        self.assertEqual(
+                            len(os.listdir("/proc/self/fd")), descriptor_baseline
+                        )
 
     def test_loader_retains_the_complete_chain_through_every_boundary(self) -> None:
         """Reject exact and partial replacements during reads, validation, and return."""

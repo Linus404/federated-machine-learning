@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 from src.artifact_compatibility import (
     PUBLIC_ARTIFACT_SCHEMA_VERSION,
+    RetainedDirectoryChain,
     canonical_json_bytes,
     deep_freeze,
-    read_regular_file,
+    read_regular_file_snapshot_at,
     sha256_bytes,
     validate_artifact_schema,
 )
@@ -174,29 +176,63 @@ def load_app_manifest(
         If the public artifact path, schema, dataset, or vocabulary is invalid.
     """
     public_dir = resolve_public_artifact_dir(public_artifact_dir=public_artifact_dir)
-    if public_dir.is_symlink() or not public_dir.is_dir():
-        raise ValueError("public artifact directory must be a regular directory")
-    canonical_dir = public_dir.resolve(strict=True)
-    path = public_dir / "manifest.json"
-    manifest_bytes = read_regular_file(path, parent=canonical_dir)
-    try:
-        validate_artifact_schema(
-            json.loads(manifest_bytes.decode("utf-8")),
-            "public manifest",
-            supported_version=PUBLIC_ARTIFACT_SCHEMA_VERSION,
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError("invalid public manifest") from error
-    if {entry.name for entry in public_dir.iterdir()} != PUBLIC_ARTIFACT_FILENAMES:
-        raise ValueError("public artifact contains unexpected files")
-    vocabulary_path = public_dir / "vocab.txt"
-    vocabulary_bytes = read_regular_file(vocabulary_path, parent=canonical_dir)
-    return validate_app_manifest_bytes(
-        manifest_bytes,
-        vocabulary_bytes,
-        vocabulary_path=vocabulary_path,
-        protocol=protocol,
+    chain = RetainedDirectoryChain.open(
+        public_dir,
+        error_message="public artifact directory chain changed while loading",
     )
+    with chain:
+        canonical_dir = chain.path
+        descriptor = chain.directory.descriptor
+        retained_manifest = read_regular_file_snapshot_at(
+            descriptor,
+            "manifest.json",
+            retain=True,
+        )
+        with retained_manifest:
+            manifest_bytes = retained_manifest.snapshot.content
+            chain.verify()
+            try:
+                validate_artifact_schema(
+                    json.loads(manifest_bytes.decode("utf-8")),
+                    "public manifest",
+                    supported_version=PUBLIC_ARTIFACT_SCHEMA_VERSION,
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError("invalid public manifest") from error
+            chain.verify()
+            if set(os.listdir(descriptor)) != PUBLIC_ARTIFACT_FILENAMES:
+                raise ValueError("public artifact contains unexpected files")
+            chain.verify()
+            vocabulary_path = canonical_dir / "vocab.txt"
+            retained_vocabulary = read_regular_file_snapshot_at(
+                descriptor,
+                "vocab.txt",
+                retain=True,
+            )
+            with retained_vocabulary:
+                vocabulary_bytes = retained_vocabulary.snapshot.content
+                chain.verify()
+                snapshot = validate_app_manifest_bytes(
+                    manifest_bytes,
+                    vocabulary_bytes,
+                    vocabulary_path=vocabulary_path,
+                    protocol=protocol,
+                )
+                chain.verify()
+                if set(os.listdir(descriptor)) != PUBLIC_ARTIFACT_FILENAMES:
+                    raise ValueError("public artifact inventory changed while loading")
+                retained_manifest.verify(
+                    descriptor,
+                    "manifest.json",
+                    expected_content=manifest_bytes,
+                )
+                retained_vocabulary.verify(
+                    descriptor,
+                    "vocab.txt",
+                    expected_content=vocabulary_bytes,
+                )
+                chain.verify()
+                return snapshot
 
 
 def validate_app_manifest_bytes(
