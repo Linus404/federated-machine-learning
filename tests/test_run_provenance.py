@@ -513,7 +513,13 @@ class RunProvenanceTests(unittest.TestCase):
                 ),
                 *(
                     valid[:-2] + f',\n  "producer": {constant}\n}}\n'
-                    for constant in ("NaN", "Infinity", "-Infinity")
+                    for constant in (
+                        "NaN",
+                        "Infinity",
+                        "-Infinity",
+                        "1e999",
+                        "-1e999",
+                    )
                 ),
             )
             for document in hostile_documents:
@@ -524,11 +530,13 @@ class RunProvenanceTests(unittest.TestCase):
                     ):
                         load_run_provenance_manifest(manifest_path)
 
-            finite = valid[:-2] + ',\n  "producer": {"attempt": 1.5}\n}\n'
+            finite = (
+                valid[:-2] + ',\n  "producer": {"upper": 1e308, "lower": -1e308}\n}\n'
+            )
             manifest_path.write_text(finite, encoding="utf-8")
             self.assertEqual(
                 load_run_provenance_manifest(manifest_path)["producer"],
-                {"attempt": 1.5},
+                {"upper": 1e308, "lower": -1e308},
             )
 
     def test_loader_rejects_missing_and_invalid_nested_metadata(self) -> None:

@@ -60,9 +60,14 @@ adapted on that same split. It writes the official test split in ascending sourc
 order to the selected prepared generation, with stable `test:<row-index>`
 identities and a strict checksum manifest. One atomic `.prepared-current`
 switch selects the matching client, public, and evaluation directories together;
-after an interruption, either the prior generation or the fully prepared new
-generation remains selected, depending on whether the atomic pointer replacement
-completed. The unsupervised split is
+after an interruption during later preparation, either the prior generation or
+the fully prepared new generation remains selected, depending on whether the
+atomic pointer replacement completed. During the first legacy migration,
+preparation may be interrupted after archiving the legacy roots but before
+all aliases and the pointer are installed, leaving the logical roots only
+partially visible and no generation selected. The durable journal makes that
+state recoverable without byte loss, but preparation must be rerun to complete
+selection. The unsupervised split is
 verified and excluded. The
 generated directories simulate client-scoped
 storage only after this centralized preparation; they are not evidence that data

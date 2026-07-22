@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import shutil
 import stat
@@ -91,6 +92,30 @@ def _reject_non_finite_json_constant(constant: str) -> Never:
     raise ValueError(f"non-finite JSON constant: {constant}")
 
 
+def _parse_finite_json_float(value: str) -> float:
+    """Decode one JSON float while rejecting overflow to infinity.
+
+    Parameters
+    ----------
+    value : str
+        Valid JSON numeric token supplied by the decoder.
+
+    Returns
+    -------
+    float
+        Finite decoded value with the standard JSON decoder's float semantics.
+
+    Raises
+    ------
+    ValueError
+        If the numeric token decodes to a non-finite float.
+    """
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON float: {value}")
+    return parsed
+
+
 def strict_json_loads(document: str | bytes | bytearray, *, source: str) -> Any:
     """Decode strict JSON and normalize parser failures for one trust boundary.
 
@@ -117,6 +142,7 @@ def strict_json_loads(document: str | bytes | bytearray, *, source: str) -> Any:
             document,
             object_pairs_hook=reject_duplicate_json_keys,
             parse_constant=_reject_non_finite_json_constant,
+            parse_float=_parse_finite_json_float,
         )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         raise ValueError(f"invalid {source}") from error

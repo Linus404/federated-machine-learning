@@ -17,6 +17,7 @@ from src.artifact_compatibility import (
     load_server_artifact_snapshot,
     read_regular_file,
     require_secure_artifact_platform,
+    strict_json_loads,
     validate_artifact_schema,
     write_server_artifact_manifest,
 )
@@ -24,6 +25,19 @@ from tests.artifact_helpers import fake_app_manifest
 
 
 class ArtifactCompatibilityTests(unittest.TestCase):
+    def test_strict_json_rejects_overflow_and_accepts_finite_exponents(self) -> None:
+        for value in ("1e999", "-1e999"):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "invalid test document"),
+            ):
+                strict_json_loads(f'{{"value":{value}}}', source="test document")
+
+        self.assertEqual(
+            strict_json_loads('{"upper":1e308,"lower":-1e308}', source="test document"),
+            {"upper": 1e308, "lower": -1e308},
+        )
+
     def test_secure_artifact_platform_rejects_windows(self) -> None:
         with (
             patch("src.artifact_compatibility.sys.platform", "win32"),
@@ -225,7 +239,7 @@ class ArtifactCompatibilityTests(unittest.TestCase):
                 path, app_manifest=fake_app_manifest()
             )
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-            payload["producer"] = "test"
+            payload["producer"] = {"upper": 1e308, "lower": -1e308}
             payload["artifacts"]["model"]["description"] = "global model"
             payload["artifacts"]["diagnostics"] = {"filename": "debug.json"}
             manifest_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -262,7 +276,13 @@ class ArtifactCompatibilityTests(unittest.TestCase):
                 ),
                 *(
                     valid[:-2] + f',\n  "producer": {constant}\n}}\n'
-                    for constant in ("NaN", "Infinity", "-Infinity")
+                    for constant in (
+                        "NaN",
+                        "Infinity",
+                        "-Infinity",
+                        "1e999",
+                        "-1e999",
+                    )
                 ),
             )
             for document in hostile_documents:

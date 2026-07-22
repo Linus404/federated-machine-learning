@@ -171,9 +171,11 @@ class ArtifactHistoryTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "invalid current-run index"):
                     resolve_current_run_dir(root)
 
-    def test_current_index_rejects_non_finite_constants(self) -> None:
+    def test_current_index_rejects_non_finite_numbers_and_accepts_finite_exponents(
+        self,
+    ) -> None:
         checksum = "sha256:" + "0" * 64
-        for constant in ("NaN", "Infinity", "-Infinity"):
+        for constant in ("NaN", "Infinity", "-Infinity", "1e999", "-1e999"):
             with (
                 self.subTest(constant=constant),
                 tempfile.TemporaryDirectory() as tmpdir,
@@ -189,6 +191,19 @@ class ArtifactHistoryTests(unittest.TestCase):
 
                 with self.assertRaisesRegex(ValueError, "invalid current-run index"):
                     resolve_current_run_dir(root)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            publish_completed_run(root, run)
+            pointer = root / "current.json"
+            valid = pointer.read_text(encoding="utf-8")
+            pointer.write_text(
+                valid[:-2] + ',\n  "producer": [1e308, -1e308]\n}\n',
+                encoding="utf-8",
+            )
+
+            self.assertEqual(resolve_current_run_dir(root), run.resolve())
 
     def test_dangling_current_index_symlink_is_not_legacy_absence(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -300,6 +315,8 @@ class ArtifactHistoryTests(unittest.TestCase):
             "NaN",
             "Infinity",
             "-Infinity",
+            "1e999",
+            "-1e999",
         ):
             with (
                 self.subTest(hostile_case=hostile_case),
