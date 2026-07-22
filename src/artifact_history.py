@@ -22,6 +22,7 @@ from src.artifact_compatibility import (
     ServerArtifactSnapshot,
     load_server_artifact_snapshot,
     read_regular_file,
+    reject_duplicate_json_keys,
     sha256_bytes,
     write_json_atomically,
     write_server_artifact_manifest,
@@ -177,7 +178,10 @@ def _load_current_index(artifact_root: str | Path) -> Mapping[str, Any] | None:
     if not path.exists() and not path.is_symlink():
         return None
     try:
-        payload = json.loads(read_regular_file(path, parent=root).decode("utf-8"))
+        payload = json.loads(
+            read_regular_file(path, parent=root).decode("utf-8"),
+            object_pairs_hook=reject_duplicate_json_keys,
+        )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         raise ValueError(f"invalid current-run index: {path}") from error
     if not isinstance(payload, Mapping):

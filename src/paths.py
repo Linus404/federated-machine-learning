@@ -7,7 +7,11 @@ import uuid
 from pathlib import Path
 from typing import BinaryIO
 
-from src.artifact_compatibility import canonical_json_bytes, read_regular_file
+from src.artifact_compatibility import (
+    canonical_json_bytes,
+    read_regular_file,
+    reject_duplicate_json_keys,
+)
 
 PUBLIC_ARTIFACT_DIR_ENV = "FML_PUBLIC_ARTIFACT_DIR"
 SERVER_ARTIFACT_DIR_ENV = "FML_SERVER_ARTIFACT_DIR"
@@ -21,34 +25,6 @@ PREPARED_LEGACY_DIRECTORY = ".prepared-legacy"
 PREPARED_MIGRATION_FILENAME = ".prepared-migration.json"
 PREPARED_GENERATION_SCHEMA_VERSION = 1
 PREPARED_ARTIFACT_KINDS = frozenset({"client", "public", "evaluation"})
-
-
-def _reject_duplicate_json_keys(
-    pairs: list[tuple[str, object]],
-) -> dict[str, object]:
-    """Decode one JSON object while rejecting duplicate member names.
-
-    Parameters
-    ----------
-    pairs : list of tuple of str and object
-        Decoded object members in source order.
-
-    Returns
-    -------
-    dict of str to object
-        Unique decoded members preserving their source order.
-
-    Raises
-    ------
-    ValueError
-        If a member name occurs more than once.
-    """
-    result: dict[str, object] = {}
-    for key, item in pairs:
-        if key in result:
-            raise ValueError(f"duplicate prepared generation index field: {key}")
-        result[key] = item
-    return result
 
 
 class RunArtifactLock:
@@ -161,7 +137,7 @@ def resolve_prepared_artifact_dir(value: str | Path, artifact_kind: str) -> Path
     try:
         index_bytes = read_regular_file(index_path, parent=canonical_generation)
         payload = json.loads(
-            index_bytes.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_keys
+            index_bytes.decode("utf-8"), object_pairs_hook=reject_duplicate_json_keys
         )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         raise ValueError("prepared generation index is invalid or unsafe") from error

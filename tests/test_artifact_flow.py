@@ -7,6 +7,7 @@ import tempfile
 import textwrap
 import unittest
 from collections import Counter
+from contextlib import chdir
 from pathlib import Path
 from unittest.mock import patch
 
@@ -889,39 +890,114 @@ class ArtifactFlowTests(unittest.TestCase):
                     )
                 load_dataset.assert_not_called()
 
-    def test_preflight_rejects_absolute_symlinked_ancestor_without_mutation(
+    def test_preflight_rejects_symlinked_ancestor_without_mutation(
         self,
     ) -> None:
-        for artifact_name, output_name in (
-            ("client", "clients"),
-            ("public", "public"),
-            ("evaluation", "evaluation"),
-        ):
-            with (
-                self.subTest(artifact_name=artifact_name),
-                tempfile.TemporaryDirectory() as tmpdir,
+        for relative in (False, True):
+            for artifact_name, output_name in (
+                ("client", "clients"),
+                ("public", "public"),
+                ("evaluation", "evaluation"),
             ):
-                root = Path(tmpdir)
-                external = root / "external"
-                external.mkdir()
-                marker = external / "must-survive"
-                marker.write_text("external", encoding="utf-8")
-                alias = root / "alias"
-                try:
-                    alias.symlink_to(external, target_is_directory=True)
-                except OSError as error:
-                    self.skipTest(f"directory symlinks are unavailable: {error}")
-
-                with self.assertRaisesRegex(ValueError, "path component"):
-                    _preflight_output_root(
-                        alias / output_name,
-                        artifact_name,
-                        reusable=True,
-                        allow_prepared_alias=True,
+                with (
+                    self.subTest(artifact_name=artifact_name, relative=relative),
+                    tempfile.TemporaryDirectory() as tmpdir,
+                ):
+                    root = Path(tmpdir)
+                    external = root / "external"
+                    external.mkdir()
+                    marker = external / "must-survive"
+                    marker.write_text("external", encoding="utf-8")
+                    alias = root / "alias"
+                    try:
+                        alias.symlink_to(external, target_is_directory=True)
+                    except OSError as error:
+                        self.skipTest(f"directory symlinks are unavailable: {error}")
+                    output = (
+                        Path("alias") / output_name if relative else alias / output_name
                     )
 
-                self.assertEqual(marker.read_text(encoding="utf-8"), "external")
-                self.assertFalse((external / output_name).exists())
+                    with (
+                        chdir(root),
+                        self.assertRaisesRegex(ValueError, "path component"),
+                    ):
+                        _preflight_output_root(
+                            output,
+                            artifact_name,
+                            reusable=True,
+                            allow_prepared_alias=True,
+                        )
+
+                    self.assertEqual(marker.read_text(encoding="utf-8"), "external")
+                    self.assertFalse((external / output_name).exists())
+
+    def test_preflight_preserves_relative_lexical_prepared_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            try:
+                (root / "clients").symlink_to(
+                    Path(".prepared-current") / "client",
+                    target_is_directory=True,
+                )
+            except OSError as error:
+                self.skipTest(f"directory symlinks are unavailable: {error}")
+
+            with chdir(root):
+                output = _preflight_output_root(
+                    "nested/../clients",
+                    "client",
+                    reusable=True,
+                    allow_prepared_alias=True,
+                )
+
+            self.assertEqual(output, root / "clients")
+
+    def test_preparation_rejects_relative_symlinked_ancestor_before_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            launch_dir = root / "launch"
+            external = root / "external"
+            generations = external / "nested" / ".prepared-generations"
+            residue = generations / ".prepare-attacker.staging"
+            launch_dir.mkdir()
+            residue.mkdir(parents=True)
+            (external / "marker.bin").write_bytes(b"external\x00content")
+            (residue / "preserve.bin").write_bytes(b"prepared residue")
+            try:
+                (launch_dir / "alias").symlink_to(external, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"directory symlinks are unavailable: {error}")
+            before = {
+                path.relative_to(external): (
+                    path.lstat().st_mode,
+                    path.read_bytes() if path.is_file() else None,
+                )
+                for path in (external, *external.rglob("*"))
+            }
+
+            with (
+                chdir(launch_dir),
+                patch("src.data_prep._acquire_preparation_lock") as acquire_lock,
+                self.assertRaisesRegex(ValueError, "path component"),
+            ):
+                prepare_all(
+                    4,
+                    "alias/nested/clients",
+                    "alias/nested/public",
+                    "alias/nested/evaluation",
+                )
+
+            acquire_lock.assert_not_called()
+            after = {
+                path.relative_to(external): (
+                    path.lstat().st_mode,
+                    path.read_bytes() if path.is_file() else None,
+                )
+                for path in (external, *external.rglob("*"))
+            }
+            self.assertEqual(after, before)
 
     def test_public_publisher_rejects_symlink_without_external_writes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

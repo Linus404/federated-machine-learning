@@ -47,6 +47,34 @@ _SERVER_BINDING_FIELDS = {
 _MODEL_DIMENSION_FIELDS = {"vocabulary_size", "sequence_length", "embedding_dim"}
 
 
+def reject_duplicate_json_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    """Decode one JSON object while rejecting duplicate member names.
+
+    Parameters
+    ----------
+    pairs : list of tuple of str and object
+        Decoded object members in source order.
+
+    Returns
+    -------
+    dict of str to object
+        Unique decoded members preserving their source order.
+
+    Raises
+    ------
+    ValueError
+        If a member name occurs more than once.
+    """
+    result: dict[str, object] = {}
+    for key, item in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object member: {key}")
+        result[key] = item
+    return result
+
+
 def require_secure_artifact_platform() -> None:
     """Require the Linux filesystem primitives used by artifact boundaries.
 

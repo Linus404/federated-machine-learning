@@ -146,6 +146,31 @@ class ArtifactHistoryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "invalid schema_version"):
                 resolve_current_run_dir(root)
 
+    def test_current_index_rejects_duplicate_security_fields(self) -> None:
+        checksum = "sha256:" + "0" * 64
+        indexes = (
+            '{"schema_version":true,"schema_version":1,'
+            f'"run_id":"{RUN_IDS[0]}",'
+            f'"artifact_manifest_checksum":"{checksum}"}}',
+            '{"schema_version":1,"run_id":"../outside",'
+            f'"run_id":"{RUN_IDS[0]}",'
+            f'"artifact_manifest_checksum":"{checksum}"}}',
+            '{"schema_version":1,'
+            f'"run_id":"{RUN_IDS[0]}",'
+            '"artifact_manifest_checksum":"invalid",'
+            f'"artifact_manifest_checksum":"{checksum}"}}',
+        )
+        for index in indexes:
+            with (
+                self.subTest(index=index),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                (root / "current.json").write_text(index, encoding="utf-8")
+
+                with self.assertRaisesRegex(ValueError, "invalid current-run index"):
+                    resolve_current_run_dir(root)
+
     def test_dangling_current_index_symlink_is_not_legacy_absence(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

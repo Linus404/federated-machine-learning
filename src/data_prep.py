@@ -48,7 +48,6 @@ from src.paths import (
     RunArtifactLock,
     default_evaluation_artifact_dir,
     default_public_artifact_dir,
-    resolve_dir,
     resolve_prepared_artifact_dir,
 )
 from src.text_preprocessing import create_text_vectorizer
@@ -56,8 +55,8 @@ from src.text_preprocessing import create_text_vectorizer
 
 def _validate_absolute_output_ancestors(
     output_dir: str | Path, artifact_name: str
-) -> Path | None:
-    """Validate existing ancestors of an absolute output path without following links.
+) -> Path:
+    """Anchor an output path and validate its ancestors without following links.
 
     Parameters
     ----------
@@ -68,8 +67,8 @@ def _validate_absolute_output_ancestors(
 
     Returns
     -------
-    pathlib.Path or None
-        Lexically normalized absolute path, or ``None`` for a relative path.
+    pathlib.Path
+        Lexically normalized absolute path anchored to the launch directory.
 
     Raises
     ------
@@ -78,7 +77,7 @@ def _validate_absolute_output_ancestors(
     """
     candidate = Path(output_dir).expanduser()
     if not candidate.is_absolute():
-        return None
+        candidate = Path.cwd() / candidate
     output_path = Path(os.path.abspath(candidate))
     anchor = Path(output_path.anchor)
     current = anchor
@@ -131,12 +130,7 @@ def _preflight_output_root(
     ValueError
         If the root or its existing parent is a symlink or invalid path type.
     """
-    lexical_path = _validate_absolute_output_ancestors(output_dir, artifact_name)
-    output_path = resolve_dir(output_dir)
-    if lexical_path is not None and output_path != lexical_path:
-        raise ValueError(
-            f"{artifact_name} artifact path component must be a regular directory"
-        )
+    output_path = _validate_absolute_output_ancestors(output_dir, artifact_name)
     if output_path.is_symlink():
         expected = Path(PREPARED_CURRENT_FILENAME) / artifact_name
         if not (
