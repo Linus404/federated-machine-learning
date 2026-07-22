@@ -976,6 +976,129 @@ class ArtifactFlowTests(unittest.TestCase):
                 self.assertEqual(state_path.read_bytes(), b"foreign")
             self.assertEqual(len(os.listdir("/proc/self/fd")), baseline_descriptors)
 
+    @unittest.skipUnless(hasattr(os, "O_TMPFILE"), "state writes require Linux")
+    def test_preparation_state_revalidates_chain_at_return_boundary(self) -> None:
+        """Reject retained preparation-parent replacement after file validation."""
+        from src import data_prep
+
+        real_verify = data_prep.verify_published_unnamed_file_at
+        for replaced_component in ("parent", "ancestor"):
+            with (
+                self.subTest(replaced_component=replaced_component),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                ancestor = root / "ancestor"
+                generations = ancestor / ".prepared-generations"
+                generations.mkdir(parents=True)
+                replaced_path = (
+                    generations if replaced_component == "parent" else ancestor
+                )
+                parked = root / f"detached-{replaced_component}"
+                detached_parent = (
+                    parked
+                    if replaced_component == "parent"
+                    else parked / generations.name
+                )
+                marker = generations / "replacement-marker"
+                calls = 0
+
+                def replace_after_final_verify(
+                    source_descriptor: int,
+                    snapshot,
+                    parent_descriptor: int,
+                    name: str,
+                    *,
+                    expected_content: bytes,
+                ) -> None:
+                    """Replace one retained chain after its final file validation.
+
+                    Parameters
+                    ----------
+                    source_descriptor : int
+                        Retained unnamed source descriptor.
+                    snapshot : RegularFileSnapshot
+                        Captured source snapshot.
+                    parent_descriptor : int
+                        Retained state-directory descriptor.
+                    name : str
+                        Direct committed state name.
+                    expected_content : bytes
+                        Canonical state bytes.
+
+                    Returns
+                    -------
+                    None
+                    """
+                    nonlocal calls
+                    calls += 1
+                    real_verify(
+                        source_descriptor,
+                        snapshot,
+                        parent_descriptor,
+                        name,
+                        expected_content=expected_content,
+                    )
+                    if calls == 2:
+                        replaced_path.rename(parked)
+                        generations.mkdir(parents=True)
+                        marker.write_bytes(b"replacement")
+
+                baseline_descriptors = len(os.listdir("/proc/self/fd"))
+                with RetainedDirectoryChain.open(
+                    generations, check_platform=False
+                ) as chain:
+                    parent_stat = os.fstat(chain.directory.descriptor)
+                    state = data_prep._PreparationStageState(
+                        "reserved",
+                        parent_stat.st_dev,
+                        parent_stat.st_ino,
+                        "1" * 32,
+                        f".prepare-{'1' * 32}.staging",
+                    )
+                    expected_document = canonical_json_bytes(
+                        {**state.payload(), "generation": 0}
+                    )
+                    with (
+                        patch.object(
+                            data_prep,
+                            "verify_published_unnamed_file_at",
+                            side_effect=replace_after_final_verify,
+                        ),
+                        self.assertRaisesRegex(
+                            ValueError, "artifact directory chain changed"
+                        ),
+                    ):
+                        data_prep._write_preparation_stage_state(chain, state, None)
+
+                state_name = data_prep._preparation_state_name(0)
+                self.assertEqual(calls, 2)
+                self.assertEqual(marker.read_bytes(), b"replacement")
+                self.assertEqual(
+                    (detached_parent / state_name).read_bytes(), expected_document
+                )
+                with RetainedDirectoryChain.open(
+                    generations, check_platform=False
+                ) as retry_chain:
+                    retry_parent = os.fstat(retry_chain.directory.descriptor)
+                    retry_state = data_prep._PreparationStageState(
+                        "reserved",
+                        retry_parent.st_dev,
+                        retry_parent.st_ino,
+                        "2" * 32,
+                        f".prepare-{'2' * 32}.staging",
+                    )
+                    retry_record = data_prep._write_preparation_stage_state(
+                        retry_chain, retry_state, None
+                    )
+
+                self.assertEqual(retry_record.state, retry_state)
+                self.assertEqual(marker.read_bytes(), b"replacement")
+                self.assertEqual(
+                    (detached_parent / state_name).read_bytes(), expected_document
+                )
+                self.assertEqual(len(os.listdir("/proc/self/fd")), baseline_descriptors)
+
     def test_recovery_accepts_equal_content_with_distinct_split_identities(
         self,
     ) -> None:

@@ -792,6 +792,96 @@ class ArtifactCompatibilityTests(unittest.TestCase):
                 self.assertEqual(len(os.listdir("/proc/self/fd")), baseline_descriptors)
 
     @unittest.skipUnless(hasattr(os, "O_TMPFILE"), "immutable writes require Linux")
+    def test_immutable_atomic_write_revalidates_chain_at_return_boundary(
+        self,
+    ) -> None:
+        """Reject parent-chain replacement after the final retained-file check."""
+        from src import artifact_compatibility
+
+        real_verify = artifact_compatibility.verify_published_unnamed_file_at
+        for replaced_component in ("parent", "ancestor"):
+            with (
+                self.subTest(replaced_component=replaced_component),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                ancestor = root / "ancestor"
+                parent = ancestor / "parent"
+                parent.mkdir(parents=True)
+                target = parent / "artifact.bin"
+                replaced_path = parent if replaced_component == "parent" else ancestor
+                parked = root / f"detached-{replaced_component}"
+                detached_target = (
+                    parked / target.name
+                    if replaced_component == "parent"
+                    else parked / parent.name / target.name
+                )
+                calls = 0
+
+                def replace_after_final_verify(
+                    source_descriptor: int,
+                    snapshot,
+                    parent_descriptor: int,
+                    name: str,
+                    *,
+                    expected_content: bytes,
+                ) -> None:
+                    """Replace one retained chain after its final file validation.
+
+                    Parameters
+                    ----------
+                    source_descriptor : int
+                        Retained unnamed source descriptor.
+                    snapshot : RegularFileSnapshot
+                        Captured source snapshot.
+                    parent_descriptor : int
+                        Retained destination-directory descriptor.
+                    name : str
+                        Direct destination child name.
+                    expected_content : bytes
+                        Exact expected destination bytes.
+
+                    Returns
+                    -------
+                    None
+                    """
+                    nonlocal calls
+                    calls += 1
+                    real_verify(
+                        source_descriptor,
+                        snapshot,
+                        parent_descriptor,
+                        name,
+                        expected_content=expected_content,
+                    )
+                    if calls == 4:
+                        replaced_path.rename(parked)
+                        parent.mkdir(parents=True)
+                        target.write_bytes(b"foreign")
+
+                baseline_descriptors = len(os.listdir("/proc/self/fd"))
+                with (
+                    patch.object(
+                        artifact_compatibility,
+                        "verify_published_unnamed_file_at",
+                        side_effect=replace_after_final_verify,
+                    ),
+                    self.assertRaisesRegex(
+                        ValueError, "artifact directory chain changed"
+                    ),
+                ):
+                    write_bytes_atomically(target, b"published", overwrite=False)
+
+                self.assertEqual(calls, 4)
+                self.assertEqual(target.read_bytes(), b"foreign")
+                self.assertEqual(detached_target.read_bytes(), b"published")
+                with self.assertRaises(FileExistsError):
+                    write_bytes_atomically(target, b"retry", overwrite=False)
+                self.assertEqual(target.read_bytes(), b"foreign")
+                self.assertEqual(detached_target.read_bytes(), b"published")
+                self.assertEqual(len(os.listdir("/proc/self/fd")), baseline_descriptors)
+
+    @unittest.skipUnless(hasattr(os, "O_TMPFILE"), "immutable writes require Linux")
     def test_immutable_atomic_write_classifies_only_capability_open_errors(
         self,
     ) -> None:

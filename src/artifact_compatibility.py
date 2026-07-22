@@ -2391,6 +2391,7 @@ def write_bytes_atomically(
                 path.name,
                 expected_content=content,
             )
+            chain.verify()
             return path
     finally:
         retained.close()

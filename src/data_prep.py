@@ -783,6 +783,7 @@ def _write_preparation_stage_state(
             name,
             expected_content=document,
         )
+        chain.verify()
         return installed
     finally:
         os.close(descriptor)

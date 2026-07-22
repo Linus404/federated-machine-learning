@@ -1055,6 +1055,130 @@ with parent.chain:
                 self.assertEqual(Path(tmpdir, state_name).read_bytes(), b"foreign")
             self.assertEqual(len(os.listdir("/proc/self/fd")), baseline_descriptors)
 
+    @unittest.skipUnless(hasattr(os, "O_TMPFILE"), "state writes require Linux")
+    def test_ownership_state_revalidates_chain_at_return_boundary(self) -> None:
+        """Reject retained evaluation-parent replacement after file validation."""
+        from src import evaluation_artifact
+
+        real_verify = evaluation_artifact.verify_published_unnamed_file_at
+        for replaced_component in ("parent", "ancestor"):
+            with (
+                self.subTest(replaced_component=replaced_component),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                owner = root / "ancestor" / "owner"
+                output = owner / "evaluation"
+                baseline_descriptors = len(os.listdir("/proc/self/fd"))
+                parent, output_name = evaluation_artifact._open_new_artifact_parent(
+                    output
+                )
+                replaced_path = (
+                    owner if replaced_component == "parent" else owner.parent
+                )
+                parked = root / f"detached-{replaced_component}"
+                detached_parent = (
+                    parked if replaced_component == "parent" else parked / owner.name
+                )
+                marker = owner / "replacement-marker"
+                calls = 0
+
+                def replace_after_final_verify(
+                    source_descriptor: int,
+                    snapshot,
+                    parent_descriptor: int,
+                    name: str,
+                    *,
+                    expected_content: bytes,
+                ) -> None:
+                    """Replace one retained chain after its final file validation.
+
+                    Parameters
+                    ----------
+                    source_descriptor : int
+                        Retained unnamed source descriptor.
+                    snapshot : RegularFileSnapshot
+                        Captured source snapshot.
+                    parent_descriptor : int
+                        Retained state-directory descriptor.
+                    name : str
+                        Direct committed state name.
+                    expected_content : bytes
+                        Canonical state bytes.
+
+                    Returns
+                    -------
+                    None
+                    """
+                    nonlocal calls
+                    calls += 1
+                    real_verify(
+                        source_descriptor,
+                        snapshot,
+                        parent_descriptor,
+                        name,
+                        expected_content=expected_content,
+                    )
+                    if calls == 2:
+                        replaced_path.rename(parked)
+                        owner.mkdir(parents=True)
+                        marker.write_bytes(b"replacement")
+
+                with parent.chain:
+                    parent_stat = os.fstat(parent.descriptor)
+                    state = evaluation_artifact._EvaluationOwnershipState(
+                        "reserved",
+                        parent_stat.st_dev,
+                        parent_stat.st_ino,
+                        output_name,
+                        "1" * 32,
+                        f".evaluation.{'1' * 32}.staging",
+                    )
+                    expected_document = canonical_json_bytes(
+                        {**state.payload(), "generation": 0}
+                    )
+                    with (
+                        patch.object(
+                            evaluation_artifact,
+                            "verify_published_unnamed_file_at",
+                            side_effect=replace_after_final_verify,
+                        ),
+                        self.assertRaisesRegex(
+                            ValueError, "evaluation parent changed during publication"
+                        ),
+                    ):
+                        evaluation_artifact._write_evaluation_state(parent, state, None)
+
+                state_name = evaluation_artifact._evaluation_state_name(output_name, 0)
+                self.assertEqual(calls, 2)
+                self.assertEqual(marker.read_bytes(), b"replacement")
+                self.assertEqual(
+                    (detached_parent / state_name).read_bytes(), expected_document
+                )
+                retry_parent, retry_output_name = (
+                    evaluation_artifact._open_new_artifact_parent(output)
+                )
+                with retry_parent.chain:
+                    retry_parent_stat = os.fstat(retry_parent.descriptor)
+                    retry_state = evaluation_artifact._EvaluationOwnershipState(
+                        "reserved",
+                        retry_parent_stat.st_dev,
+                        retry_parent_stat.st_ino,
+                        retry_output_name,
+                        "2" * 32,
+                        f".evaluation.{'2' * 32}.staging",
+                    )
+                    retry_record = evaluation_artifact._write_evaluation_state(
+                        retry_parent, retry_state, None
+                    )
+
+                self.assertEqual(retry_record.state, retry_state)
+                self.assertEqual(marker.read_bytes(), b"replacement")
+                self.assertEqual(
+                    (detached_parent / state_name).read_bytes(), expected_document
+                )
+                self.assertEqual(len(os.listdir("/proc/self/fd")), baseline_descriptors)
+
     def test_publication_rejects_corrupt_state_and_preserves_residues(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

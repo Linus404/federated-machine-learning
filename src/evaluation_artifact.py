@@ -855,6 +855,8 @@ def _write_evaluation_state(
             name,
             expected_content=document,
         )
+        if require_visible_parent:
+            _verify_evaluation_parent(parent)
         return installed
     finally:
         os.close(descriptor)
