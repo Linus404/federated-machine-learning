@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import numpy as np
 
+from src.artifact_compatibility import canonical_json_bytes
 from src.data_prep import (
     _validate_loaded_dataset,
     build_vectorizer,
@@ -603,7 +604,7 @@ os._exit(72)
             with self.assertRaisesRegex(FileExistsError, "refusing replacement"):
                 publish_evaluation_artifact(self.rows, symlink, protocol=self.protocol)
 
-    def test_publication_cleans_owned_crash_residue_and_retries(self) -> None:
+    def test_publication_preserves_unbound_crash_residue(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             residue = root / ".evaluation.crashed.staging"
@@ -615,7 +616,65 @@ os._exit(72)
             )
 
             self.assertTrue(artifact.is_dir())
-            self.assertFalse(residue.exists())
+            self.assertEqual((residue / "partial.jsonl").read_bytes(), b"partial")
+
+    def test_publication_recovers_only_state_bound_staging_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            output = root / "evaluation"
+            nonce = "1" * 32
+            stage = root / f".evaluation.{nonce}.staging"
+            unbound = root / ".evaluation.unbound.staging"
+            stage.mkdir()
+            unbound.mkdir()
+            (stage / "partial").write_bytes(b"owned")
+            (unbound / "partial").write_bytes(b"unbound")
+            parent_stat = root.stat()
+            stage_stat = stage.stat()
+            state = {
+                "schema_version": 1,
+                "operation": "build",
+                "parent_device": parent_stat.st_dev,
+                "parent_inode": parent_stat.st_ino,
+                "output_name": "evaluation",
+                "nonce": nonce,
+                "stage_name": stage.name,
+                "device": stage_stat.st_dev,
+                "inode": stage_stat.st_ino,
+                "source_name": None,
+                "tombstone_name": None,
+            }
+            state_path = root / ".evaluation.publication.state"
+            state_path.write_bytes(canonical_json_bytes(state))
+            state_path.chmod(0o600)
+
+            self.assertEqual(
+                publish_evaluation_artifact(self.rows, output, protocol=self.protocol),
+                output,
+            )
+
+            self.assertFalse(stage.exists())
+            self.assertFalse(state_path.exists())
+            self.assertEqual((unbound / "partial").read_bytes(), b"unbound")
+
+    def test_publication_rejects_corrupt_state_and_preserves_residues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            residue = root / ".evaluation.unbound.staging"
+            residue.mkdir()
+            marker = residue / "preserve"
+            marker.write_bytes(b"unbound")
+            state = root / ".evaluation.publication.state"
+            state.write_bytes(b'{"schema_version":1}\n')
+            state.chmod(0o600)
+
+            with self.assertRaisesRegex(ValueError, "ownership state"):
+                publish_evaluation_artifact(
+                    self.rows, root / "evaluation", protocol=self.protocol
+                )
+
+            self.assertEqual(marker.read_bytes(), b"unbound")
+            self.assertEqual(state.read_bytes(), b'{"schema_version":1}\n')
 
     def test_publication_recovers_private_partial_deletion_tombstone(self) -> None:
         """Retry a failed rollback without restoring a partial public artifact."""
@@ -691,7 +750,7 @@ os._exit(72)
             self.assertFalse((external / "evaluation").exists())
             self.assertFalse((external / ".evaluation.run.lock").exists())
 
-    def test_publication_rejects_linked_residue_without_external_deletion(self) -> None:
+    def test_publication_preserves_unbound_linked_residue(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             external = root / "external"
@@ -704,10 +763,12 @@ os._exit(72)
             except OSError as error:
                 self.skipTest(f"directory symlinks are unavailable: {error}")
 
-            with self.assertRaisesRegex(ValueError, "residue is unsafe"):
+            self.assertEqual(
                 publish_evaluation_artifact(
                     self.rows, root / "evaluation", protocol=self.protocol
-                )
+                ),
+                root / "evaluation",
+            )
 
             self.assertEqual(marker.read_text(encoding="utf-8"), "external")
             self.assertTrue(residue.is_symlink())

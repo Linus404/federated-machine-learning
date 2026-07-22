@@ -60,6 +60,23 @@ _RECORD_FIELDS = {
     "row_identity",
     "order",
 }
+_EVALUATION_STATE_SCHEMA_VERSION = 1
+_EVALUATION_STATE_SUFFIX = ".publication.state"
+_EVALUATION_OWNERSHIP_FILENAME = ".publication-owner"
+_EVALUATION_STATE_FIELDS = {
+    "schema_version",
+    "operation",
+    "parent_device",
+    "parent_inode",
+    "output_name",
+    "nonce",
+    "stage_name",
+    "device",
+    "inode",
+    "source_name",
+    "tombstone_name",
+}
+_STATE_TEMPORARY_NAME_ATTEMPTS = 128
 
 
 @dataclass(frozen=True)
@@ -134,6 +151,44 @@ class _RetainedEvaluationParent:
             Basename, or ``None`` for the filesystem anchor.
         """
         return None if self.path == Path(self.path.anchor) else self.path.name
+
+
+@dataclass(frozen=True)
+class _EvaluationOwnershipState:
+    """Bind one evaluation publication mutation to durable ownership evidence."""
+
+    operation: str
+    parent_device: int
+    parent_inode: int
+    output_name: str
+    nonce: str
+    stage_name: str
+    device: int | None = None
+    inode: int | None = None
+    source_name: str | None = None
+    tombstone_name: str | None = None
+
+    def payload(self) -> dict[str, object]:
+        """Return the canonical serialization payload.
+
+        Returns
+        -------
+        dict of str to object
+            Exact durable ownership record.
+        """
+        return {
+            "schema_version": _EVALUATION_STATE_SCHEMA_VERSION,
+            "operation": self.operation,
+            "parent_device": self.parent_device,
+            "parent_inode": self.parent_inode,
+            "output_name": self.output_name,
+            "nonce": self.nonce,
+            "stage_name": self.stage_name,
+            "device": self.device,
+            "inode": self.inode,
+            "source_name": self.source_name,
+            "tombstone_name": self.tombstone_name,
+        }
 
 
 def load_scientific_protocol() -> Mapping[str, Any]:
@@ -395,6 +450,337 @@ def _destination_exists(parent_descriptor: int, output_name: str) -> bool:
     return True
 
 
+def _evaluation_state_name(output_name: str) -> str:
+    """Return the private ownership-state name for one destination.
+
+    Parameters
+    ----------
+    output_name : str
+        Direct child destination basename.
+
+    Returns
+    -------
+    str
+        Descriptor-relative state filename.
+    """
+    return f".{output_name}{_EVALUATION_STATE_SUFFIX}"
+
+
+def _read_regular_bytes_at(
+    parent_descriptor: int, name: str
+) -> tuple[bytes, tuple[int, int]]:
+    """Read one stable single-link regular file without following links.
+
+    Parameters
+    ----------
+    parent_descriptor : int
+        Retained owning-directory descriptor.
+    name : str
+        Direct child filename.
+
+    Returns
+    -------
+    tuple of bytes and tuple of int
+        Exact stable file content and device/inode identity.
+    """
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+        dir_fd=parent_descriptor,
+    )
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o600
+        ):
+            raise ValueError("evaluation ownership state is unsafe")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ) or sum(map(len, chunks)) != after.st_size:
+            raise ValueError("evaluation ownership state changed while retained")
+        return b"".join(chunks), (after.st_dev, after.st_ino)
+    finally:
+        os.close(descriptor)
+
+
+def _parse_evaluation_state(document: bytes) -> _EvaluationOwnershipState:
+    """Validate one canonical evaluation ownership record.
+
+    Parameters
+    ----------
+    document : bytes
+        Exact candidate state bytes.
+
+    Returns
+    -------
+    _EvaluationOwnershipState
+        Strict validated state.
+    """
+    payload = json.loads(document)
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != _EVALUATION_STATE_FIELDS
+        or payload["schema_version"] != _EVALUATION_STATE_SCHEMA_VERSION
+        or canonical_json_bytes(payload) != document
+        or payload["operation"] not in {"reserved", "build", "install", "delete"}
+        or type(payload["parent_device"]) is not int
+        or payload["parent_device"] < 0
+        or type(payload["parent_inode"]) is not int
+        or payload["parent_inode"] < 1
+        or not isinstance(payload["output_name"], str)
+        or Path(payload["output_name"]).name != payload["output_name"]
+        or not isinstance(payload["nonce"], str)
+        or len(payload["nonce"]) != 32
+        or any(character not in "0123456789abcdef" for character in payload["nonce"])
+        or payload["stage_name"]
+        != f".{payload['output_name']}.{payload['nonce']}.staging"
+    ):
+        raise ValueError("evaluation ownership state is unsafe")
+    device = payload["device"]
+    inode = payload["inode"]
+    source_name = payload["source_name"]
+    tombstone_name = payload["tombstone_name"]
+    operation = payload["operation"]
+    if operation == "reserved":
+        valid_phase = all(
+            value is None for value in (device, inode, source_name, tombstone_name)
+        )
+    else:
+        valid_phase = (
+            type(device) is int
+            and device >= 0
+            and type(inode) is int
+            and inode >= 1
+            and (source_name is None or Path(source_name).name == source_name)
+            and (tombstone_name is None or Path(tombstone_name).name == tombstone_name)
+        )
+        if operation == "build":
+            valid_phase = valid_phase and source_name is None and tombstone_name is None
+        elif operation == "install":
+            valid_phase = (
+                valid_phase
+                and source_name == payload["stage_name"]
+                and tombstone_name is None
+            )
+        else:
+            valid_phase = (
+                valid_phase
+                and source_name in {payload["stage_name"], payload["output_name"]}
+                and tombstone_name
+                == f".{payload['output_name']}.{device:x}-{inode:x}.deleting"
+            )
+    if not valid_phase:
+        raise ValueError("evaluation ownership state is unsafe")
+    return _EvaluationOwnershipState(
+        operation,
+        payload["parent_device"],
+        payload["parent_inode"],
+        payload["output_name"],
+        payload["nonce"],
+        payload["stage_name"],
+        device,
+        inode,
+        source_name,
+        tombstone_name,
+    )
+
+
+def _load_evaluation_state(
+    parent_descriptor: int, output_name: str
+) -> tuple[_EvaluationOwnershipState, tuple[bytes, tuple[int, int]]] | None:
+    """Load the sole ownership record for one destination.
+
+    Parameters
+    ----------
+    parent_descriptor : int
+        Retained destination-parent descriptor.
+    output_name : str
+        Direct child destination basename.
+
+    Returns
+    -------
+    tuple of _EvaluationOwnershipState and bytes or None
+        Validated state and exact bytes, or ``None`` when absent.
+    """
+    name = _evaluation_state_name(output_name)
+    try:
+        record = _read_regular_bytes_at(parent_descriptor, name)
+    except FileNotFoundError:
+        return None
+    state = _parse_evaluation_state(record[0])
+    if state.output_name != output_name:
+        raise ValueError("evaluation ownership state is unsafe")
+    return state, record
+
+
+def _write_evaluation_state(
+    parent: _RetainedEvaluationParent,
+    state: _EvaluationOwnershipState,
+    previous: tuple[bytes, tuple[int, int]] | None,
+    *,
+    require_visible_parent: bool = True,
+) -> tuple[bytes, tuple[int, int]]:
+    """Install and durably flush an exact ownership-state transition.
+
+    Parameters
+    ----------
+    parent : _RetainedEvaluationParent
+        Retained complete destination-parent chain.
+    state : _EvaluationOwnershipState
+        New canonical state.
+    previous : tuple of bytes and identity or None
+        Exact prior state and identity, or ``None`` for exclusive creation.
+    require_visible_parent : bool, optional
+        Require the retained parent chain to remain visibly selected.
+
+    Returns
+    -------
+    tuple of bytes and tuple of int
+        Canonical installed bytes and state-file identity.
+    """
+    parent_stat = os.fstat(parent.descriptor)
+    if (state.parent_device, state.parent_inode) != (
+        parent_stat.st_dev,
+        parent_stat.st_ino,
+    ):
+        raise ValueError("evaluation ownership state selects another parent")
+    document = canonical_json_bytes(state.payload())
+    name = _evaluation_state_name(state.output_name)
+    descriptor: int | None = None
+    temporary = ""
+    for _ in range(_STATE_TEMPORARY_NAME_ATTEMPTS):
+        candidate = f".{name}.{uuid.uuid4().hex}.tmp"
+        try:
+            descriptor = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=parent.descriptor,
+            )
+        except FileExistsError:
+            continue
+        temporary = candidate
+        break
+    if descriptor is None:
+        raise FileExistsError("could not allocate evaluation ownership state")
+    try:
+        written = 0
+        while written < len(document):
+            count = os.write(descriptor, document[written:])
+            if count == 0:
+                raise OSError("evaluation ownership-state write made no progress")
+            written += count
+        os.fsync(descriptor)
+        if require_visible_parent:
+            _verify_evaluation_parent(parent)
+        if previous is not None:
+            if _read_regular_bytes_at(parent.descriptor, name) != previous:
+                raise ValueError("evaluation ownership state changed while retained")
+            os.unlink(name, dir_fd=parent.descriptor)
+        os.link(
+            temporary,
+            name,
+            src_dir_fd=parent.descriptor,
+            dst_dir_fd=parent.descriptor,
+            follow_symlinks=False,
+        )
+        os.unlink(temporary, dir_fd=parent.descriptor)
+        temporary = ""
+        if require_visible_parent:
+            _fsync_evaluation_descriptor(parent, parent.descriptor)
+        else:
+            current = os.fstat(parent.descriptor)
+            if (current.st_dev, current.st_ino) != (
+                state.parent_device,
+                state.parent_inode,
+            ):
+                raise ValueError("evaluation ownership state selects another parent")
+            os.fsync(parent.descriptor)
+        record = _read_regular_bytes_at(parent.descriptor, name)
+        if record[0] != document:
+            raise ValueError("evaluation ownership state changed while retained")
+        return record
+    finally:
+        os.close(descriptor)
+        if temporary:
+            try:
+                os.unlink(temporary, dir_fd=parent.descriptor)
+            except FileNotFoundError:
+                pass
+
+
+def _remove_evaluation_state(
+    parent: _RetainedEvaluationParent,
+    output_name: str,
+    record: tuple[bytes, tuple[int, int]],
+    *,
+    require_visible_parent: bool = True,
+) -> None:
+    """Durably remove only the exact retained ownership state.
+
+    Parameters
+    ----------
+    parent : _RetainedEvaluationParent
+        Retained complete destination-parent chain.
+    output_name : str
+        Direct child destination basename.
+    record : tuple of bytes and identity
+        Exact state bytes and identity authorized for removal.
+    require_visible_parent : bool, optional
+        Require the retained parent chain to remain visibly selected.
+
+    Returns
+    -------
+    None
+    """
+    name = _evaluation_state_name(output_name)
+    if _read_regular_bytes_at(parent.descriptor, name) != record:
+        raise ValueError("evaluation ownership state changed while retained")
+    os.unlink(name, dir_fd=parent.descriptor)
+    if require_visible_parent:
+        _fsync_evaluation_descriptor(parent, parent.descriptor)
+    else:
+        os.fsync(parent.descriptor)
+
+
+def _open_bound_evaluation_directory(
+    parent: _RetainedEvaluationParent,
+    name: str,
+    state: _EvaluationOwnershipState,
+) -> int:
+    """Open one state-bound directory and require its exact identity.
+
+    Parameters
+    ----------
+    parent : _RetainedEvaluationParent
+        Retained destination parent.
+    name : str
+        State-selected direct child name.
+    state : _EvaluationOwnershipState
+        Ownership state containing the expected identity.
+
+    Returns
+    -------
+    int
+        Open no-follow directory descriptor.
+    """
+    descriptor = parent.chain.open_child(name, os.O_RDONLY | os.O_DIRECTORY)
+    current = os.fstat(descriptor)
+    if (current.st_dev, current.st_ino) != (state.device, state.inode):
+        os.close(descriptor)
+        raise ValueError("evaluation ownership residue was replaced")
+    return descriptor
+
+
 def _evaluation_deletion_tombstone(output_name: str, descriptor: int) -> str:
     """Bind a recognizable private deletion name to one retained directory.
 
@@ -416,38 +802,148 @@ def _evaluation_deletion_tombstone(output_name: str, descriptor: int) -> str:
     return f".{output_name}.{current.st_dev:x}-{current.st_ino:x}.deleting"
 
 
-def _evaluation_tombstone_identity(
-    output_name: str, name: str
-) -> tuple[int, int] | None:
-    """Parse one canonical evaluation deletion tombstone identity.
+def _delete_bound_evaluation_directory(
+    parent: _RetainedEvaluationParent,
+    state: _EvaluationOwnershipState,
+    record: tuple[bytes, tuple[int, int]],
+    source_name: str,
+    descriptor: int,
+    *,
+    require_visible_parent: bool = True,
+) -> None:
+    """Transition to deletion and remove one exact owned directory tree.
 
     Parameters
     ----------
-    output_name : str
-        Public evaluation destination basename.
-    name : str
-        Candidate direct-child residue name.
+    parent : _RetainedEvaluationParent
+        Retained complete destination-parent chain.
+    state : _EvaluationOwnershipState
+        Current bound ownership state.
+    record : tuple of bytes and identity
+        Exact current state bytes and identity.
+    source_name : str
+        Visible owned source name.
+    descriptor : int
+        Retained descriptor for the exact source directory.
+    require_visible_parent : bool, optional
+        Require the retained parent chain to remain visibly selected.
 
     Returns
     -------
-    tuple of int or None
-        Encoded device and inode, or ``None`` for unrelated names.
+    None
     """
-    prefix = f".{output_name}."
-    suffix = ".deleting"
-    if not name.startswith(prefix) or not name.endswith(suffix):
-        return None
-    encoded = name[len(prefix) : -len(suffix)]
-    parts = encoded.split("-")
-    if len(parts) != 2 or any(
-        not part or any(character not in "0123456789abcdef" for character in part)
-        for part in parts
+    tombstone = _evaluation_deletion_tombstone(state.output_name, descriptor)
+    deleting = _EvaluationOwnershipState(
+        "delete",
+        state.parent_device,
+        state.parent_inode,
+        state.output_name,
+        state.nonce,
+        state.stage_name,
+        state.device,
+        state.inode,
+        source_name,
+        tombstone,
+    )
+    deleting_record = _write_evaluation_state(
+        parent,
+        deleting,
+        record,
+        require_visible_parent=require_visible_parent,
+    )
+    parent.chain.remove_child_tree(
+        source_name,
+        descriptor,
+        require_visible_chain=False,
+        tombstone_name=tombstone,
+    )
+    _remove_evaluation_state(
+        parent,
+        state.output_name,
+        deleting_record,
+        require_visible_parent=require_visible_parent,
+    )
+
+
+def _recover_evaluation_state(
+    parent: _RetainedEvaluationParent, output_name: str
+) -> None:
+    """Recover only the exact directory bound by durable ownership state.
+
+    Parameters
+    ----------
+    parent : _RetainedEvaluationParent
+        Retained complete destination-parent chain.
+    output_name : str
+        Direct child destination basename.
+
+    Returns
+    -------
+    None
+    """
+    record = _load_evaluation_state(parent.descriptor, output_name)
+    if record is None:
+        return
+    state, document = record
+    parent_stat = os.fstat(parent.descriptor)
+    if (state.parent_device, state.parent_inode) != (
+        parent_stat.st_dev,
+        parent_stat.st_ino,
     ):
-        return None
-    device, inode = (int(part, 16) for part in parts)
-    if inode < 1 or name != f".{output_name}.{device:x}-{inode:x}.deleting":
-        return None
-    return device, inode
+        raise ValueError("evaluation ownership state selects another parent")
+    if state.operation == "reserved":
+        if _destination_exists(parent.descriptor, state.stage_name):
+            raise ValueError("evaluation staging residue lacks bound identity")
+        _remove_evaluation_state(parent, output_name, document)
+        return
+
+    if state.operation == "delete":
+        assert state.source_name is not None
+        assert state.tombstone_name is not None
+        present = [
+            name
+            for name in (state.source_name, state.tombstone_name)
+            if _destination_exists(parent.descriptor, name)
+        ]
+        if len(present) > 1:
+            raise ValueError("evaluation deletion state is ambiguous")
+        if not present:
+            _remove_evaluation_state(parent, output_name, document)
+            return
+        name = present[0]
+        descriptor = _open_bound_evaluation_directory(parent, name, state)
+        try:
+            if name == state.source_name:
+                parent.chain.remove_child_tree(
+                    name,
+                    descriptor,
+                    tombstone_name=state.tombstone_name,
+                )
+            else:
+                parent.chain.remove_detached_child_tree(name, descriptor)
+        finally:
+            os.close(descriptor)
+        _remove_evaluation_state(parent, output_name, document)
+        return
+
+    names = [state.stage_name]
+    if state.operation == "install":
+        names.append(output_name)
+    present = [name for name in names if _destination_exists(parent.descriptor, name)]
+    if len(present) > 1:
+        raise ValueError("evaluation ownership state is ambiguous")
+    if not present:
+        _remove_evaluation_state(parent, output_name, document)
+        return
+    name = present[0]
+    descriptor = _open_bound_evaluation_directory(parent, name, state)
+    try:
+        if state.operation == "install" and name == output_name:
+            _remove_evaluation_state(parent, output_name, document)
+            return
+        _delete_bound_evaluation_directory(parent, state, document, name, descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _read_retained_evaluation_file(
@@ -666,14 +1162,19 @@ def _publish_evaluation_artifact_unlocked(
         raise FileExistsError(
             f"evaluation artifact path already exists; refusing replacement: {output_path}"
         )
-    staging_name = f".{output_name}.{uuid.uuid4().hex}.staging"
-    _verify_evaluation_parent(parent)
-    os.mkdir(staging_name, mode=0o700, dir_fd=parent_descriptor)
-    _verify_evaluation_parent(parent)
-    staging_descriptor = parent.chain.open_child(
+    nonce = uuid.uuid4().hex
+    staging_name = f".{output_name}.{nonce}.staging"
+    parent_stat = os.fstat(parent_descriptor)
+    state = _EvaluationOwnershipState(
+        "reserved",
+        parent_stat.st_dev,
+        parent_stat.st_ino,
+        output_name,
+        nonce,
         staging_name,
-        os.O_RDONLY | os.O_DIRECTORY,
     )
+    state_document = _write_evaluation_state(parent, state, None)
+    staging_descriptor: int | None = None
     record_hash = hashlib.sha256()
     content_hash = hashlib.sha256()
     label_counts: Counter[int] = Counter()
@@ -681,6 +1182,25 @@ def _publish_evaluation_artifact_unlocked(
     retained_files: dict[str, _RetainedEvaluationFile] = {}
     destination_owned = False
     try:
+        _verify_evaluation_parent(parent)
+        os.mkdir(staging_name, mode=0o700, dir_fd=parent_descriptor)
+        _verify_evaluation_parent(parent)
+        staging_descriptor = parent.chain.open_child(
+            staging_name,
+            os.O_RDONLY | os.O_DIRECTORY,
+        )
+        staged_identity = os.fstat(staging_descriptor)
+        state = _EvaluationOwnershipState(
+            "build",
+            state.parent_device,
+            state.parent_inode,
+            output_name,
+            nonce,
+            staging_name,
+            staged_identity.st_dev,
+            staged_identity.st_ino,
+        )
+        state_document = _write_evaluation_state(parent, state, state_document)
         records_descriptor = parent.chain.open_child(
             EVALUATION_RECORDS_FILENAME,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL,
@@ -773,6 +1293,18 @@ def _publish_evaluation_artifact_unlocked(
             staged_stat.st_ino,
         ) != (opened_stat.st_dev, opened_stat.st_ino):
             raise ValueError("evaluation staging directory changed during publication")
+        state = _EvaluationOwnershipState(
+            "install",
+            state.parent_device,
+            state.parent_inode,
+            output_name,
+            nonce,
+            staging_name,
+            state.device,
+            state.inode,
+            staging_name,
+        )
+        state_document = _write_evaluation_state(parent, state, state_document)
         _verify_evaluation_parent(parent)
         os.rename(
             staging_name,
@@ -800,35 +1332,37 @@ def _publish_evaluation_artifact_unlocked(
             raise ValueError("evaluation destination changed during publication")
         parent.chain.commit()
         _verify_evaluation_parent(parent)
+        _remove_evaluation_state(parent, output_name, state_document)
         return output_path
     except BaseException:
-        try:
-            owned_names = (
-                (output_name, staging_name)
-                if destination_owned
-                else (staging_name, output_name)
-            )
-            for owned_name in owned_names:
-                if _directory_entry_matches_descriptor(
-                    parent_descriptor, owned_name, staging_descriptor
-                ):
-                    parent.chain.remove_child_tree(
-                        owned_name,
-                        staging_descriptor,
-                        require_visible_chain=False,
-                        tombstone_name=_evaluation_deletion_tombstone(
-                            output_name,
+        if staging_descriptor is not None:
+            try:
+                owned_names = (
+                    (output_name, staging_name)
+                    if destination_owned
+                    else (staging_name, output_name)
+                )
+                for owned_name in owned_names:
+                    if _directory_entry_matches_descriptor(
+                        parent_descriptor, owned_name, staging_descriptor
+                    ):
+                        _delete_bound_evaluation_directory(
+                            parent,
+                            state,
+                            state_document,
+                            owned_name,
                             staging_descriptor,
-                        ),
-                    )
-                    break
-        except (FileNotFoundError, OSError, ValueError):
-            pass
+                            require_visible_parent=False,
+                        )
+                        break
+            except (FileNotFoundError, OSError, ValueError):
+                pass
         raise
     finally:
         for retained in retained_files.values():
             os.close(retained.descriptor)
-        os.close(staging_descriptor)
+        if staging_descriptor is not None:
+            os.close(staging_descriptor)
 
 
 def publish_evaluation_artifact(
@@ -870,50 +1404,7 @@ def publish_evaluation_artifact(
         lock = _acquire_evaluation_lock(parent.descriptor, output_name)
         try:
             _verify_evaluation_parent(parent)
-            prefix = f".{output_name}."
-            for residue_name in os.listdir(parent.descriptor):
-                staged = residue_name.startswith(prefix) and residue_name.endswith(
-                    ".staging"
-                )
-                tombstone_identity = _evaluation_tombstone_identity(
-                    output_name, residue_name
-                )
-                if not staged and tombstone_identity is None:
-                    continue
-                if tombstone_identity is not None and _destination_exists(
-                    parent.descriptor, output_name
-                ):
-                    continue
-                residue_stat = os.stat(
-                    residue_name, dir_fd=parent.descriptor, follow_symlinks=False
-                )
-                if not stat.S_ISDIR(residue_stat.st_mode):
-                    raise ValueError("evaluation staging residue is unsafe")
-                _verify_evaluation_parent(parent)
-                residue_descriptor = parent.chain.open_child(
-                    residue_name,
-                    os.O_RDONLY | os.O_DIRECTORY,
-                )
-                try:
-                    if tombstone_identity is None:
-                        parent.chain.remove_child_tree(
-                            residue_name,
-                            residue_descriptor,
-                            tombstone_name=_evaluation_deletion_tombstone(
-                                output_name,
-                                residue_descriptor,
-                            ),
-                        )
-                    else:
-                        current = os.fstat(residue_descriptor)
-                        if (current.st_dev, current.st_ino) != tombstone_identity:
-                            raise ValueError("evaluation deletion residue is unsafe")
-                        parent.chain.remove_detached_child_tree(
-                            residue_name,
-                            residue_descriptor,
-                        )
-                finally:
-                    os.close(residue_descriptor)
+            _recover_evaluation_state(parent, output_name)
             _verify_evaluation_parent(parent)
             result = _publish_evaluation_artifact_unlocked(
                 rows,

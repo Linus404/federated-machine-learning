@@ -9,6 +9,7 @@ import stat
 import tempfile
 import uuid
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -23,6 +24,7 @@ from src.app_manifest import (
 )
 from src.artifact_compatibility import (
     PUBLIC_ARTIFACT_SCHEMA_VERSION,
+    RetainedDirectoryChain,
     canonical_json_bytes,
     read_regular_file,
     require_secure_artifact_platform,
@@ -60,6 +62,55 @@ from src.paths import (
     validate_prepared_generation_inventory,
 )
 from src.text_preprocessing import create_text_vectorizer
+
+_PREPARATION_STAGE_STATE_FILENAME = ".prepare-stage.state"
+_PREPARATION_STAGE_STATE_SCHEMA_VERSION = 1
+_PREPARATION_STAGE_STATE_FIELDS = {
+    "schema_version",
+    "operation",
+    "parent_device",
+    "parent_inode",
+    "nonce",
+    "stage_name",
+    "device",
+    "inode",
+    "tombstone_name",
+}
+_STAGE_STATE_TEMPORARY_NAME_ATTEMPTS = 128
+
+
+@dataclass(frozen=True)
+class _PreparationStageState:
+    """Bind one private preparation stage to durable descriptor identity."""
+
+    operation: str
+    parent_device: int
+    parent_inode: int
+    nonce: str
+    stage_name: str
+    device: int | None = None
+    inode: int | None = None
+    tombstone_name: str | None = None
+
+    def payload(self) -> dict[str, object]:
+        """Return the canonical serialized state.
+
+        Returns
+        -------
+        dict of str to object
+            Exact durable ownership record.
+        """
+        return {
+            "schema_version": _PREPARATION_STAGE_STATE_SCHEMA_VERSION,
+            "operation": self.operation,
+            "parent_device": self.parent_device,
+            "parent_inode": self.parent_inode,
+            "nonce": self.nonce,
+            "stage_name": self.stage_name,
+            "device": self.device,
+            "inode": self.inode,
+            "tombstone_name": self.tombstone_name,
+        }
 
 
 def _validate_absolute_output_ancestors(
@@ -364,6 +415,333 @@ def _fsync_directory_tree(root: Path) -> None:
         _fsync_directory(directory)
 
 
+def _read_preparation_state_at(
+    parent_descriptor: int,
+) -> tuple[bytes, tuple[int, int]] | None:
+    """Read the stable private preparation-stage state.
+
+    Parameters
+    ----------
+    parent_descriptor : int
+        Retained prepared-generations descriptor.
+
+    Returns
+    -------
+    tuple of bytes and tuple of int or None
+        Exact state bytes and identity, or ``None`` when absent.
+    """
+    try:
+        descriptor = os.open(
+            _PREPARATION_STAGE_STATE_FILENAME,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=parent_descriptor,
+        )
+    except FileNotFoundError:
+        return None
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o600
+        ):
+            raise ValueError("preparation stage state is unsafe")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ) or sum(map(len, chunks)) != after.st_size:
+            raise ValueError("preparation stage state changed while retained")
+        return b"".join(chunks), (after.st_dev, after.st_ino)
+    finally:
+        os.close(descriptor)
+
+
+def _parse_preparation_stage_state(document: bytes) -> _PreparationStageState:
+    """Validate one canonical preparation-stage ownership record.
+
+    Parameters
+    ----------
+    document : bytes
+        Exact state bytes.
+
+    Returns
+    -------
+    _PreparationStageState
+        Strict validated state.
+    """
+    payload = strict_json_loads(document, source="preparation stage state")
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != _PREPARATION_STAGE_STATE_FIELDS
+        or payload["schema_version"] != _PREPARATION_STAGE_STATE_SCHEMA_VERSION
+        or canonical_json_bytes(payload) != document
+        or payload["operation"] not in {"reserved", "build", "delete"}
+        or type(payload["parent_device"]) is not int
+        or payload["parent_device"] < 0
+        or type(payload["parent_inode"]) is not int
+        or payload["parent_inode"] < 1
+        or not isinstance(payload["nonce"], str)
+        or len(payload["nonce"]) != 32
+        or any(character not in "0123456789abcdef" for character in payload["nonce"])
+        or payload["stage_name"] != f".prepare-{payload['nonce']}.staging"
+    ):
+        raise ValueError("preparation stage state is unsafe")
+    operation = payload["operation"]
+    device = payload["device"]
+    inode = payload["inode"]
+    tombstone = payload["tombstone_name"]
+    if operation == "reserved":
+        valid_phase = device is None and inode is None and tombstone is None
+    else:
+        valid_phase = (
+            type(device) is int and device >= 0 and type(inode) is int and inode >= 1
+        )
+        if operation == "build":
+            valid_phase = valid_phase and tombstone is None
+        else:
+            valid_phase = (
+                valid_phase
+                and tombstone
+                == f".{payload['stage_name']}.{device:x}-{inode:x}.deleting"
+            )
+    if not valid_phase:
+        raise ValueError("preparation stage state is unsafe")
+    return _PreparationStageState(
+        operation,
+        payload["parent_device"],
+        payload["parent_inode"],
+        payload["nonce"],
+        payload["stage_name"],
+        device,
+        inode,
+        tombstone,
+    )
+
+
+def _write_preparation_stage_state(
+    chain: RetainedDirectoryChain,
+    state: _PreparationStageState,
+    previous: tuple[bytes, tuple[int, int]] | None,
+) -> tuple[bytes, tuple[int, int]]:
+    """Install and durably flush one stage-ownership transition.
+
+    Parameters
+    ----------
+    chain : RetainedDirectoryChain
+        Retained chain through the prepared-generations directory.
+    state : _PreparationStageState
+        New exact ownership state.
+    previous : tuple of bytes and identity or None
+        Exact prior bytes and identity, or ``None`` for exclusive creation.
+
+    Returns
+    -------
+    tuple of bytes and tuple of int
+        Canonical installed bytes and state-file identity.
+    """
+    chain.verify()
+    parent_descriptor = chain.directory.descriptor
+    current = os.fstat(parent_descriptor)
+    if (current.st_dev, current.st_ino) != (
+        state.parent_device,
+        state.parent_inode,
+    ):
+        raise ValueError("preparation stage state selects another parent")
+    document = canonical_json_bytes(state.payload())
+    descriptor: int | None = None
+    temporary = ""
+    for _ in range(_STAGE_STATE_TEMPORARY_NAME_ATTEMPTS):
+        candidate = f"..prepare-stage.{uuid.uuid4().hex}.tmp"
+        try:
+            descriptor = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=parent_descriptor,
+            )
+        except FileExistsError:
+            continue
+        temporary = candidate
+        break
+    if descriptor is None:
+        raise FileExistsError("could not allocate preparation stage state")
+    try:
+        written = 0
+        while written < len(document):
+            count = os.write(descriptor, document[written:])
+            if count == 0:
+                raise OSError("preparation stage-state write made no progress")
+            written += count
+        os.fsync(descriptor)
+        chain.verify()
+        if previous is not None:
+            if _read_preparation_state_at(parent_descriptor) != previous:
+                raise ValueError("preparation stage state changed while retained")
+            os.unlink(_PREPARATION_STAGE_STATE_FILENAME, dir_fd=parent_descriptor)
+        os.link(
+            temporary,
+            _PREPARATION_STAGE_STATE_FILENAME,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        os.unlink(temporary, dir_fd=parent_descriptor)
+        temporary = ""
+        os.fsync(parent_descriptor)
+        chain.verify()
+        record = _read_preparation_state_at(parent_descriptor)
+        if record is None or record[0] != document:
+            raise ValueError("preparation stage state changed while retained")
+        return record
+    finally:
+        os.close(descriptor)
+        if temporary:
+            try:
+                os.unlink(temporary, dir_fd=parent_descriptor)
+            except FileNotFoundError:
+                pass
+
+
+def _remove_preparation_stage_state(
+    chain: RetainedDirectoryChain, record: tuple[bytes, tuple[int, int]]
+) -> None:
+    """Durably remove only the exact stage-ownership record.
+
+    Parameters
+    ----------
+    chain : RetainedDirectoryChain
+        Retained prepared-generations chain.
+    record : tuple of bytes and identity
+        Exact state bytes and identity authorized for removal.
+
+    Returns
+    -------
+    None
+    """
+    chain.verify()
+    descriptor = chain.directory.descriptor
+    if _read_preparation_state_at(descriptor) != record:
+        raise ValueError("preparation stage state changed while retained")
+    os.unlink(_PREPARATION_STAGE_STATE_FILENAME, dir_fd=descriptor)
+    os.fsync(descriptor)
+    chain.verify()
+
+
+def _open_bound_preparation_stage(
+    chain: RetainedDirectoryChain,
+    name: str,
+    state: _PreparationStageState,
+) -> int:
+    """Open and validate one exact state-bound stage directory.
+
+    Parameters
+    ----------
+    chain : RetainedDirectoryChain
+        Retained prepared-generations chain.
+    name : str
+        State-selected source or tombstone name.
+    state : _PreparationStageState
+        State containing the exact expected identity.
+
+    Returns
+    -------
+    int
+        Open no-follow directory descriptor.
+    """
+    descriptor = chain.open_child(name, os.O_RDONLY | os.O_DIRECTORY)
+    current = os.fstat(descriptor)
+    if (current.st_dev, current.st_ino) != (state.device, state.inode):
+        os.close(descriptor)
+        raise ValueError("preparation stage residue was replaced")
+    return descriptor
+
+
+def _recover_preparation_stage(chain: RetainedDirectoryChain) -> None:
+    """Recover only the exact invocation-owned preparation stage.
+
+    Parameters
+    ----------
+    chain : RetainedDirectoryChain
+        Retained prepared-generations chain.
+
+    Returns
+    -------
+    None
+    """
+    parent_descriptor = chain.directory.descriptor
+    record = _read_preparation_state_at(parent_descriptor)
+    if record is None:
+        return
+    state = _parse_preparation_stage_state(record[0])
+    current = os.fstat(parent_descriptor)
+    if (current.st_dev, current.st_ino) != (
+        state.parent_device,
+        state.parent_inode,
+    ):
+        raise ValueError("preparation stage state selects another parent")
+
+    names = (
+        (state.stage_name, state.tombstone_name)
+        if state.operation == "delete"
+        else (state.stage_name,)
+    )
+    present: list[str] = []
+    for name in names:
+        if name is None:
+            continue
+        try:
+            os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        present.append(name)
+    if state.operation == "reserved":
+        if present:
+            raise ValueError("preparation stage residue lacks bound identity")
+        _remove_preparation_stage_state(chain, record)
+        return
+    if len(present) > 1:
+        raise ValueError("preparation stage state is ambiguous")
+    if not present:
+        _remove_preparation_stage_state(chain, record)
+        return
+
+    name = present[0]
+    descriptor = _open_bound_preparation_stage(chain, name, state)
+    try:
+        if state.operation == "build":
+            tombstone = f".{state.stage_name}.{state.device:x}-{state.inode:x}.deleting"
+            deleting = _PreparationStageState(
+                "delete",
+                state.parent_device,
+                state.parent_inode,
+                state.nonce,
+                state.stage_name,
+                state.device,
+                state.inode,
+                tombstone,
+            )
+            record = _write_preparation_stage_state(chain, deleting, record)
+            chain.remove_child_tree(name, descriptor, tombstone_name=tombstone)
+        elif name == state.stage_name:
+            assert state.tombstone_name is not None
+            chain.remove_child_tree(
+                name,
+                descriptor,
+                tombstone_name=state.tombstone_name,
+            )
+        else:
+            chain.remove_detached_child_tree(name, descriptor)
+    finally:
+        os.close(descriptor)
+    _remove_preparation_stage_state(chain, record)
+
+
 def _publication_checkpoint(phase: str) -> None:
     """Expose a no-op process-death checkpoint for durability regression tests.
 
@@ -433,7 +811,15 @@ def _validate_migration_journal(
     if schema_version in {2, PREPARED_GENERATION_SCHEMA_VERSION}:
         fields |= {"preparation_request"}
     if schema_version == PREPARED_GENERATION_SCHEMA_VERSION:
-        fields |= {"generation_index_checksum"}
+        fields |= {
+            "generation_index_checksum",
+            "parent_device",
+            "parent_inode",
+            "generations_device",
+            "generations_inode",
+            "stage_device",
+            "stage_inode",
+        }
     if set(payload) != fields:
         raise ValueError("prepared migration journal has an invalid field set")
     generation_id = payload["generation_id"]
@@ -474,6 +860,20 @@ def _validate_migration_journal(
         or any(character not in "0123456789abcdef" for character in index_checksum[7:])
     ):
         raise ValueError("prepared migration journal index checksum is invalid")
+    identity_fields = (
+        "parent_device",
+        "parent_inode",
+        "generations_device",
+        "generations_inode",
+        "stage_device",
+        "stage_inode",
+    )
+    if schema_version == PREPARED_GENERATION_SCHEMA_VERSION and any(
+        type(payload[field]) is not int
+        or payload[field] < (1 if field.endswith("inode") else 0)
+        for field in identity_fields
+    ):
+        raise ValueError("prepared migration journal identity is invalid")
     legacy_roots = payload["legacy_roots"]
     alias_roots = payload["alias_roots"]
     for value, name in (
@@ -517,6 +917,11 @@ def _validate_migration_journal(
             if index_checksum is not None
             else {}
         ),
+        **(
+            {field: payload[field] for field in identity_fields}
+            if schema_version == PREPARED_GENERATION_SCHEMA_VERSION
+            else {}
+        ),
         "logical_roots": expected_roots,
         **({"preparation_request": request} if request is not None else {}),
         "legacy_roots": legacy_roots,
@@ -553,6 +958,46 @@ class _PreparedGenerationValidationError(ValueError):
     """Identify recovery validation failures that must retain their journal."""
 
 
+def _require_migration_generation_identity(
+    generation: Path, transaction: Mapping[str, Any]
+) -> None:
+    """Require a journal candidate and both parents to retain exact identities.
+
+    Parameters
+    ----------
+    generation : pathlib.Path
+        Staged or final generation candidate.
+    transaction : mapping of str to Any
+        Validated migration journal.
+
+    Returns
+    -------
+    None
+    """
+    if "stage_device" not in transaction:
+        return
+    generations = generation.parent
+    parent = generations.parent
+    parent_stat = parent.stat(follow_symlinks=False)
+    generations_stat = generations.stat(follow_symlinks=False)
+    generation_stat = generation.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(parent_stat.st_mode)
+        or not stat.S_ISDIR(generations_stat.st_mode)
+        or not stat.S_ISDIR(generation_stat.st_mode)
+        or (parent_stat.st_dev, parent_stat.st_ino)
+        != (transaction["parent_device"], transaction["parent_inode"])
+        or (generations_stat.st_dev, generations_stat.st_ino)
+        != (
+            transaction["generations_device"],
+            transaction["generations_inode"],
+        )
+        or (generation_stat.st_dev, generation_stat.st_ino)
+        != (transaction["stage_device"], transaction["stage_inode"])
+    ):
+        raise ValueError("prepared migration generation identity changed")
+
+
 def _validate_owned_generation_index(
     generation: Path, transaction: Mapping[str, Any]
 ) -> None:
@@ -575,6 +1020,7 @@ def _validate_owned_generation_index(
         If the candidate is unsafe or its canonical index differs from the journal.
     """
     generations = generation.parent
+    _require_migration_generation_identity(generation, transaction)
     if (
         generations.is_symlink()
         or not generations.is_dir()
@@ -667,6 +1113,7 @@ def _validate_recovery_generation(
     """
     try:
         generations = generation.parent
+        _require_migration_generation_identity(generation, transaction)
         if (
             generations.is_symlink()
             or not generations.is_dir()
@@ -837,10 +1284,9 @@ def _recover_prepared_migration(
     if transaction is None:
         return False
     request = validate_preparation_request(preparation_request)
-    if (
-        transaction["schema_version"] != PREPARED_GENERATION_SCHEMA_VERSION
-        or transaction.get("preparation_request") != request
-    ):
+    if transaction["schema_version"] != PREPARED_GENERATION_SCHEMA_VERSION:
+        raise ValueError("prepared migration journal lacks durable stage identity")
+    if transaction.get("preparation_request") != request:
         _discard_mismatched_prepared_migration(roots, transaction)
         return False
     parent = roots["client"].parent
@@ -1144,11 +1590,25 @@ def _publish_prepared_roots(
         if root.is_symlink() and Path(os.readlink(root)) != expected_alias:
             raise ValueError(f"{name} artifact root has an unsafe prepared alias")
     previous_pointer_target = os.readlink(pointer) if pointer.is_symlink() else None
+    parent_stat = parent.stat(follow_symlinks=False)
+    generations_stat = generations.stat(follow_symlinks=False)
+    stage_stat = generation_stage.stat(follow_symlinks=False)
+    if not all(
+        stat.S_ISDIR(item.st_mode)
+        for item in (parent_stat, generations_stat, stage_stat)
+    ):
+        raise ValueError("prepared migration generation is unsafe")
     transaction = {
         "schema_version": PREPARED_GENERATION_SCHEMA_VERSION,
         "generation_id": generation_id,
         "stage_name": generation_stage.name,
         "generation_index_checksum": sha256_bytes(index_bytes),
+        "parent_device": parent_stat.st_dev,
+        "parent_inode": parent_stat.st_ino,
+        "generations_device": generations_stat.st_dev,
+        "generations_inode": generations_stat.st_ino,
+        "stage_device": stage_stat.st_dev,
+        "stage_inode": stage_stat.st_ino,
         "logical_roots": {name: roots[name].name for name in sorted(roots)},
         "preparation_request": request,
         "legacy_roots": sorted(legacy_roots),
@@ -1665,6 +2125,7 @@ def prepare_all(
         )
     lock = _acquire_preparation_lock(roots)
     stages: dict[str, Path] = {}
+    generation_chain: RetainedDirectoryChain | None = None
     try:
         parent = next(iter({root.parent for root in roots.values()}))
         generations = parent / PREPARED_GENERATIONS_DIRECTORY
@@ -1673,16 +2134,52 @@ def prepare_all(
         ):
             raise ValueError("prepared generations root must be a regular directory")
         generations.mkdir(mode=0o755, exist_ok=True)
-        if _recover_prepared_migration(roots, request):
-            return
-        for residue in generations.glob(".prepare-*.staging"):
-            residue_stat = residue.lstat()
-            if residue.is_symlink() or not stat.S_ISDIR(residue_stat.st_mode):
-                raise ValueError(f"owned preparation residue is unsafe: {residue.name}")
-            shutil.rmtree(residue)
-        generation_stage = Path(
-            tempfile.mkdtemp(dir=generations, prefix=".prepare-", suffix=".staging")
+        generation_chain = RetainedDirectoryChain.open(
+            generations,
+            error_message="prepared generations directory changed during preparation",
+            check_platform=False,
         )
+        if _recover_prepared_migration(roots, request):
+            _recover_preparation_stage(generation_chain)
+            return
+        _recover_preparation_stage(generation_chain)
+        parent_descriptor = generation_chain.directory.descriptor
+        parent_stat = os.fstat(parent_descriptor)
+        nonce = uuid.uuid4().hex
+        stage_name = f".prepare-{nonce}.staging"
+        stage_state = _PreparationStageState(
+            "reserved",
+            parent_stat.st_dev,
+            parent_stat.st_ino,
+            nonce,
+            stage_name,
+        )
+        stage_document = _write_preparation_stage_state(
+            generation_chain, stage_state, None
+        )
+        generation_chain.verify()
+        os.mkdir(stage_name, mode=0o700, dir_fd=parent_descriptor)
+        generation_chain.verify()
+        stage_descriptor = generation_chain.open_child(
+            stage_name, os.O_RDONLY | os.O_DIRECTORY
+        )
+        try:
+            stage_stat = os.fstat(stage_descriptor)
+            stage_state = _PreparationStageState(
+                "build",
+                parent_stat.st_dev,
+                parent_stat.st_ino,
+                nonce,
+                stage_name,
+                stage_stat.st_dev,
+                stage_stat.st_ino,
+            )
+            _write_preparation_stage_state(
+                generation_chain, stage_state, stage_document
+            )
+        finally:
+            os.close(stage_descriptor)
+        generation_stage = generations / stage_name
         stages = {name: generation_stage / name for name in roots}
         stages["public"].mkdir()
         stages["client"].mkdir()
@@ -1732,12 +2229,22 @@ def prepare_all(
         load_evaluation_artifact_snapshot(stages["evaluation"], protocol=protocol)
         for stage in stages.values():
             _fsync_directory_tree(stage)
+        generation_chain.verify()
+        verification_descriptor = _open_bound_preparation_stage(
+            generation_chain, stage_name, stage_state
+        )
+        os.close(verification_descriptor)
         _publish_prepared_roots(roots, stages, request)
+        _recover_preparation_stage(generation_chain)
         stages = {}
     finally:
-        if stages:
-            shutil.rmtree(next(iter(stages.values())).parent, ignore_errors=True)
-        lock.release()
+        try:
+            if stages and generation_chain is not None:
+                _recover_preparation_stage(generation_chain)
+        finally:
+            if generation_chain is not None:
+                generation_chain.close()
+            lock.release()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

@@ -17,6 +17,7 @@ from src.app_manifest import AppManifest, load_app_manifest
 from src.artifact_compatibility import (
     CLIENT_SHARD_SCHEMA_VERSION,
     PUBLIC_ARTIFACT_SCHEMA_VERSION,
+    RetainedDirectoryChain,
     canonical_json_bytes,
     sha256_bytes,
 )
@@ -26,6 +27,7 @@ from src.data_prep import (
     _preflight_output_root,
     _publish_prepared_roots,
     _recover_prepared_migration,
+    _recover_preparation_stage,
     _validate_recovery_generation,
     build_vectorizer,
     main,
@@ -302,12 +304,27 @@ def write_pending_prepared_recovery(
     }
     (candidate / "index.json").write_bytes(canonical_json_bytes(index))
     index_bytes = (candidate / "index.json").read_bytes()
+    parent_stat = root.stat()
+    generations_stat = candidate.parent.stat()
+    candidate_stat = candidate.stat()
     journal = {
         "schema_version": schema_version,
         "generation_id": generation_id,
         "stage_name": stage_name,
         **(
             {"generation_index_checksum": sha256_bytes(index_bytes)}
+            if not legacy_schema
+            else {}
+        ),
+        **(
+            {
+                "parent_device": parent_stat.st_dev,
+                "parent_inode": parent_stat.st_ino,
+                "generations_device": generations_stat.st_dev,
+                "generations_inode": generations_stat.st_ino,
+                "stage_device": candidate_stat.st_dev,
+                "stage_inode": candidate_stat.st_ino,
+            }
             if not legacy_schema
             else {}
         ),
@@ -574,6 +591,9 @@ def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> No
     }
     for sentinel in sentinels.values():
         sentinel.write_text("external test sentinel", encoding="utf-8")
+    unbound_stage = tmp_path / ".prepared-generations" / ".prepare-unbound.staging"
+    unbound_stage.mkdir(parents=True)
+    (unbound_stage / "preserve.bin").write_bytes(b"unbound preparation residue")
     (client_dir / "client-0.tar.gz").write_bytes(b"legacy private shard")
     texts = np.asarray([f"Review {index} good movie" for index in range(12)])
     labels = np.asarray([index % 2 for index in range(12)], dtype="int32")
@@ -675,6 +695,9 @@ def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> No
         )
 
     load_dataset.assert_called_once_with()
+    assert (unbound_stage / "preserve.bin").read_bytes() == (
+        b"unbound preparation residue"
+    )
     public_generation = resolve_prepared_artifact_dir(public_dir, "public")
     client_generation = resolve_prepared_artifact_dir(client_dir, "client")
     evaluation_generation = resolve_prepared_artifact_dir(evaluation_dir, "evaluation")
@@ -740,6 +763,64 @@ def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> No
 
 
 class ArtifactFlowTests(unittest.TestCase):
+    def test_preparation_recovers_only_state_bound_stage_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generations = Path(tmpdir) / ".prepared-generations"
+            nonce = "2" * 32
+            stage = generations / f".prepare-{nonce}.staging"
+            unbound = generations / ".prepare-unbound.staging"
+            stage.mkdir(parents=True)
+            unbound.mkdir()
+            (stage / "partial").write_bytes(b"owned")
+            (unbound / "partial").write_bytes(b"unbound")
+            parent_stat = generations.stat()
+            stage_stat = stage.stat()
+            state = {
+                "schema_version": 1,
+                "operation": "build",
+                "parent_device": parent_stat.st_dev,
+                "parent_inode": parent_stat.st_ino,
+                "nonce": nonce,
+                "stage_name": stage.name,
+                "device": stage_stat.st_dev,
+                "inode": stage_stat.st_ino,
+                "tombstone_name": None,
+            }
+            state_path = generations / ".prepare-stage.state"
+            state_path.write_bytes(canonical_json_bytes(state))
+            state_path.chmod(0o600)
+
+            chain = RetainedDirectoryChain.open(generations, check_platform=False)
+            try:
+                _recover_preparation_stage(chain)
+            finally:
+                chain.close()
+
+            self.assertFalse(stage.exists())
+            self.assertFalse(state_path.exists())
+            self.assertEqual((unbound / "partial").read_bytes(), b"unbound")
+
+    def test_preparation_rejects_corrupt_state_without_residue_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generations = Path(tmpdir) / ".prepared-generations"
+            residue = generations / ".prepare-unbound.staging"
+            residue.mkdir(parents=True)
+            marker = residue / "preserve"
+            marker.write_bytes(b"unbound")
+            state = generations / ".prepare-stage.state"
+            state.write_bytes(b'{"schema_version":1}\n')
+            state.chmod(0o600)
+
+            chain = RetainedDirectoryChain.open(generations, check_platform=False)
+            try:
+                with self.assertRaisesRegex(ValueError, "stage state"):
+                    _recover_preparation_stage(chain)
+            finally:
+                chain.close()
+
+            self.assertEqual(marker.read_bytes(), b"unbound")
+            self.assertEqual(state.read_bytes(), b'{"schema_version":1}\n')
+
     def test_recovery_accepts_equal_content_with_distinct_split_identities(
         self,
     ) -> None:
@@ -2267,17 +2348,18 @@ class ArtifactFlowTests(unittest.TestCase):
                     name,
                 )
 
-    def test_schema_one_pending_preparation_is_rolled_back_not_recovered(self) -> None:
+    def test_schema_one_pending_preparation_is_preserved_unrecovered(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             roots, candidate, _ = write_pending_prepared_recovery(
                 root, final=False, legacy_schema=True
             )
 
-            self.assertFalse(_recover_prepared_migration(roots, preparation_request(4)))
+            with self.assertRaisesRegex(ValueError, "lacks durable stage identity"):
+                _recover_prepared_migration(roots, preparation_request(4))
 
-            self.assertFalse(candidate.exists())
-            self.assertFalse((root / ".prepared-migration.json").exists())
+            self.assertTrue(candidate.exists())
+            self.assertTrue((root / ".prepared-migration.json").exists())
             for name, logical_root in roots.items():
                 self.assertTrue(logical_root.is_dir())
                 self.assertFalse(logical_root.is_symlink())
@@ -2285,7 +2367,7 @@ class ArtifactFlowTests(unittest.TestCase):
                     (logical_root / "legacy.txt").read_text(encoding="utf-8"), name
                 )
 
-    def test_schema_two_pending_preparation_is_rolled_back_not_recovered(self) -> None:
+    def test_schema_two_pending_preparation_is_preserved_unrecovered(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             roots, candidate, _ = write_pending_prepared_recovery(root, final=False)
@@ -2298,12 +2380,22 @@ class ArtifactFlowTests(unittest.TestCase):
             journal = json.loads(journal_path.read_bytes())
             journal["schema_version"] = 2
             journal.pop("generation_index_checksum")
+            for field in (
+                "parent_device",
+                "parent_inode",
+                "generations_device",
+                "generations_inode",
+                "stage_device",
+                "stage_inode",
+            ):
+                journal.pop(field)
             journal_path.write_bytes(canonical_json_bytes(journal))
 
-            self.assertFalse(_recover_prepared_migration(roots, preparation_request()))
+            with self.assertRaisesRegex(ValueError, "lacks durable stage identity"):
+                _recover_prepared_migration(roots, preparation_request())
 
-            self.assertFalse(candidate.exists())
-            self.assertFalse(journal_path.exists())
+            self.assertTrue(candidate.exists())
+            self.assertTrue(journal_path.exists())
 
     def test_preparation_rejects_overlapping_artifact_boundaries_before_loading(
         self,

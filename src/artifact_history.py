@@ -20,22 +20,23 @@ if TYPE_CHECKING:
 
 from src.artifact_compatibility import (
     ARTIFACT_SCHEMA_VERSION,
+    REQUIRED_COMPLETED_ARTIFACTS,
     RetainedDirectory as _RetainedDirectory,
     RetainedDirectoryChain,
+    SERVER_ARTIFACTS,
     SERVER_ARTIFACT_MANIFEST_FILENAME,
+    SERVER_ARTIFACT_SCHEMA_VERSION,
     RegularFileSnapshot,
     ServerArtifactSnapshot,
     ServerFinalizationSnapshot,
     canonical_json_bytes,
     load_server_artifact_snapshot,
     read_regular_file,
-    read_regular_file_snapshot,
     require_secure_artifact_platform,
+    server_artifact_binding,
     sha256_bytes,
     strict_json_loads,
     validate_run_provenance_evidence,
-    write_bytes_atomically,
-    write_server_artifact_manifest,
 )
 from src.paths import run_manifest_path
 from src.run_provenance import (
@@ -478,7 +479,10 @@ def _unlink_retained_file_entry(
 
 @contextmanager
 def _capture_run_inventory(
-    run_descriptor: int, *, exclude_manifest: bool
+    run_descriptor: int,
+    *,
+    exclude_manifest: bool,
+    retained_files: Mapping[str, _RetainedFile] | None = None,
 ) -> Iterator[Mapping[str, _RetainedFile]]:
     """Capture and retain every regular entry in one run directory.
 
@@ -488,16 +492,26 @@ def _capture_run_inventory(
         Retained selected-run directory descriptor.
     exclude_manifest : bool
         Omit the artifact manifest while constructing its checksums.
+    retained_files : mapping of str to _RetainedFile or None, optional
+        Already retained entries whose ownership transfers to this context.
 
     Yields
     ------
     collections.abc.Mapping
         Immutable filename-to-retained-file mapping.
     """
-    files: dict[str, _RetainedFile] = {}
+    files = dict(retained_files or {})
     try:
         for name in sorted(os.listdir(run_descriptor)):
             if exclude_manifest and name == SERVER_ARTIFACT_MANIFEST_FILENAME:
+                continue
+            if name in files:
+                _require_retained_file_entry(
+                    run_descriptor,
+                    name,
+                    files[name],
+                    files[name].snapshot.content,
+                )
                 continue
             try:
                 files[name] = _open_retained_file(run_descriptor, name)
@@ -535,6 +549,8 @@ def _verify_run_inventory(
     run_descriptor: int,
     inventory: Mapping[str, _RetainedFile],
     expected_content: Mapping[str, bytes],
+    *,
+    exclude_manifest: bool = False,
 ) -> None:
     """Revalidate exact entries, identities, metadata, and bytes.
 
@@ -546,14 +562,17 @@ def _verify_run_inventory(
         Entire retained completed-run inventory.
     expected_content : mapping of str to bytes
         Validated manifest and artifact bytes.
+    exclude_manifest : bool, optional
+        Ignore the server manifest while validating its input inventory.
 
     Returns
     -------
     None
     """
-    if set(os.listdir(run_descriptor)) != set(inventory) or set(inventory) != set(
-        expected_content
-    ):
+    visible = set(os.listdir(run_descriptor))
+    if exclude_manifest:
+        visible.discard(SERVER_ARTIFACT_MANIFEST_FILENAME)
+    if visible != set(inventory) or set(inventory) != set(expected_content):
         raise ValueError("server artifact inventory changed during finalization")
     for name, retained in inventory.items():
         try:
@@ -1430,6 +1449,18 @@ def _replace_bytes_at(
         )
         verify_chain()
         temporary = None
+        captured, file_stat = _read_descriptor_bytes(descriptor)
+        retained = _RetainedFile(
+            descriptor,
+            RegularFileSnapshot(
+                captured,
+                file_stat.st_dev,
+                file_stat.st_ino,
+                file_stat.st_size,
+                file_stat.st_mtime_ns,
+                file_stat.st_ctime_ns,
+            ),
+        )
         _require_retained_file_entry(root_descriptor, name, retained, content)
         if retain:
             descriptor = None
@@ -1458,7 +1489,188 @@ def _replace_bytes_at(
                     ):
                         os.unlink(temporary, dir_fd=root_descriptor)
                 verify_chain()
-            except (FileNotFoundError, ValueError):
+            except (OSError, ValueError):
+                pass
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+
+
+def _install_bytes_at(
+    directory: _RetainedDirectory,
+    name: str,
+    content: bytes,
+    *,
+    chain: RetainedDirectoryChain,
+) -> _RetainedFile:
+    """Exclusively install or retain one exact descriptor-relative file.
+
+    Parameters
+    ----------
+    directory : _RetainedDirectory
+        Retained owning run directory.
+    name : str
+        Direct child destination filename.
+    content : bytes
+        Exact required content.
+    chain : RetainedDirectoryChain
+        Complete retained run chain.
+
+    Returns
+    -------
+    _RetainedFile
+        Open retained descriptor for the exact installed or preexisting file.
+
+    Raises
+    ------
+    ValueError
+        If a preexisting or colliding destination differs or is unsafe.
+    """
+
+    def retain_existing() -> _RetainedFile | None:
+        try:
+            retained = _open_retained_file(directory.descriptor, name)
+        except ValueError:
+            try:
+                os.stat(name, dir_fd=directory.descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+            raise ValueError(f"retained public artifact is unsafe: {name}")
+        if retained.snapshot.content != content:
+            os.close(retained.descriptor)
+            raise ValueError(f"retained public artifact differs from snapshot: {name}")
+        _require_retained_file_entry(directory.descriptor, name, retained, content)
+        return retained
+
+    chain.verify()
+    existing = retain_existing()
+    if existing is not None:
+        chain.verify()
+        return existing
+
+    descriptor: int | None = None
+    temporary: str | None = None
+    for _ in range(_TEMPORARY_NAME_ATTEMPTS):
+        candidate = f".{name}.{uuid.uuid4().hex}.tmp"
+        try:
+            chain.verify()
+            descriptor = os.open(
+                candidate,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o644,
+                dir_fd=directory.descriptor,
+            )
+            chain.verify()
+        except FileExistsError:
+            continue
+        temporary = candidate
+        break
+    if descriptor is None or temporary is None:
+        raise FileExistsError("could not allocate an exclusive temporary file")
+    retained: _RetainedFile | None = None
+    try:
+        _write_all(descriptor, content)
+        chain.verify()
+        os.fchmod(descriptor, 0o644)
+        os.fsync(descriptor)
+        chain.verify()
+        captured, file_stat = _read_descriptor_bytes(descriptor)
+        if captured != content:
+            raise ValueError("retained public artifact changed during write")
+        retained = _RetainedFile(
+            descriptor,
+            RegularFileSnapshot(
+                captured,
+                file_stat.st_dev,
+                file_stat.st_ino,
+                file_stat.st_size,
+                file_stat.st_mtime_ns,
+                file_stat.st_ctime_ns,
+            ),
+        )
+        _require_retained_file_entry(directory.descriptor, temporary, retained, content)
+        try:
+            os.link(
+                temporary,
+                name,
+                src_dir_fd=directory.descriptor,
+                dst_dir_fd=directory.descriptor,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            _unlink_retained_file_entry(
+                directory.descriptor, temporary, retained, content
+            )
+            temporary = None
+            os.close(descriptor)
+            descriptor = None
+            collision = retain_existing()
+            if collision is None:
+                raise ValueError(f"retained public artifact is unsafe: {name}")
+            chain.verify()
+            return collision
+        installed_entry = os.stat(
+            name, dir_fd=directory.descriptor, follow_symlinks=False
+        )
+        temporary_entry = os.stat(
+            temporary, dir_fd=directory.descriptor, follow_symlinks=False
+        )
+        linked = os.fstat(descriptor)
+        if (
+            len(
+                {
+                    (installed_entry.st_dev, installed_entry.st_ino),
+                    (temporary_entry.st_dev, temporary_entry.st_ino),
+                    (linked.st_dev, linked.st_ino),
+                }
+            )
+            != 1
+            or not stat.S_ISREG(installed_entry.st_mode)
+            or installed_entry.st_nlink != 2
+            or temporary_entry.st_nlink != 2
+            or linked.st_nlink != 2
+        ):
+            raise ValueError("retained public artifact changed during install")
+        os.unlink(temporary, dir_fd=directory.descriptor)
+        temporary = None
+        captured, file_stat = _read_descriptor_bytes(descriptor)
+        retained = _RetainedFile(
+            descriptor,
+            RegularFileSnapshot(
+                captured,
+                file_stat.st_dev,
+                file_stat.st_ino,
+                file_stat.st_size,
+                file_stat.st_mtime_ns,
+                file_stat.st_ctime_ns,
+            ),
+        )
+        chain.verify()
+        os.fsync(directory.descriptor)
+        chain.verify()
+        _require_retained_file_entry(directory.descriptor, name, retained, content)
+        descriptor = None
+        return retained
+    except BaseException:
+        if temporary is not None:
+            try:
+                if retained is not None:
+                    _unlink_retained_file_entry(
+                        directory.descriptor, temporary, retained, content
+                    )
+                elif descriptor is not None:
+                    entry = os.stat(
+                        temporary,
+                        dir_fd=directory.descriptor,
+                        follow_symlinks=False,
+                    )
+                    current = os.fstat(descriptor)
+                    if (entry.st_dev, entry.st_ino) == (
+                        current.st_dev,
+                        current.st_ino,
+                    ):
+                        os.unlink(temporary, dir_fd=directory.descriptor)
+            except (OSError, ValueError):
                 pass
         if descriptor is not None:
             os.close(descriptor)
@@ -1760,37 +1972,95 @@ def resolve_current_run_dir(artifact_root: str | Path) -> Path:
     return load_current_run_snapshot(root).directory
 
 
-def _retain_public_artifacts(run_dir: Path, app_manifest: AppManifest) -> None:
+def _retain_public_artifacts(
+    descriptors: _HistoryDescriptors, app_manifest: AppManifest
+) -> Mapping[str, _RetainedFile]:
     """Publish immutable public evidence into one run before final capture.
 
     Parameters
     ----------
-    run_dir : pathlib.Path
-        Canonical in-progress run directory.
+    descriptors : _HistoryDescriptors
+        Retained root-to-run descriptor chain.
     app_manifest : AppManifest
         Validated public snapshot used by the run.
 
     Returns
     -------
-    None
+    collections.abc.Mapping
+        Exact public evidence retained through finalization.
 
     Raises
     ------
     ValueError
         If an existing retained artifact is unsafe or differs from the snapshot.
     """
-    for name, content in (
-        ("manifest.json", app_manifest.manifest_bytes),
-        ("vocab.txt", app_manifest.vocabulary_bytes),
-    ):
-        path = run_dir / name
-        try:
-            write_bytes_atomically(path, content, overwrite=False)
-        except FileExistsError:
-            pass
-        retained = read_regular_file_snapshot(path, parent=run_dir)
-        if retained.content != content:
-            raise ValueError(f"retained public artifact differs from snapshot: {name}")
+    retained_files: dict[str, _RetainedFile] = {}
+    try:
+        for name, content in (
+            ("manifest.json", app_manifest.manifest_bytes),
+            ("vocab.txt", app_manifest.vocabulary_bytes),
+        ):
+            retained_files[name] = _install_bytes_at(
+                descriptors.run,
+                name,
+                content,
+                chain=descriptors.chain,
+            )
+        _verify_history_descriptors(descriptors)
+        for name, retained in retained_files.items():
+            expected = (
+                app_manifest.manifest_bytes
+                if name == "manifest.json"
+                else app_manifest.vocabulary_bytes
+            )
+            _require_retained_file_entry(
+                descriptors.run.descriptor, name, retained, expected
+            )
+        return MappingProxyType(retained_files)
+    except BaseException:
+        for retained in retained_files.values():
+            os.close(retained.descriptor)
+        raise
+
+
+def _finalized_server_manifest_bytes(
+    app_manifest: AppManifest, artifact_snapshot: ServerFinalizationSnapshot
+) -> bytes:
+    """Build the canonical completed server manifest from retained files.
+
+    Parameters
+    ----------
+    app_manifest : AppManifest
+        Validated public artifact binding.
+    artifact_snapshot : ServerFinalizationSnapshot
+        Complete retained pre-manifest run inventory.
+
+    Returns
+    -------
+    bytes
+        Canonical completed server manifest bytes.
+    """
+    missing = sorted(REQUIRED_COMPLETED_ARTIFACTS - artifact_snapshot.files.keys())
+    if missing:
+        raise ValueError(
+            "cannot finalize run with missing artifacts: " + ", ".join(missing)
+        )
+    return canonical_json_bytes(
+        {
+            "schema_version": SERVER_ARTIFACT_SCHEMA_VERSION,
+            "artifacts": SERVER_ARTIFACTS,
+            "binding": server_artifact_binding(app_manifest),
+            "lifecycle": "complete",
+            "sizes": {
+                name: snapshot.size_bytes
+                for name, snapshot in artifact_snapshot.files.items()
+            },
+            "checksums": {
+                name: sha256_bytes(snapshot.content)
+                for name, snapshot in artifact_snapshot.files.items()
+            },
+        }
+    )
 
 
 def load_current_run_snapshot(
@@ -1911,7 +2181,6 @@ def publish_completed_run(
                 )
             except FileNotFoundError:
                 existing_manifest_bytes = None
-                existing_snapshot = None
             else:
                 retained_existing_manifest = _open_retained_file(
                     descriptors.run.descriptor,
@@ -1923,23 +2192,20 @@ def publish_completed_run(
                     )
                 finally:
                     os.close(retained_existing_manifest.descriptor)
-                existing_snapshot = load_server_artifact_snapshot(
+                load_server_artifact_snapshot(
                     resolved_run_dir,
                     manifest_bytes=existing_manifest_bytes,
                     app_manifest=validated_manifest,
+                    _retained_chain=descriptors.chain,
                 )
-            was_complete = (
-                existing_snapshot is not None
-                and existing_snapshot.manifest.get("lifecycle") == "complete"
-            )
-            if not was_complete:
-                _verify_history_descriptors(descriptors)
-                _retain_public_artifacts(resolved_run_dir, validated_manifest)
-                _verify_history_descriptors(descriptors)
+            _verify_history_descriptors(descriptors)
+            retained_public = _retain_public_artifacts(descriptors, validated_manifest)
 
             try:
                 inventory_context = _capture_run_inventory(
-                    descriptors.run.descriptor, exclude_manifest=True
+                    descriptors.run.descriptor,
+                    exclude_manifest=True,
+                    retained_files=retained_public,
                 )
                 with inventory_context as artifact_inventory:
                     artifact_snapshot = _snapshot_from_inventory(artifact_inventory)
@@ -1959,28 +2225,43 @@ def publish_completed_run(
                         raise ValueError(
                             "run directory does not match its provenance run_id"
                         )
+                    _verify_run_inventory(
+                        descriptors.run.descriptor,
+                        artifact_inventory,
+                        {
+                            name: retained.snapshot.content
+                            for name, retained in artifact_inventory.items()
+                        },
+                        exclude_manifest=True,
+                    )
                     _verify_history_descriptors(descriptors)
                     _sync_retained_files(artifact_inventory)
                     _verify_history_descriptors(descriptors)
+                    retained_manifest: _RetainedFile | None = None
 
                     if existing_manifest_bytes is not None:
                         snapshot = load_server_artifact_snapshot(
                             resolved_run_dir,
                             manifest_bytes=existing_manifest_bytes,
                             app_manifest=validated_manifest,
+                            _retained_chain=descriptors.chain,
                         )
                         validate_run_provenance_evidence(
                             provenance, snapshot.manifest, validated_manifest
                         )
                         if snapshot.manifest.get("lifecycle") != "complete":
                             _verify_history_descriptors(descriptors)
-                            write_server_artifact_manifest(
-                                resolved_run_dir,
-                                app_manifest=validated_manifest,
-                                finalized=True,
-                                artifact_snapshot=artifact_snapshot,
+                            finalized_manifest = _finalized_server_manifest_bytes(
+                                validated_manifest, artifact_snapshot
                             )
-                            _verify_history_descriptors(descriptors)
+                            retained_manifest = _replace_bytes_at(
+                                descriptors.run.descriptor,
+                                SERVER_ARTIFACT_MANIFEST_FILENAME,
+                                finalized_manifest,
+                                retain=True,
+                                chain=descriptors.chain,
+                            )
+                            assert retained_manifest is not None
                         elif dict(snapshot.files) != {
                             name: retained.snapshot.content
                             for name, retained in artifact_inventory.items()
@@ -1990,24 +2271,30 @@ def publish_completed_run(
                             )
                     else:
                         _verify_history_descriptors(descriptors)
-                        write_server_artifact_manifest(
-                            resolved_run_dir,
-                            app_manifest=validated_manifest,
-                            finalized=True,
-                            artifact_snapshot=artifact_snapshot,
+                        finalized_manifest = _finalized_server_manifest_bytes(
+                            validated_manifest, artifact_snapshot
                         )
-                        _verify_history_descriptors(descriptors)
-                    _verify_history_descriptors(descriptors)
-                    retained_manifest = _open_retained_file(
-                        descriptors.run.descriptor,
-                        SERVER_ARTIFACT_MANIFEST_FILENAME,
-                    )
+                        retained_manifest = _replace_bytes_at(
+                            descriptors.run.descriptor,
+                            SERVER_ARTIFACT_MANIFEST_FILENAME,
+                            finalized_manifest,
+                            retain=True,
+                            chain=descriptors.chain,
+                        )
+                        assert retained_manifest is not None
+                    if retained_manifest is None:
+                        retained_manifest = _open_retained_file(
+                            descriptors.run.descriptor,
+                            SERVER_ARTIFACT_MANIFEST_FILENAME,
+                        )
                     try:
+                        _verify_history_descriptors(descriptors)
                         manifest_bytes = retained_manifest.snapshot.content
                         snapshot = load_server_artifact_snapshot(
                             resolved_run_dir,
                             manifest_bytes=manifest_bytes,
                             app_manifest=validated_manifest,
+                            _retained_chain=descriptors.chain,
                         )
                         validate_run_provenance_evidence(
                             provenance, snapshot.manifest, validated_manifest

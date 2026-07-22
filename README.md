@@ -82,8 +82,10 @@ Direct evaluation publication retains and revalidates every no-follow directory
 edge from the filesystem root through the destination parent. Missing parent
 components are created descriptor-relatively and each new edge is flushed before
 the next component is created. A failed publication removes only entries whose
-captured identity proves that invocation owns them; nonempty or detached recovery
-state is preserved for a safe retry.
+durable ownership state binds the exact parent, private name, nonce, operation, and
+captured identity to that invocation. Unbound `.staging`/`.deleting` lookalikes,
+corrupt state, and identity replacements are preserved rather than inferred from
+their names.
 
 The first generation created over real legacy `artifacts/clients`,
 `artifacts/public`, or `artifacts/evaluation` directories migrates those complete
@@ -182,6 +184,8 @@ protocol, require the provenance and model dimensions to match them, and reject
 any unmanifested directory entry before loading. Current and explicit historical
 loads apply the same completed-run provenance, directory-identity, public-evidence,
 vocabulary, checksum, and exact-inventory validation boundary.
+Preparation likewise recovers only the exact staging inode named by its flushed
+ownership record; unrelated `.prepare-*.staging` directories are left untouched.
 Set
 `FML_CODE_REVISION` to the full Git object ID in images that do not contain `.git`.
 Client shard identities and checksums are not collected by the server manifest.
@@ -194,7 +198,9 @@ for every visible edge from the filesystem root through the artifact root, canon
 revalidated for creation, finalization, recovery, current publication, and pruning.
 Finalizers lock the retained root inode, but still reject a detached visible path;
 replacing a visible lock pathname cannot split serialization across same-run or
-different-run publishers. Before the
+different-run publishers. Public `manifest.json` and `vocab.txt` retention, completed
+manifest installation, and all final verification use the retained run descriptor,
+so a replacement at the run pathname receives no finalization writes. Before the
 final barriers, an atomically replaced private state file records the exact candidate
 pointer and the exact previous pointer identity, bytes, and checksum, or absence. It
 is written through an exclusive temporary file, flushed, renamed descriptor-relatively,

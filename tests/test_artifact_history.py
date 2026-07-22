@@ -1757,6 +1757,43 @@ class ArtifactHistoryTests(unittest.TestCase):
             self.assertTrue(replaced)
             self.assertFalse((root / "current.json").exists())
 
+    def test_public_install_never_writes_through_replaced_run_path(self) -> None:
+        """Keep public evidence on the retained run inode at the write boundary."""
+        from src import artifact_history
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            parked = root / "runs" / "parked-run"
+            replacement = root / "runs" / "replacement"
+            replacement.mkdir()
+            (replacement / "preserve.bin").write_bytes(b"replacement")
+            descriptor_baseline = len(os.listdir("/proc/self/fd"))
+            replaced = False
+            real_write = artifact_history._write_all
+
+            def replace_after_write(descriptor, content):
+                nonlocal replaced
+                result = real_write(descriptor, content)
+                if not replaced:
+                    replaced = True
+                    run.rename(parked)
+                    replacement.rename(run)
+                return result
+
+            with (
+                patch.object(
+                    artifact_history, "_write_all", side_effect=replace_after_write
+                ),
+                self.assertRaisesRegex(ValueError, "history changed"),
+            ):
+                publish_completed_run(root, run)
+
+            self.assertTrue(replaced)
+            self.assertEqual({path.name for path in run.iterdir()}, {"preserve.bin"})
+            self.assertNotIn("manifest.json", {path.name for path in run.iterdir()})
+            self.assertEqual(len(os.listdir("/proc/self/fd")), descriptor_baseline)
+
     def test_exact_retry_recovers_after_post_replacement_root_fsync_failure(
         self,
     ) -> None:
@@ -2962,19 +2999,15 @@ with patch("src.app_manifest.load_scientific_protocol", return_value=_TEST_PROTO
             release_write = threading.Event()
             errors: list[BaseException] = []
 
-            from src import artifact_compatibility
+            from src import artifact_history
 
-            write_json_atomically = artifact_compatibility.write_json_atomically
+            replace_bytes_at = artifact_history._replace_bytes_at
 
-            def delayed_write(path, payload, *, overwrite=True):
-                if (
-                    path.name == "artifact_manifest.json"
-                    and payload.get("lifecycle") == "complete"
-                    and not first_write.is_set()
-                ):
+            def delayed_write(directory_descriptor, name, content, **kwargs):
+                if name == "artifact_manifest.json" and not first_write.is_set():
                     first_write.set()
                     release_write.wait(timeout=2)
-                return write_json_atomically(path, payload, overwrite=overwrite)
+                return replace_bytes_at(directory_descriptor, name, content, **kwargs)
 
             def publish() -> Path | None:
                 start.wait()
@@ -2986,7 +3019,7 @@ with patch("src.app_manifest.load_scientific_protocol", return_value=_TEST_PROTO
 
             with (
                 patch(
-                    "src.artifact_compatibility.write_json_atomically",
+                    "src.artifact_history._replace_bytes_at",
                     side_effect=delayed_write,
                 ),
                 ThreadPoolExecutor(max_workers=2) as executor,
