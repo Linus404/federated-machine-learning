@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import csv
+import math
 import warnings
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from flwr.common import (
     Context,
     Parameters,
@@ -44,6 +47,8 @@ from src.paths import (
 warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"keras\..*")
 
 DEFAULT_SERVER_ROUNDS = 20
+DEFAULT_EXPECTED_CLIENTS = 4
+_PROTOCOL_DTYPE = np.dtype(np.float32)
 
 
 def weighted_average(metrics: list[tuple[int, dict[str, float]]]) -> dict[str, float]:
@@ -57,8 +62,257 @@ def weighted_average(metrics: list[tuple[int, dict[str, float]]]) -> dict[str, f
     return {"accuracy": accuracy}
 
 
+def _sorted_fit_results(
+    results: list[Any],
+    expected_client_ids: frozenset[int],
+    result_kind: str = "fit",
+) -> list[Any]:
+    """Validate and order fit results by numeric client identifier.
+
+    Parameters
+    ----------
+    results : list[Any]
+        Flower ``(ClientProxy, FitRes)`` pairs for one round.
+    expected_client_ids : frozenset[int]
+        Exact client-ID set required for the round.
+    result_kind : str, optional
+        Result label used in validation errors.
+
+    Returns
+    -------
+    list[Any]
+        A new list sorted by ascending zero-based client ID.
+
+    Raises
+    ------
+    ValueError
+        If the expected set is invalid or a client ID is missing, invalid,
+        duplicated, or unexpected.
+    """
+    if not expected_client_ids or any(
+        type(client_id) is not int or client_id < 0 for client_id in expected_client_ids
+    ):
+        raise ValueError("expected client IDs must be nonempty non-negative integers")
+    if expected_client_ids != frozenset(range(len(expected_client_ids))):
+        raise ValueError("expected client IDs must be contiguous from zero")
+    identified_results: list[tuple[int, Any]] = []
+    for result in results:
+        if not isinstance(result, tuple) or len(result) != 2:
+            raise ValueError(f"every {result_kind} result must be a pair")
+        metrics = getattr(result[1], "metrics", None)
+        if not isinstance(metrics, dict):
+            raise ValueError(f"every {result_kind} result must contain metrics")
+        client_id = metrics.get("client_id")
+        if type(client_id) is not int:
+            raise ValueError(
+                f"every {result_kind} result must contain a built-in integer client_id"
+            )
+        identified_results.append((client_id, result))
+
+    client_ids = [client_id for client_id, _ in identified_results]
+    if len(set(client_ids)) != len(client_ids):
+        raise ValueError(f"{result_kind} result client_id values must be unique")
+    actual_client_ids = frozenset(client_ids)
+    if actual_client_ids != expected_client_ids:
+        missing = sorted(expected_client_ids - actual_client_ids)
+        unexpected = sorted(actual_client_ids - expected_client_ids)
+        raise ValueError(
+            f"{result_kind} result client IDs must equal the expected set; "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    return [result for _, result in sorted(identified_results)]
+
+
+def _validate_evaluate_results(
+    results: list[Any], expected_client_ids: frozenset[int]
+) -> list[Any]:
+    """Validate and order one complete client-evaluation result set.
+
+    Parameters
+    ----------
+    results : list[Any]
+        Flower ``(ClientProxy, EvaluateRes)`` pairs for one round.
+    expected_client_ids : frozenset[int]
+        Exact client-ID set required for the round.
+
+    Returns
+    -------
+    list[Any]
+        Validated results sorted by ascending client ID.
+
+    Raises
+    ------
+    ValueError
+        If any result is missing, malformed, duplicated, unexpected, or
+        contains an invalid sample count, loss, or accuracy.
+    """
+    ordered_results = _sorted_fit_results(
+        results, expected_client_ids, result_kind="evaluation"
+    )
+    for _, evaluate_result in ordered_results:
+        num_examples = getattr(evaluate_result, "num_examples", None)
+        if type(num_examples) is not int or num_examples <= 0:
+            raise ValueError(
+                "evaluation result num_examples must be a positive built-in integer"
+            )
+        loss = getattr(evaluate_result, "loss", None)
+        accuracy = evaluate_result.metrics.get("accuracy")
+        if (
+            not isinstance(loss, Real)
+            or isinstance(loss, bool)
+            or not math.isfinite(loss)
+            or float(loss) < 0.0
+        ):
+            raise ValueError(
+                "evaluation result loss must be a finite non-negative real number"
+            )
+        if (
+            not isinstance(accuracy, Real)
+            or isinstance(accuracy, bool)
+            or not math.isfinite(accuracy)
+            or not 0.0 <= float(accuracy) <= 1.0
+        ):
+            raise ValueError(
+                "evaluation result accuracy must be a finite real number in [0, 1]"
+            )
+    return ordered_results
+
+
+def _validate_aggregated_evaluation(
+    loss: float | None, metrics: dict[str, Any]
+) -> None:
+    """Validate aggregate evaluation values before artifact publication.
+
+    Parameters
+    ----------
+    loss : float or None
+        Sample-weighted aggregate loss.
+    metrics : dict[str, Any]
+        Aggregate evaluation metrics.
+
+    Raises
+    ------
+    ValueError
+        If aggregate loss or accuracy is missing or outside its permitted range.
+    """
+    if not isinstance(metrics, dict):
+        raise ValueError("aggregate evaluation metrics must be a dictionary")
+    accuracy = metrics.get("accuracy")
+    if (
+        not isinstance(loss, Real)
+        or isinstance(loss, bool)
+        or not math.isfinite(loss)
+        or float(loss) < 0.0
+    ):
+        raise ValueError(
+            "aggregate evaluation loss must be a finite non-negative real number"
+        )
+    if (
+        not isinstance(accuracy, Real)
+        or isinstance(accuracy, bool)
+        or not math.isfinite(accuracy)
+        or not 0.0 <= float(accuracy) <= 1.0
+    ):
+        raise ValueError(
+            "aggregate evaluation accuracy must be a finite real number in [0, 1]"
+        )
+
+
+def _validate_fit_results(
+    results: list[Any],
+    expected_client_ids: frozenset[int],
+    expected_weight_shapes: tuple[tuple[int, ...], ...],
+) -> tuple[list[Any], list[list[np.ndarray]]]:
+    """Validate one complete round against the runtime aggregation contract.
+
+    Parameters
+    ----------
+    results : list[Any]
+        Flower ``(ClientProxy, FitRes)`` pairs for one round.
+    expected_client_ids : frozenset[int]
+        Exact client-ID set required for the round.
+    expected_weight_shapes : tuple[tuple[int, ...], ...]
+        Round-start model-weight shapes in model order.
+
+    Returns
+    -------
+    tuple[list[Any], list[list[numpy.ndarray]]]
+        Ordered fit results and their decoded, validated weights.
+
+    Raises
+    ------
+    ValueError
+        If a sample count or decoded model violates the aggregation contract.
+    """
+    if not expected_weight_shapes or any(
+        not shape or any(dimension <= 0 for dimension in shape)
+        for shape in expected_weight_shapes
+    ):
+        raise ValueError("expected model weights must have non-scalar nonempty shapes")
+
+    ordered_results = _sorted_fit_results(results, expected_client_ids)
+    decoded_weights: list[list[np.ndarray]] = []
+    for _, fit_result in ordered_results:
+        if type(fit_result.num_examples) is not int or fit_result.num_examples <= 0:
+            raise ValueError(
+                "fit result num_examples must be a positive built-in integer"
+            )
+        weights = parameters_to_ndarrays(fit_result.parameters)
+        if len(weights) != len(expected_weight_shapes):
+            raise ValueError("fit result model weight count must match round start")
+        for weight, expected_shape in zip(weights, expected_weight_shapes, strict=True):
+            if weight.dtype != _PROTOCOL_DTYPE:
+                raise ValueError("fit result model weights must use exactly float32")
+            if weight.ndim == 0 or weight.size == 0:
+                raise ValueError(
+                    "fit result model weights must be non-scalar and nonempty"
+                )
+            if weight.shape != expected_shape:
+                raise ValueError(
+                    "fit result model weight shapes must match round start"
+                )
+            if not np.all(np.isfinite(weight)):
+                raise ValueError("fit result model weights must contain finite values")
+        decoded_weights.append(weights)
+    return ordered_results, decoded_weights
+
+
+def _validate_aggregated_parameters(
+    parameters: Parameters, expected_weight_shapes: tuple[tuple[int, ...], ...]
+) -> None:
+    """Validate aggregated parameters before publication or reuse.
+
+    Parameters
+    ----------
+    parameters : Parameters
+        Flower parameters returned by the selected aggregation strategy.
+    expected_weight_shapes : tuple[tuple[int, ...], ...]
+        Required model-weight shapes in model order.
+
+    Raises
+    ------
+    ValueError
+        If the aggregate has an invalid count, dtype, shape, size, or value.
+    """
+    weights = parameters_to_ndarrays(parameters)
+    if len(weights) != len(expected_weight_shapes):
+        raise ValueError("aggregate model weight count must match round start")
+    for weight, expected_shape in zip(weights, expected_weight_shapes, strict=True):
+        if weight.dtype != _PROTOCOL_DTYPE:
+            raise ValueError("aggregate model weights must use exactly float32")
+        if weight.ndim == 0 or weight.size == 0:
+            raise ValueError("aggregate model weights must be non-scalar and nonempty")
+        if weight.shape != expected_shape:
+            raise ValueError("aggregate model weight shapes must match round start")
+        if not np.all(np.isfinite(weight)):
+            raise ValueError("aggregate model weights must contain finite values")
+
+
 class SentimentServer(FedProx):
     """Run FedProx with optional experimental Huber aggregation and artifacts."""
+
+    expected_client_ids: frozenset[int]
+    expected_weight_shapes: tuple[tuple[int, ...], ...]
 
     def __init__(
         self,
@@ -122,73 +376,164 @@ class SentimentServer(FedProx):
                     }
                 )
 
-    def aggregate_fit(self, server_round, results, failures):
-        parameters: Parameters | None
-        if self.use_huber and results:
-            # Robust Huber aggregation instead of plain FedProx averaging
-            reference = parameters_to_ndarrays(results[0][1].parameters)
-            vectors = [
-                _flatten(parameters_to_ndarrays(r.parameters)) for _, r in results
-            ]
-            counts = [r.num_examples for _, r in results]
-            aggregated = huber_aggregate(vectors, counts, self.huber_threshold)
-            parameters = ndarrays_to_parameters(_unflatten(aggregated, reference))
-            metrics = {}
-            if self.fit_metrics_aggregation_fn:
-                metrics = self.fit_metrics_aggregation_fn(
-                    [(r.num_examples, r.metrics) for _, r in results]
-                )
-        else:
-            # Standard FedProx averaging
-            parameters, metrics = super().aggregate_fit(server_round, results, failures)
+    def _release_artifact_lock(self) -> None:
+        """Release this run's writer lock at most once.
 
-        # Artifact saving
-        if parameters is not None:
+        Returns
+        -------
+        None
+            The lock is released when present and then detached.
+        """
+        artifact_lock = getattr(self, "_artifact_lock", None)
+        self._artifact_lock = None
+        if artifact_lock is not None:
+            artifact_lock.release()
+
+    def aggregate_fit(self, server_round, results, failures):
+        """Aggregate one complete, validated fit round or hard-fail.
+
+        Parameters
+        ----------
+        server_round : int
+            One-based Flower server round.
+        results : list[Any]
+            Successful Flower fit results.
+        failures : list[Any]
+            Flower fit failures for the round.
+
+        Returns
+        -------
+        tuple[Parameters, dict[str, Any]]
+            Validated aggregate parameters and aggregated fit metrics.
+
+        Raises
+        ------
+        RuntimeError
+            If Flower reports any fit failure.
+        ValueError
+            If the result set, an input, or the aggregate violates the runtime
+            aggregation contract.
+        """
+        try:
+            parameters: Parameters | None
+            if failures:
+                raise RuntimeError(
+                    f"fit round {server_round} failed for {len(failures)} client(s)"
+                )
+
+            ordered_results, client_weights = _validate_fit_results(
+                results, self.expected_client_ids, self.expected_weight_shapes
+            )
+            if self.use_huber:
+                # Robust Huber aggregation instead of plain FedProx averaging
+                reference = client_weights[0]
+                vectors = [_flatten(weights) for weights in client_weights]
+                counts = [result.num_examples for _, result in ordered_results]
+                aggregated = huber_aggregate(vectors, counts, self.huber_threshold)
+                parameters = ndarrays_to_parameters(_unflatten(aggregated, reference))
+                metrics = {}
+                if self.fit_metrics_aggregation_fn:
+                    metrics = self.fit_metrics_aggregation_fn(
+                        [
+                            (result.num_examples, result.metrics)
+                            for _, result in ordered_results
+                        ]
+                    )
+            else:
+                # Standard FedProx averaging
+                parameters, metrics = super().aggregate_fit(
+                    server_round, ordered_results, failures
+                )
+
+            if parameters is None:
+                raise RuntimeError(f"fit round {server_round} produced no aggregate")
+            _validate_aggregated_parameters(parameters, self.expected_weight_shapes)
+
+            # Artifact saving
             self.artifact_dir.mkdir(parents=True, exist_ok=True)
             model = build_model_from_manifest(self.app_manifest)
             model.set_weights(parameters_to_ndarrays(parameters))
             model.save(str(self.model_path))
+        except BaseException:
+            self._release_artifact_lock()
+            raise
 
         return parameters, metrics
 
     def aggregate_evaluate(
         self, server_round: int, results: list[Any], failures: list[Any]
     ) -> tuple[float | None, dict[str, Any]]:
-        loss, metrics = super().aggregate_evaluate(server_round, results, failures)
+        """Aggregate one complete evaluation round or hard-fail safely.
 
-        self.artifact_dir.mkdir(parents=True, exist_ok=True)
-        self._write_client_metrics(server_round, results)
-        if server_round == 1 and self.metrics_path.exists():
-            self.metrics_path.unlink()
-        file_exists = self.metrics_path.exists()
+        Parameters
+        ----------
+        server_round : int
+            One-based Flower server round.
+        results : list[Any]
+            Successful Flower evaluation results.
+        failures : list[Any]
+            Flower evaluation failures for the round.
 
-        with self.metrics_path.open("a", newline="") as file:
-            writer = csv.DictWriter(file, fieldnames=["round", "loss", "accuracy"])
-            if not file_exists:
-                writer.writeheader()
-            writer.writerow(
-                {
-                    "round": server_round,
-                    "loss": loss,
-                    "accuracy": metrics.get("accuracy"),
-                }
+        Returns
+        -------
+        tuple[float, dict[str, Any]]
+            Finite aggregate loss and metrics.
+
+        Raises
+        ------
+        RuntimeError
+            If Flower reports any evaluation failure.
+        ValueError
+            If the complete result set or aggregate metrics are invalid.
+        """
+        try:
+            if failures:
+                raise RuntimeError(
+                    f"evaluation round {server_round} failed for "
+                    f"{len(failures)} client(s)"
+                )
+            ordered_results = _validate_evaluate_results(
+                results, self.expected_client_ids
             )
-        if server_round == self.final_round:
-            try:
+            loss, metrics = super().aggregate_evaluate(
+                server_round, ordered_results, []
+            )
+            _validate_aggregated_evaluation(loss, metrics)
+
+            self.artifact_dir.mkdir(parents=True, exist_ok=True)
+            self._write_client_metrics(server_round, ordered_results)
+            if server_round == 1 and self.metrics_path.exists():
+                self.metrics_path.unlink()
+            file_exists = self.metrics_path.exists()
+
+            with self.metrics_path.open("a", newline="") as file:
+                writer = csv.DictWriter(file, fieldnames=["round", "loss", "accuracy"])
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow(
+                    {
+                        "round": server_round,
+                        "loss": loss,
+                        "accuracy": metrics["accuracy"],
+                    }
+                )
+            if server_round == self.final_round:
                 publish_completed_run(self.artifact_root, self.artifact_dir)
                 prune_run_history(
                     self.artifact_root,
                     self.artifact_retention_runs,
                     active_run_dir=self.artifact_dir,
                 )
-            finally:
-                if self._artifact_lock is not None:
-                    self._artifact_lock.release()
+        except BaseException:
+            self._release_artifact_lock()
+            raise
+        if server_round == self.final_round:
+            self._release_artifact_lock()
         return loss, metrics
 
 
 def create_strategy(
-    min_clients: int = 4,
+    min_clients: int = DEFAULT_EXPECTED_CLIENTS,
     artifact_dir: str | Path | None = None,
     artifact_lock: RunArtifactLock | None = None,
     artifact_root: str | Path | None = None,
@@ -199,15 +544,54 @@ def create_strategy(
     use_huber: bool = False,
     huber_threshold: float = DEFAULT_HUBER_THRESHOLD,
 ) -> SentimentServer:
+    """Create the deployment strategy with exact-round validation.
+
+    Parameters
+    ----------
+    min_clients : int, optional
+        Exact number of clients required in every fit round.
+    artifact_dir : str or pathlib.Path, optional
+        Directory for this run's server artifacts.
+    artifact_lock : RunArtifactLock, optional
+        Exclusive writer lock held for this run.
+    artifact_root : str or pathlib.Path, optional
+        Root directory containing run history.
+    artifact_retention_runs : int, optional
+        Number of completed runs to retain.
+    final_round : int, optional
+        One-based final Flower round.
+    public_artifact_dir : str or pathlib.Path, optional
+        Directory containing the public application manifest.
+    proximal_mu : float, optional
+        FedProx proximal coefficient.
+    use_huber : bool, optional
+        Whether to replace sample-weighted averaging with Huber aggregation.
+    huber_threshold : float, optional
+        Positive Huber residual threshold.
+
+    Returns
+    -------
+    SentimentServer
+        Configured deployment strategy.
+
+    Raises
+    ------
+    ValueError
+        If ``min_clients`` is not a positive built-in integer.
+    """
+    if type(min_clients) is not int or min_clients <= 0:
+        raise ValueError("min_clients must be a positive built-in integer")
     resolved_artifact_dir = resolve_dir(artifact_dir or default_server_artifact_dir())
 
     app_manifest = load_app_manifest(
         public_artifact_dir=public_artifact_dir,
     )
     initial_model = build_model_from_manifest(app_manifest)
+    initial_weights = initial_model.get_weights()
 
-    return SentimentServer(
+    strategy = SentimentServer(
         proximal_mu=proximal_mu,
+        accept_failures=False,
         artifact_dir=resolved_artifact_dir,
         artifact_lock=artifact_lock,
         artifact_root=artifact_root,
@@ -221,13 +605,33 @@ def create_strategy(
         min_fit_clients=min_clients,
         min_evaluate_clients=min_clients,
         min_available_clients=min_clients,
-        initial_parameters=ndarrays_to_parameters(initial_model.get_weights()),
+        initial_parameters=ndarrays_to_parameters(initial_weights),
         fit_metrics_aggregation_fn=weighted_average,
         evaluate_metrics_aggregation_fn=weighted_average,
     )
+    strategy.expected_client_ids = frozenset(range(min_clients))
+    strategy.expected_weight_shapes = tuple(weight.shape for weight in initial_weights)
+    return strategy
 
 
 def server_fn(context: Context) -> ServerAppComponents:
+    """Create Flower server components from one deployment run context.
+
+    Parameters
+    ----------
+    context : Context
+        Flower run context containing deployment configuration.
+
+    Returns
+    -------
+    ServerAppComponents
+        Strategy and round configuration for the Flower server application.
+
+    Raises
+    ------
+    ValueError
+        If numeric settings or artifact directory boundaries are invalid.
+    """
     run_config: dict[str, Any] = context.run_config
     artifact_root = resolve_dir(
         run_config.get("server-artifact-dir", default_server_artifact_dir())
@@ -236,10 +640,13 @@ def server_fn(context: Context) -> ServerAppComponents:
     retention_runs = int(
         run_config.get("artifact-retention-runs", DEFAULT_ARTIFACT_RETENTION_RUNS)
     )
+    expected_clients = run_config.get("expected-client-count", DEFAULT_EXPECTED_CLIENTS)
     if num_rounds < 1:
         raise ValueError("num-server-rounds must be a positive integer")
     if retention_runs < 1:
         raise ValueError("artifact-retention-runs must be a positive integer")
+    if type(expected_clients) is not int or expected_clients < 1:
+        raise ValueError("expected-client-count must be a positive built-in integer")
     public_artifact_dir = resolve_public_artifact_dir(run_config)
     resolved_public_dir = public_artifact_dir.resolve()
     resolved_artifact_root = artifact_root.resolve()
@@ -259,7 +666,7 @@ def server_fn(context: Context) -> ServerAppComponents:
         )
         prune_run_history(artifact_root, retention_runs, active_run_dir=run_dir)
         strategy = create_strategy(
-            min_clients=4,
+            min_clients=expected_clients,
             artifact_dir=run_dir,
             artifact_lock=artifact_lock,
             artifact_root=artifact_root,

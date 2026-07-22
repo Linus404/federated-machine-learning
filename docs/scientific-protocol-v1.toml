@@ -1,0 +1,922 @@
+protocol_version = 1
+name = "federated-imdb-scientific-protocol"
+status = "frozen"
+amendment_policy = "Changes require a separately reviewed protocol version before comparative results are produced."
+
+[scope]
+purpose = "Preregistered, executable specification for the later PR12 experiment runner and its generated comparative results."
+implementation_status = "This repository revision freezes the protocol before the experiment runner is split out; it does not contain a runner that executes the registered matrix. No matrix cell or comparative result may be claimed as executed by this revision."
+reviewed_server_boundary = "src/server_app.py is the current deployment/demo server, not the registered experiment runner. It exposes FedProx with either Flower sample-weighted aggregation or the Huber aggregate, requires an exact configured client-ID set for fitting, validates that submitted sample counts are positive built-in integers but does not independently derive the registered fitted-row counts, and performs client-local evaluation aggregation. It does not implement threat transforms, FedMedian, FedTrimmedAvg, deterministic protocol partition construction, the server-held validation union, the untouched-test schedule, privacy analyses, or matrix orchestration."
+deployment_configuration = "The deployment defaults to expected-client-count=4 because compose.yaml registers client IDs 0 through 3. Changing expected-client-count changes only the deployment server's exact fit-result set; it does not select or execute a protocol matrix client_scale cell."
+experiment_runner_requirement = "A later runner claiming protocol conformance must implement every registered cell and validation/evaluation boundary exactly, including client scales 4, 16, and 64, registered strategies and threats, no client evaluation, one server-held validation-union evaluation per round, final untouched-test evaluation, hard cell failure, and provenance. Reusing src/server_app.py without those additions is non-conformant."
+
+[dataset]
+id = "stanfordnlp/imdb"
+config = "plain_text"
+revision = "e6281661ce1c48d982bc483cf8a173c1bbeb5d31"
+datasets_version = "4.8.5"
+raw_hash_algorithm = "sha256"
+content_hash_algorithm = "sha256"
+content_hash_serialization = "For each row in dataset order, encode compact UTF-8 JSON with sorted keys label and text, then one newline."
+content_hash_python = '''json.dumps({"label": int(row["label"]), "text": row["text"]}, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8") + b"\n"'''
+content_hash_json_ensure_ascii = false
+content_hash_json_separators = [",", ":"]
+content_hash_json_sort_keys = true
+content_hash_json_allow_nan = false
+content_hash_unicode_normalization = "none_preserve_dataset_code_points_exactly"
+
+[dataset.sources]
+dataset_api = "https://huggingface.co/api/datasets/stanfordnlp/imdb"
+refs_api = "https://huggingface.co/api/datasets/stanfordnlp/imdb/refs"
+revision_tree_api = "https://huggingface.co/api/datasets/stanfordnlp/imdb/tree/e6281661ce1c48d982bc483cf8a173c1bbeb5d31"
+loading_documentation = "https://huggingface.co/docs/datasets/loading"
+
+[dataset.splits.train]
+rows = 25000
+label_counts = [12500, 12500]
+label_index_ranges = [[0, 12499], [12500, 24999]]
+use = "training_and_deterministic_validation_only"
+raw_parquet_sha256 = "db47d16b5c297cc0dd625e519c81319c24c9149e70e8496de5475f6fa928342c"
+content_sha256 = "4639bf1063fddebc3d7a446004a1032832227b0d3d28b01f58f99a4f94c0ab8a"
+
+[dataset.splits.test]
+rows = 25000
+label_counts = [12500, 12500]
+label_index_ranges = [[0, 12499], [12500, 24999]]
+use = "sole_untouched_global_test_set"
+raw_parquet_sha256 = "b52e26e2f872d282ffac460bf9770b25ac6f102cda0e6ca7158df98c94e8b3da"
+content_sha256 = "48168f7787435514498e777646a1312897c1207d239c61acdde5e049bc3f1a3f"
+
+[dataset.splits.unsupervised]
+rows = 50000
+use = "excluded"
+raw_parquet_sha256 = "74d14fbfcbb39fb7d299c38ca9f0ae6d231bf97108da85d620027ba437b6d52e"
+content_sha256 = "d56c24962d82526173fc9fab14b820873ea281d64ab11915ec12eaf73f65deeb"
+
+[untouched_test]
+split = "test"
+sole_global_test_set = true
+available_to_client_training = false
+available_to_validation = false
+available_to_tuning = false
+available_to_model_selection = false
+available_to_partitioning = false
+access = "registered_final_model_evaluation_and_registered_privacy_analysis_only"
+decision_threshold = 0.5
+threshold_comparison = "probability_greater_than_or_equal"
+selection_rule = "Never tune thresholds, hyperparameters, strategies, stopping, or model selection on test results."
+train_split_use = "Only the official train split may supply training and deterministic stratified validation rows."
+
+[seeding]
+seeds = [67, 101, 211, 307, 401]
+application = ["partitioning", "validation_split", "model_initialization", "training_order", "dropout", "threat_construction", "privacy_sampling"]
+hash_algorithm = "sha256"
+seed_material = "master_seed_pipe_namespace_pipe_attempt_encoded_as_ascii"
+uint64_byte_slice = "first_8_digest_bytes"
+uint64_byte_order = "big"
+python_derivation = '''int.from_bytes(hashlib.sha256(f"{master_seed}|{namespace}|{attempt}".encode("ascii")).digest()[:8], "big", signed=False)'''
+numpy_generator = "numpy.random.Generator(numpy.random.PCG64(derived_uint64))"
+tensorflow_seed = "derived_uint64_modulo_2147483647_with_zero_replaced_by_one"
+tensorflow_seed_python = '''seed = derived_uint64 % 2147483647 or 1'''
+default_attempt = 0
+namespace_is_utf8_ascii = true
+namespace_reuse_forbidden = true
+generator_lifecycle = "Derive one uint64 for one fully expanded namespace and attempt, instantiate exactly one numpy.random.Generator with PCG64 from it, execute only that namespace's registered stochastic operation, then discard the generator. Never share or reuse a Generator across namespaces, labels, clients, rounds, epochs, attempts, cells, or master seeds."
+label_namespace_rule = "Every stochastic operation performed separately by label has a distinct namespace ending in label-{label}; derive and instantiate its Generator independently."
+
+[seeding.cell_id]
+fields = ["matrix_kind", "strategy", "partition", "alpha", "client_scale", "seed", "threat"]
+serialization = "compact_sorted_json"
+serialization_is_identifier = true
+python_serialization = '''json.dumps({"matrix_kind": matrix_kind, "strategy": strategy, "partition": partition, "alpha": alpha, "client_scale": client_scale, "seed": seed, "threat": threat}, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False)'''
+matrix_kind = "Exact subsection name under matrix: primary_federated, centralized, local_only, scale, robustness, membership_inference, or update_leakage."
+strategy = "Registered training strategy; for privacy analysis cells this is the source model name from the matrix models list."
+partition = "Registered partition name, or JSON null for centralized cells and centralized membership-inference cells."
+alpha = "Dirichlet alpha as a JSON number for dirichlet partitions, or JSON null for iid_stratified and non-partitioned cells."
+client_scale = "Registered integer client scale, or JSON null for centralized cells and centralized membership-inference cells."
+seed = "Registered integer master seed, not its ordinal position."
+threat = '''JSON null outside robustness. For robustness, exactly {"attack": <registered attack string>, "malicious_fraction": <registered JSON number>}; no other threat keys are permitted.'''
+canonical_example = '''{"alpha":0.5,"client_scale":4,"matrix_kind":"robustness","partition":"dirichlet_0.5","seed":67,"strategy":"fedavg","threat":{"attack":"outlier","malicious_fraction":0.25}}'''
+
+[seeding.namespaces]
+partition_iid = "partition/iid/{client_scale}/round--1/epoch--1/client--1/label-{label}"
+partition_dirichlet = "partition/{partition_name}/{client_scale}/round--1/epoch--1/client--1/label-{label}"
+validation = "validation/{partition_name}/{client_scale}/round--1/epoch--1/client-{client_id}/label-{label}"
+model_initialization = "model/{cell_id}/round--1/epoch--1/client-{client_id}"
+training_order = "training/{cell_id}/round-{round_index}/epoch-{epoch_index}/client-{client_id}"
+dropout = "dropout/{cell_id}/round-{round_index}/epoch--1/client-{client_id}"
+malicious_order = "malicious-order/dirichlet_0.5/4/round--1/epoch--1/client--1"
+membership_member = "privacy/membership/{cell_id}/member/round--1/epoch--1/client--1/label-{label}"
+membership_nonmember = "privacy/membership/{cell_id}/nonmember/round--1/epoch--1/client--1/label-{label}"
+update_member = "privacy/update-leakage/{cell_id}/member/round-{round_index}/epoch--1/client-{client_id}/label-{label}"
+update_nonmember = "privacy/update-leakage/{cell_id}/nonmember/round-{round_index}/epoch--1/client-{client_id}/label-{label}"
+
+[indexing]
+all_indices_zero_based = true
+non_applicable_seed_namespace_index = -1
+federated_round_indices = "integers from 0 through 19"
+federated_epoch_indices_per_round = [0]
+centralized_epoch_indices = "integers from 0 through 19"
+local_only_epoch_indices = "integers from 0 through 19"
+client_indices = "integers from 0 through client_scale minus 1"
+label_indices = [0, 1]
+seed_namespace_rule = "Every seed namespace that contains round, epoch, or client dimensions uses the zero-based index when applicable and the literal sentinel -1 when not applicable; the rendered sentinel therefore appears as round--1, epoch--1, or client--1."
+
+[indexing.namespace_contexts]
+federated_training = { round_index = "0_through_19", epoch_index = 0, client_id = "0_through_client_scale_minus_1" }
+centralized_training = { round_index = -1, epoch_index = "0_through_19", client_id = -1 }
+local_only_training = { round_index = -1, epoch_index = "0_through_19", client_id = "0_through_3" }
+global_model_initialization = { round_index = -1, epoch_index = -1, client_id = -1 }
+local_only_model_initialization = { round_index = -1, epoch_index = -1, client_id = "0_through_3" }
+
+[partitioning]
+registered = ["iid_stratified", "dirichlet_1.0", "dirichlet_0.5", "dirichlet_0.1"]
+dirichlet_alphas = [1.0, 0.5, 0.1]
+minimum_samples_per_client = 32
+first_attempt = 0
+last_attempt = 9999
+attempt_seed_rule = "derive_deterministically_from_experiment_seed_and_attempt"
+acceptance_rule = "Accept the first attempt in ascending order where every client has at least 32 samples; fail after attempt 9999."
+client_scales = [4, 16, 64]
+primary_client_scale = 4
+row_identity = "zero_based_official_split_row_index"
+labels = [0, 1]
+client_id_format = "client-{zero_based_integer}"
+
+[partitioning.iid]
+algorithm = "For each label in ascending order, sort row indices, derive its label-specific namespace at attempt 0, instantiate a new PCG64 Generator, permute the rows once, discard the Generator, split with numpy.array_split into client_scale parts in ascending client ID order, concatenate both label parts per client, then sort each client shard by row index."
+attempt = 0
+balance = "per_label_part_sizes_differ_by_at_most_one"
+
+[partitioning.dirichlet]
+algorithm = "For each attempt and each label in ascending order, sort its row indices, derive that label's partition namespace with the current attempt, instantiate a new PCG64 Generator, call generator.permutation, generator.dirichlet with client_scale copies of alpha, and generator.multinomial with the label row count and those probabilities, then discard the Generator and assign consecutive permuted rows to clients in ascending ID order using those counts. Concatenate both label allocations per client and sort each shard by row index."
+retry_scope = "discard_every_client_allocation_and_restart_with_next_attempt"
+acceptance_checked_after_both_labels = true
+
+[partitioning.validation]
+algorithm = "Within each accepted client shard and each label in ascending order, sort row indices, derive the client-and-label-specific validation namespace at attempt 0, instantiate a new PCG64 Generator, permute once, discard the Generator, assign the first floor(label_count_times_0.2) rows to validation and all remaining rows to fitted training, then sort both resulting index sets."
+validation_union_use = "server_held_per_round_global_validation_only"
+fitted_rows_use = "optimizer_input_only"
+
+[selection.clients]
+fit_participation = "all_registered_clients_every_round"
+evaluation_participation = "none"
+evaluation_execution = "After each aggregation, the server evaluates the global model exactly once on the ascending-row-index union of all registered validation rows; clients receive no evaluate request and return no evaluate response."
+order = "ascending_numeric_client_id"
+random_sampling = false
+
+[selection.malicious]
+algorithm = "At attempt 0, instantiate one PCG64 Generator for the malicious-order namespace, permute ascending client IDs once, discard the Generator, and for malicious count k choose the first k IDs and sort the chosen IDs for execution."
+pairing = "Reuse the same seeded permutation across all robustness strategies, attacks, and malicious fractions for one master seed; the one-client set is a subset of the two-client set."
+
+[model]
+revision = "sentiment-cnn-v1"
+vocabulary_size = 20000
+sequence_length = 500
+embedding_dimension = 100
+embedding_trainable = true
+padding_token_id = 0
+padding_masked_before_convolution = true
+convolution_filters = 64
+convolution_kernel_size = 3
+convolution_padding = "same"
+convolution_activation = "relu"
+convolution_use_bias = false
+pooling = "global_max_1d"
+hidden_units = 32
+hidden_activation = "relu"
+dropout_rate = 0.3
+output_units = 1
+output_activation = "sigmoid"
+loss = "keras.losses.BinaryCrossentropy"
+loss_from_logits = false
+loss_label_smoothing = 0.0
+loss_axis = -1
+loss_reduction = "sum_over_batch_size"
+loss_probability_clip = 1e-7
+loss_logit_recovery_required = true
+loss_definition = "The registered sigmoid output tensor must be passed directly to keras.losses.BinaryCrossentropy. In Keras 3.14.0 with the TensorFlow 2.20.0 backend, the Sigmoid layer attaches its pre-activation float32 logits; BinaryCrossentropy(from_logits=False) recovers those logits and evaluates tf.nn.sigmoid_cross_entropy_with_logits, averages the one-element output axis, then sum_over_batch_size averages examples in the batch. Never detach, copy, cast, serialize, or reconstruct probabilities before training loss evaluation because doing so loses the attached logits and changes saturated-edge loss semantics."
+loss_probability_fallback = "loss_probability_clip=1e-7 documents Keras's fallback only when no attached logits exist; that fallback is not the registered model-training path."
+
+[model.loss_golden_probe]
+dtype = "float32"
+logits = [100.0, -100.0, 0.0]
+labels = [0.0, 1.0, 1.0]
+sigmoid_probabilities = [1.0, 0.0, 0.5]
+elementwise_losses = [100.0, 100.0, 0.6931471824645996]
+sum_over_batch_size_loss = 66.89771270751953
+
+[preprocessing]
+input_dtype = "tf.string"
+unicode_normalization = "none"
+html_removal = "tf.strings.regex_replace(text, '<[^>]+>', ' ') using TensorFlow RE2 semantics"
+lowercase = "tf.strings.lower"
+lowercase_semantics = "Under TensorFlow 2.20.0, tf.strings.lower maps ASCII U+0041 through U+005A to U+0061 through U+007A and preserves every non-ASCII UTF-8 code point exactly; no Unicode case folding or normalization occurs."
+punctuation_characters = '''!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~'''
+punctuation_handling = "Delete every ASCII string.punctuation code point with tf.strings.regex_replace; do not replace punctuation with whitespace."
+standardization_order = ["html_removal", "ascii_lowercase", "ascii_punctuation_deletion"]
+standardize_python = '''def protocol_standardize(text):
+    text = tf.strings.regex_replace(text, "<[^>]+>", " ")
+    text = tf.strings.lower(text)
+    return tf.strings.regex_replace(text, "[" + re.escape(string.punctuation) + "]", "")'''
+tokenization = "keras.layers.TextVectorization split='whitespace' delegates to tf.strings.split with sep=None. Under TensorFlow 2.20.0, only maximal nonempty runs of ASCII HT, LF, VT, FF, CR, and SPACE (U+0009 through U+000D and U+0020) delimit tokens; leading and trailing delimiters and empty tokens are discarded. Non-ASCII whitespace, including U+00A0, U+2003, U+2028, and U+2029, remains inside tokens."
+max_tokens = 20000
+reserved_tokens = ["", "[UNK]"]
+padding_token_id = 0
+oov_token = "[UNK]"
+oov_token_id = 1
+oov_buckets = 1
+learned_token_limit = 19998
+output_mode = "int"
+output_sequence_length = 500
+truncation = "post_retain_the_first_500_tokens"
+padding = "post_append_token_id_0_to_length_500"
+layer_dtype = "string"
+output_dtype = "int64"
+vectorizer_python = '''keras.layers.TextVectorization(max_tokens=20000, standardize=protocol_standardize, split="whitespace", output_mode="int", output_sequence_length=500, pad_to_max_tokens=False)'''
+adaptation_split = "official_train_entire_25000_rows_labels_ignored_test_and_unsupervised_excluded"
+adaptation_order = "ascending_zero_based_official_train_row_index"
+adaptation_batch_size = 256
+adaptation_python = '''texts = list(dataset["text"])
+vectorizer.adapt(tf.data.Dataset.from_tensor_slices(texts).batch(256, drop_remainder=False))'''
+adaptation_lifecycle = "Construct and adapt exactly one vectorizer before any partitioning; freeze get_vocabulary and use that identical ordered vocabulary for every client, centralized model, local-only model, seed, partition, and privacy analysis. Never call adapt again."
+vocabulary_serialization = "For each get_vocabulary item in index order including the empty padding token and [UNK], append its UTF-8 bytes then one LF byte; include the final LF."
+vocabulary_hash_algorithm = "sha256"
+vocabulary_size = 20000
+vocabulary_sha256 = "021e9f054e1b1ad4622fdb87d6d98f17337d202cc35faefdcfd8ae15a3887b9b"
+vocabulary_verification = "Hard-fail before the first cell unless both get_vocabulary length and serialized SHA-256 equal vocabulary_size and vocabulary_sha256."
+
+[[preprocessing.golden_cases]]
+name = "ascii_lowercase_unicode_preservation"
+input = "<b>AZ</b>\tÄÖÜ ẞ Σ İ CAFÉ!"
+standardized = " az \tÄÖÜ ẞ Σ İ cafÉ"
+tokens = ["az", "ÄÖÜ", "ẞ", "Σ", "İ", "cafÉ"]
+
+[[preprocessing.golden_cases]]
+name = "exact_ascii_whitespace"
+input = " A\tB\nC\rD\fE\u000bF  G\u00a0H\u2003I\u2028J\u2029K "
+standardized = " a\tb\nc\rd\fe\u000bf  g\u00a0h\u2003i\u2028j\u2029k "
+tokens = ["a", "b", "c", "d", "e", "f", "g\u00a0h\u2003i\u2028j\u2029k"]
+
+[framework]
+tensorflow_version = "2.20.0"
+keras_version = "3.14.0"
+numpy_version = "2.4.4"
+keras_backend = "tensorflow"
+version_check = "Hard-fail before preprocessing, partitioning, or training unless tensorflow.__version__, keras.__version__, and numpy.__version__ exactly match the registered versions."
+execution_environment_before_import = { KERAS_BACKEND = "tensorflow", TF_ENABLE_ONEDNN_OPTS = "0", TF_DETERMINISTIC_OPS = "1", PYTHONHASHSEED = "0" }
+deterministic_ops_api = "tf.config.experimental.enable_op_determinism()"
+seed_api = "keras.utils.set_random_seed(tensorflow_seed)"
+seed_api_order = "Call keras.utils.set_random_seed with the derived nonzero TensorFlow seed immediately before each registered model construction; call enable_op_determinism once after TensorFlow import and before any TensorFlow operation."
+device_reproducibility_scope = "Bitwise repeatability is required across reruns on the same device type, hardware model, driver/runtime, operating system, Python, TensorFlow, and Keras versions; CPU and GPU results are not compared bitwise. Any operation rejected as nondeterministic is a hard cell failure."
+
+[framework.dropout]
+layer = "keras.layers.Dropout"
+rate = 0.3
+seed_argument = "Pass the nonzero TensorFlow seed derived from the registered dropout namespace to Dropout(seed=seed) at construction."
+federated_lifecycle = "For every client fit attempt, construct one fresh complete model and one fresh Dropout instance using round_index and client_id, load the round-start global weights, run exactly the registered local epoch, then discard the model; an infrastructure retry reconstructs from scratch with the same seeds, weights, batches, and optimizer state."
+centralized_lifecycle = "Construct one model and one Dropout instance with round_index=-1 and client_id=-1, then retain that instance and its deterministic mask sequence across all 20 epochs; an infrastructure retry reconstructs the entire run from scratch."
+local_only_lifecycle = "For each client_id 0 through 3, construct one model and one Dropout instance with round_index=-1, retain it across that model's 20 epochs, and discard it after final evaluation; an infrastructure retry of that model reconstructs it from scratch."
+inference = "Invoke with training=False for validation, test, and privacy inference, so Dropout consumes no mask and changes no Dropout RNG state."
+
+[training]
+rounds = 20
+local_epochs = 1
+federated_fitted_row_exposures = 20
+model_initialization_rng = "Set the framework seed from the model-initialization derived uint64 before constructing each model; construct models in registered layer order."
+training_order_rng = "For each epoch, sort fitted official row indices, permute them once with the training-order PCG64 generator at attempt 0, materialize batches in that order, and disable framework reshuffling."
+dropout_rng = "Derive the registered dropout seed once per Dropout instance, pass it as the layer seed argument, and follow framework.dropout lifecycle exactly; never reset or replace a live Dropout instance. No other stochastic layer is registered."
+batch_size = 64
+validation_fraction = 0.2
+validation_sampling = "deterministic_stratified_within_train_partition"
+early_stopping = false
+optimizer = "adam"
+learning_rate = 0.001
+beta_1 = 0.9
+beta_2 = 0.999
+epsilon = 1e-7
+amsgrad = false
+update_noise = false
+
+[aggregation]
+flower_version = "1.32.1"
+numpy_version = "2.4.4"
+result_set = "A registered round contains exactly one successful FitRes for every registered client and no failures. Zero successful results, any failure, or a missing registered client hard-fails the cell; partial-round aggregation is forbidden."
+client_validation = "Before parameters are decoded, require every FitRes.metrics client_id to have Python type int but not bool, to be in the inclusive range 0 through client_scale-1, and to be unique; require the resulting ID set to equal range(client_scale), then sort FitRes objects by ascending client_id."
+sample_count_validation = "Require every FitRes.num_examples to have Python type int but not bool, to be positive, and to equal that client's registered fitted-row count."
+model_validation = "Decode every FitRes.parameters with flwr.common.parameters_to_ndarrays. Require a nonempty model-weight list; require every array to have dtype exactly numpy.float32, contain only finite values, and match the corresponding round-start model.weights shape; require every client to have the same weight count and shapes. Scalars and zero-element arrays are forbidden."
+submitted_value = "The aggregation input is each client's complete post-fit model.weights list after the threat transformation below, never a pre-aggregated update or delta. Honest clients retain their decoded post-fit arrays bit-for-bit."
+threat_order = "First complete the honest local epoch and decode the complete honest post-fit weights. Second validate client IDs, sample counts, round-start weights, and every honest post-fit array. Third, only for selected malicious clients and independently for each model.weights tensor in model.weights order, execute the registered threat transformation. Fourth, aggregate the resulting complete submitted weights. Never aggregate honest weights before applying a threat."
+threat_transformation = "For each selected malicious client's corresponding float32 honest post-fit tensor H and common float32 round-start tensor G, execute D=numpy.subtract(H,G), T=numpy.multiply(D,numpy.float32(threat_scale)), and S=numpy.add(G,T), using NumPy 2.4.4 defaults with no dtype argument or out argument. D, T, and S remain float32. Use threat_scale=10.0 for outlier and -10.0 for sign_flip. S replaces H as that client's complete submitted tensor. Hard-fail if D, T, or S is non-finite."
+coordinate_layout = "For mathematical indexing and golden probes only, flatten every submitted tensor separately with numpy.ndarray.flatten(order='C'), concatenate those vectors in model.weights order, and number coordinates from zero. Reconstruct by splitting at the original tensor element counts and applying numpy.reshape(part, original_shape, order='C') with no dtype cast. The executable Flower calls operate tensor-by-tensor and are bitwise equivalent to this coordinate layout; coordinates never mix."
+common_invalid_inputs = "Hard-fail the cell before aggregation for any result-set, client-ID, sample-count, model, threat-intermediate, flattening, or reconstruction violation above. Also hard-fail if the selected strategy returns a different tensor count or shape, a non-float32 dtype, or any non-finite value. No invalid registered input may be skipped, repaired, clipped, cast, partially aggregated, or assigned a fallback result. The explicit strategies.fedprox_huber reconstruction cast is part of that valid strategy's registered output formula and is not input repair."
+
+[aggregation.golden_probe]
+tensor_shapes = [[2], [2]]
+client_ids = [0, 1, 2, 3]
+sample_counts = [1, 2, 3, 4]
+round_start_vector = [10.0, -10.0, 1.0, -1.0]
+honest_post_fit_vectors = [[11.0, -8.0, 4.0, 3.0], [12.0, -13.0, -1.0, 4.0], [14.0, -9.0, 7.0, -7.0], [9.0, -6.0, 5.0, 1.0]]
+malicious_client_ids = [1]
+threat = "sign_flip"
+threat_scale = -10.0
+submitted_post_fit_vectors = [[11.0, -8.0, 4.0, 3.0], [-10.0, 20.0, 21.0, -51.0], [14.0, -9.0, 7.0, -7.0], [9.0, -6.0, 5.0, 1.0]]
+
+[strategies.centralized]
+kind = "centralized"
+training_epochs = 20
+split_reference = "iid_stratified_at_4_clients_then_union_the_four_fitted_sets_and_union_the_four_validation_sets"
+training_rows = "union_of_the_four_iid_stratified_fitted_training_sets"
+validation_rows = "union_of_the_four_iid_stratified_registered_validation_sets"
+fitted_row_exposures = 20
+test_evaluation = "once_after_epoch_20"
+validation_reporting = "report the registered validation metric curve for zero-based epoch indices 0 through 19"
+convergence_round_reporting = "not_applicable_and_must_not_be_reported"
+
+[strategies.local_only]
+kind = "one_model_per_client"
+client_scale = 4
+models_per_cell = 4
+training_epochs_per_model = 20
+training_rows_per_model = "that_clients_fitted_training_rows_only"
+fitted_row_exposures = 20
+model_aggregation = "none"
+prediction_aggregation = "none"
+reporting = "retain raw predictions and classification metrics separately for each of the four client models; the final untouched-test cell summary is the unweighted arithmetic mean of each reported scalar metric across exactly four models"
+test_evaluation = "each_model_once_after_epoch_20"
+validation_reporting = "report each model's registered validation metric curve for zero-based epoch indices 0 through 19, applying metrics.classification.local_only_single_class exactly when that model's fixed validation rows contain one class"
+convergence_round_reporting = "not_applicable_and_must_not_be_reported"
+
+[strategies.fedavg]
+kind = "sample_weighted_mean"
+aggregation_input = "Exactly aggregation.submitted_value and aggregation.coordinate_layout."
+sample_weighting = "Use FitRes.num_examples after aggregation.sample_count_validation; no other weight is permitted."
+executable = "Call flwr.server.strategy.aggregate.aggregate_inplace from Flower 1.32.1 once with the ascending-client-ID list of (ClientProxy, FitRes) pairs."
+scaling_factors = "Inside aggregate_inplace, compute num_examples_total with Python sum over ascending-client-ID FitRes.num_examples, then construct numpy.asarray([fit_res.num_examples / num_examples_total for each result]) with no dtype argument. Python true division produces binary64 Python floats and numpy.asarray produces a float64 vector."
+reduction = "For each tensor, multiply every client's submitted float32 array by its numpy.float64 scaling-factor scalar in ascending client_id order through Flower 1.32.1 _try_inplace. NumPy 2.4.4 numpy.can_cast(factor,numpy.float32,casting='same_kind') is true, so execute numpy.multiply(array,factor,out=array) without constructing a float32 factor; the ufunc computes the float64 product and stores its cast result in the float32 array. Use the scaled client 0 array as the accumulator and, for clients 1 through client_scale-1, execute numpy.add(accumulator,scaled_client_array,out=accumulator) as a strict float32 left fold."
+result = "The float32 accumulator tensors, reconstructed in unchanged model.weights order and shapes, are the next round-start global weights. Do not aggregate deltas and do not add the previous global weights after reduction."
+invalid_inputs = "Exactly aggregation.common_invalid_inputs. Flower warnings, implicit casts, broadcasting, unequal zip truncation, zero-division, or NaN/Inf propagation are not accepted alternatives."
+
+[strategies.fedavg.golden_probe]
+aggregate_vector = [6.899999618530273, -1.9000000953674316, 8.699999809265137, -11.600000381469727]
+aggregate_float32_uint32 = [1088212172, 3220386612, 1091253043, 3241777562]
+
+[strategies.fedprox]
+kind = "sample_weighted_mean_with_proximal_objective"
+mu = 0.1
+reference = "Immediately after loading round-start global model weights, create one immutable TensorFlow constant per model.trainable_weights entry in that order using keras.ops.convert_to_tensor(weight.numpy().copy()); create these before the first local optimizer step and reuse the same constants for every batch in that client's one local epoch."
+data_loss = "Construct keras.losses.BinaryCrossentropy() with its Keras 3.14.0 defaults, which equal the registered from_logits, label_smoothing, axis, and sum_over_batch_size reduction. For each batch, evaluate it on the registered labels and attached-logit sigmoid output with no sample weights."
+proximal_term = "In TensorFlow float32 and model.trainable_weights order, form one scalar term per variable with keras.ops.sum(keras.ops.square(local_weight-reference_weight)), then left-fold addition from the first term through the last and multiply by mu/2. Include every trainable scalar exactly once and no non-trainable variable."
+local_objective = "data_loss + proximal_term; differentiate this scalar once with respect to model.trainable_variables and apply one Adam update per batch. The proximal term is one batch-level scalar and is not divided or multiplied by batch size."
+client_update = "After the local epoch, each client submits its complete post-fit trainable and non-trainable model weights in model.weights order, plus its zero-based integer client_id in FitRes.metrics; it does not submit a delta."
+aggregation_sample_weight = "The integer number of that client's fitted training rows supplied to the optimizer, excluding validation rows; retries do not change this weight."
+aggregation = "Exactly strategies.fedavg aggregation_input, sample_weighting, executable, scaling_factors, reduction, result, and invalid_inputs. FedProx changes only the local objective; it does not change aggregation."
+
+[strategies.fedprox.golden_probe]
+batch_example_losses = [0.2, 0.8]
+current_trainable_variables = [[1.0, 2.0], [3.0]]
+reference_trainable_variables = [[0.0, 2.0], [1.0]]
+data_loss = 0.5
+proximal_term = 0.25
+local_objective = 0.75
+
+[strategies.fedprox_huber]
+kind = "fedprox_with_iterative_huber_aggregation"
+mu = 0.1
+threshold = 10.0
+iterations = 10
+epsilon = 1e-8
+local_objective = "Exactly strategies.fedprox, including its immutable round-start reference, float32 proximal sum reduction, batch-level placement, and Adam update."
+client_vector = "Apply aggregation result-set, client, sample-count, model, and threat validation and ordering. Flatten each resulting complete submitted model in model.weights order with aggregation.coordinate_layout, stack vectors in ascending client_id order with numpy.stack, and call numpy.ndarray.astype(numpy.float32, copy=False). All registered input arrays are already float32; the call performs no information-losing cast."
+sample_weight = "Convert each positive integer strategies.fedprox aggregation_sample_weight to float64, divide the vector of weights by its float64 sum once, and retain these normalized base weights for every iteration."
+initialization = "Set estimate_0 = numpy.average(client_vectors, axis=0, weights=normalized_base_weights). Float32 client vectors and float64 weights produce a float64 estimate."
+residual_norm = "At iteration t, residual_i = numpy.linalg.norm(estimate_t - client_vector_i) with no ord argument, the float64 Euclidean norm over the complete flattened vector."
+epsilon_rule = "If residual_i <= threshold, set scale_i=1.0 without using epsilon; otherwise set scale_i=threshold/(residual_i+epsilon) exactly."
+huber_weight = "Set effective_weight_i = sample_weight_i * scale_i."
+update = "For t=0 through 9, normalize effective weights by their sum, then set estimate_(t+1) = numpy.average(client_vectors, axis=0, weights=normalized_effective_weights), preserving ascending client_id order in float64. Execute exactly 10 updates with no early stopping. Hard-fail on non-finite values or a non-positive effective-weight sum."
+reconstruction = "After iteration 10, execute estimate_10.astype(numpy.float32) exactly once with default casting and no copy argument. Hard-fail if the cast result is non-finite. Split that float32 vector at the original model-weight element counts and reshape each part in C order to its reference model.weights shape without any further dtype cast; serialize those float32 arrays as the aggregated global parameters. This registered result cast is part of the Huber formula and is not input repair."
+
+[strategies.fedprox_huber.golden_probe]
+client_vectors = [[0.0, 0.0], [30.0, 0.0], [0.0, 40.0]]
+sample_weights = [2, 1, 1]
+initial_estimate = [7.5, 10.0]
+estimate_after_10_updates = [4.335034175752573, 4.163210734443747]
+aggregate_vector = [4.335034370422363, 4.163210868835449]
+aggregate_float32_uint32 = [1082833050, 1082472710]
+
+[strategies.fedmedian]
+kind = "coordinate_wise_median"
+aggregation_input = "Exactly aggregation.submitted_value and aggregation.coordinate_layout."
+sample_weighting = "None. Validate FitRes.num_examples through aggregation.sample_count_validation, then ignore every sample count during parameter aggregation. Every client contributes one value per coordinate."
+executable = "Build (parameters_to_ndarrays(FitRes.parameters), FitRes.num_examples) pairs in ascending client_id order and call flwr.server.strategy.aggregate.aggregate_median from Flower 1.32.1 once. For each model.weights tensor position, Flower executes numpy.median(numpy.asarray(client_tensors), axis=0) with NumPy 2.4.4 defaults."
+even_client_rule = "All registered client scales are even. For each coordinate, numpy.median selects the two central order statistics at zero-based positions client_scale/2-1 and client_scale/2 and passes those float32 values to its NumPy 2.4.4 axis-0 mean reduction; sample counts and client order do not select the middle values."
+reduction = "The reduction tree is exactly the one executed by NumPy 2.4.4 numpy.median(numpy.asarray(client_tensors),axis=0), including its partition and even-middle float32 mean implementation. No cross-coordinate reduction and no client-ID-order sum occur; reproductions must call this exact function rather than substitute a sort or custom mean. Preserve the returned float32 tensor dtype, tensor order, and shapes without a cast."
+invalid_inputs = "Exactly aggregation.common_invalid_inputs. Broadcasting, dtype promotion, masked values, NaN behavior, or unequal zip truncation are not accepted alternatives."
+assumption = "Requires fewer than 50 percent Byzantine values at each coordinate."
+
+[strategies.fedmedian.golden_probe]
+aggregate_vector = [10.0, -7.0, 6.0, -3.0]
+aggregate_float32_uint32 = [1092616192, 3235905536, 1086324736, 3225419776]
+
+[strategies.fedtrimmedavg]
+kind = "coordinate_wise_trimmed_mean"
+beta = 0.25
+aggregation_input = "Exactly aggregation.submitted_value and aggregation.coordinate_layout."
+sample_weighting = "None. Validate FitRes.num_examples through aggregation.sample_count_validation, then ignore every sample count during parameter aggregation. Every retained client value contributes equally per coordinate."
+executable = "Build (parameters_to_ndarrays(FitRes.parameters), FitRes.num_examples) pairs in ascending client_id order and call flwr.server.strategy.aggregate.aggregate_trimmed_avg from Flower 1.32.1 once with proportiontocut=0.25. For each model.weights tensor position, Flower stacks client tensors with numpy.asarray, then its _trim_mean executes numpy.partition(array, (lowercut, uppercut-1), axis=0), slices partitioned[lowercut:uppercut] on axis 0, and executes numpy.mean(slice, axis=0), all with NumPy 2.4.4 defaults."
+trim_count_rule = "For client_count n, compute lowercut=int(0.25*n) and uppercut=n-lowercut; because n is a positive registered integer, lowercut=floor(0.25*n). Remove exactly lowercut lowest and lowercut highest order statistics independently at every coordinate. Registered counts 4, 16, and 64 therefore trim 1, 4, and 16 values per side and retain 2, 8, and 32 values."
+reduction = "For every coordinate, the reduction tree is exactly the one executed by NumPy 2.4.4 numpy.mean(partitioned[lowercut:uppercut],axis=0), using NumPy's float32 sum accumulator and division over the axis-0 slice returned by numpy.partition. Reproductions must call these exact functions; do not sort the retained values, substitute a client-ID-order left fold, use float64 accumulation, or average client deltas. Preserve the returned float32 tensor dtype, tensor order, and shapes without a cast."
+invalid_inputs = "Exactly aggregation.common_invalid_inputs, plus hard-fail unless 0.0 <= beta < 0.5 and client_count-2*floor(beta*client_count) is positive. Broadcasting, dtype promotion, masked values, NaN behavior, or unequal zip truncation are not accepted alternatives."
+assumption = "Robustness requires Byzantine values to occupy the trimmed extremes; no guarantee is claimed at 50 percent malicious clients."
+
+[strategies.fedtrimmedavg.golden_probe]
+aggregate_vector = [10.0, -7.0, 6.0, -3.0]
+aggregate_float32_uint32 = [1092616192, 3235905536, 1086324736, 3225419776]
+
+[threats]
+client_scale = 4
+partition = "dirichlet_0.5"
+malicious_fractions = [0.25, 0.5]
+malicious_client_counts = [1, 2]
+update_source = "malicious_client_model_delta"
+
+[threats.outlier]
+transformation = "submitted_delta_equals_10_times_honest_delta"
+scale = 10.0
+
+[threats.sign_flip]
+transformation = "submitted_delta_equals_negative_10_times_honest_delta"
+scale = -10.0
+
+[privacy.membership_inference]
+access = "black_box_prediction_probabilities"
+knowledge = "candidate_records_and_membership_labels_for_the_balanced_attack_sample"
+member_source = "fitted_training_rows_actually_supplied_to_the_model_optimizer"
+nonmember_source = "official_test_split"
+member_records = 1000
+nonmember_records = 1000
+records_per_class_per_membership = 500
+sampling_replacement = false
+sampling_algorithm = "For members and nonmembers separately and for labels 0 then 1, sort eligible official row indices, derive the pool-and-label-specific namespace at attempt 0, instantiate a new PCG64 Generator, permute once, discard the Generator, and take the first 500. Concatenate member label-0, member label-1, nonmember label-0, and nonmember label-1 records in that order; hard-fail if any pool-label has fewer than 500 eligible rows."
+membership_positive_label = 1
+membership_negative_label = 0
+prediction_clip_minimum = 1e-7
+prediction_clip_maximum = 0.9999999
+per_example_loss = "Convert y and p to float64, set q=min(max(p,1e-7),0.9999999), and compute -(y*ln(q)+(1-y)*ln1p(-q)) with natural logarithms and no reduction."
+attack_score = "negative_per_example_binary_crossentropy_loss_so_larger_means_more_likely_member"
+success_metrics = ["roc_auc", "max_tpr_minus_fpr", "tpr_at_1_percent_fpr"]
+
+[privacy.update_leakage]
+attacker = "honest_but_curious_server"
+access = ["individual_client_update", "current_global_model", "candidate_records"]
+target_round_index = 0
+selected_client = "lowest numeric zero-based client_id whose accepted fitted partition contains at least records_per_class_per_target_label rows of label 0 and at least that many rows of label 1; hard-fail the update-leakage cell if no client qualifies"
+selected_client_feasibility = "The fixed count 500 is feasible for every registered master seed under dirichlet_0.5 with 4 clients; executable offline protocol tests derive the exact selected client for all five seeds."
+pre_update_model = "global model sent to selected_client at the start of zero-based round index 0"
+individual_client_update = "flatten in model trainable-variable order each selected_client post-fit weight minus the corresponding pre-update global weight"
+member_source = "selected_client fitted training rows"
+nonmember_source = "union of all non-selected clients fitted training rows from the same accepted partition"
+member_records = 1000
+nonmember_records = 1000
+records_per_class_per_target_label = 500
+sampling_replacement = false
+sampling_algorithm = "For target members and target nonmembers separately and for labels 0 then 1, sort eligible official train row indices, derive the pool-and-label-specific namespace containing target_round_index and selected_client at attempt 0, instantiate a new PCG64 Generator, permute once, discard the Generator, and take the first 500. Concatenate member label-0, member label-1, nonmember label-0, and nonmember label-1 records in that order; hard-fail if no selected client exists or any pool-label has fewer than 500 eligible rows."
+target_membership_positive_label = 1
+target_membership_negative_label = 0
+gradient_model = "pre_update_model"
+gradient_loss = "Per-example binary_crossentropy in TensorFlow float32: set q=tf.clip_by_value(sigmoid_probability,1e-7,0.9999999) and compute -(y*tf.math.log(q)+(1-y)*tf.math.log1p(-q)) with no batch reduction; differentiate this exact expression, including the clip operation, with respect to trainable variables."
+gradient_vector = "negative_gradient_of_loss_flattened_in_model_trainable_variable_order"
+score = "dot(gradient_vector,individual_client_update)_divided_by_product_of_l2_norms"
+zero_norm_score = 0.0
+score_direction = "larger_means_more_likely_fitted_by_target_client"
+success_metrics = ["roc_auc", "max_tpr_minus_fpr", "tpr_at_1_percent_fpr"]
+
+[privacy.metrics]
+input = "Finite float64 attack scores with binary membership labels, where label 1 is the positive class; hard-fail unless both classes are present."
+thresholds = "Start with positive infinity, then each distinct finite score in strictly descending order. At threshold t, predict member exactly when score >= t; consume all equal-score records atomically, never order or split ties."
+roc_points = "At every registered threshold, FPR=FP/number_of_negative_labels and TPR=TP/number_of_positive_labels in float64; retain repeated FPR points caused by positive-only threshold groups."
+roc_auc = "numpy.trapezoid(tpr, fpr) over all threshold-ordered ROC points, including vertical repeated-FPR segments."
+max_tpr_minus_fpr = "Maximum TPR-FPR over registered ROC points; if multiple thresholds attain it, select the first point, which is the highest threshold."
+tpr_at_1_percent_fpr = "Set target FPR to 0.01. For each distinct FPR retain the maximum TPR at that FPR, then apply numpy.interp(target, ascending_distinct_fpr, retained_tpr); endpoints are therefore constant outside the observed FPR range. This interpolated value is a summary, not an attainable threshold claim."
+target_fpr = 0.01
+
+[[privacy.metrics.golden_vectors]]
+name = "mixed_ties"
+labels = [1, 0, 1, 0, 1, 0]
+scores = [0.9, 0.8, 0.8, 0.4, 0.2, 0.2]
+thresholds = ["inf", "0.9", "0.8", "0.4", "0.2"]
+fpr = [0.0, 0.0, 0.3333333333333333, 0.6666666666666666, 1.0]
+tpr = [0.0, 0.3333333333333333, 0.6666666666666666, 0.6666666666666666, 1.0]
+roc_auc = 0.6666666666666666
+max_tpr_minus_fpr = 0.3333333333333333
+max_threshold = 0.9
+tpr_at_1_percent_fpr = 0.3433333333333333
+
+[[privacy.metrics.golden_vectors]]
+name = "all_scores_tied"
+labels = [1, 0, 1, 0]
+scores = [0.5, 0.5, 0.5, 0.5]
+thresholds = ["inf", "0.5"]
+fpr = [0.0, 1.0]
+tpr = [0.0, 1.0]
+roc_auc = 0.5
+max_tpr_minus_fpr = 0.0
+max_threshold = "inf"
+tpr_at_1_percent_fpr = 0.01
+
+[privacy.binary_crossentropy]
+dtype = "float64"
+clip_minimum = 1e-7
+clip_maximum = 0.9999999
+formula = "q=minimum(maximum(p,clip_minimum),clip_maximum); loss=-(y*log(q)+(1-y)*log1p(-q)); score=-loss"
+reduction = "none"
+
+[[privacy.binary_crossentropy.golden_vectors]]
+labels = [1, 0, 1, 0]
+probabilities = [0.9, 0.2, 0.00000001, 0.99999999]
+losses = [0.10536051565782628, 0.22314355131420976, 16.11809565095832, 16.118095651484676]
+
+[metrics.classification]
+raw_predictions = true
+prediction_source = "The only classification score is the model's registered sigmoid output returned by model(vectorized_batch, training=False); never use logits, rounded values, detached training-loss tensors, or client-reported metrics."
+prediction_dtype = "float32"
+prediction_shape = "After each inference call require shape (batch_rows,1), concatenate batch outputs on axis 0, then remove only axis 1 to obtain one contiguous float32 probability per evaluated row. Hard-fail on any other rank or shape."
+prediction_order = "Feed examples in ascending zero-based official dataset row index and preserve that order through batching, concatenation, raw-prediction storage, labels, and metric construction. No framework shuffle, sorting by score, or regrouping by label is permitted."
+inference_batch_size = 256
+inference_drop_remainder = false
+inference_execution = "Create consecutive slices [0:256], [256:512], and so on in prediction_order, including the final smaller batch; invoke the model once per slice with training=False."
+label_dtype = "int64"
+input_validation = "Require nonempty same-length rank-one NumPy arrays; labels must have dtype exactly numpy.int64 and values only 0 or 1; probabilities must have dtype exactly numpy.float32, be finite, and lie in the closed interval [0.0,1.0]. Require both labels for ROC construction except for the explicit metrics.classification.local_only_single_class validation-only behavior. Never repair, clip, cast, flatten, broadcast, or drop an input."
+decision_threshold = 0.5
+threshold_comparison = "probability_greater_than_or_equal"
+threshold_applies_to = ["every_server_validation_union_evaluation", "every_final_untouched_test_evaluation", "every_centralized_validation_evaluation", "every_local_only_validation_evaluation"]
+threshold_applies_to_every_registered_model = true
+threshold_tuning = false
+predicted_label_dtype = "bool"
+count_dtype = "python_int"
+confusion_matrix_order = [["TN", "FP"], ["FN", "TP"]]
+confusion_matrix = "With predicted_positive=(probability>=numpy.float32(0.5)), compute TN=count((label==0)&~predicted_positive), FP=count((label==0)&predicted_positive), FN=count((label==1)&~predicted_positive), and TP=count((label==1)&predicted_positive) using numpy.count_nonzero, convert each count to Python int, and report [[TN,FP],[FN,TP]] explicitly."
+accuracy = "Compute Python-float (TN+TP)/(TN+FP+FN+TP) from the Python integer counts."
+precision = "If TP+FP is zero report Python float 0.0; otherwise report Python-float TP/(TP+FP)."
+recall = "If TP+FN is zero report Python float 0.0; otherwise report Python-float TP/(TP+FN)."
+f1 = "If 2*TP+FP+FN is zero report Python float 0.0; otherwise report Python-float (2*TP)/(2*TP+FP+FN), computed directly from the integer counts rather than from rounded precision and recall."
+roc_thresholds = "Construct numpy.concatenate(([numpy.inf],numpy.unique(probabilities)[::-1])). The initial point predicts no positives; each following threshold is one distinct finite float32 probability in strictly descending order. At threshold t predict positive exactly when probability>=t, so all equal-score rows enter atomically and ties are never split or reordered."
+roc_points = "For every threshold in roc_thresholds compute TPR=TP/number_of_positive_labels and FPR=FP/number_of_negative_labels as float64 ratios of integer counts. Retain every point in threshold order, including repeated FPR or TPR values."
+roc_auc = "Report float(numpy.trapezoid(tpr,fpr)) over the complete threshold-ordered float64 arrays with NumPy 2.4.4 defaults; do not deduplicate points, interpolate thresholds, reorder points, or substitute a ranking formula."
+roc_auc_status = "Record defined whenever both classes are present. Only for metrics.classification.local_only_single_class record undefined_single_class."
+reported = ["accuracy", "confusion_matrix", "precision", "recall", "f1", "roc_auc"]
+positive_label = 1
+zero_division = 0
+
+[metrics.classification.local_only_single_class]
+scope = "local_only_validation_only"
+activation = "After valid labels and probabilities are fixed, activate exactly when a local-only model's registered validation labels contain only class 0 or only class 1. Every other validation, final untouched-test, and privacy evaluation still hard-fails unless both classes are present."
+threshold_metrics = "Compute predicted_positive, confusion_matrix, accuracy, precision, recall, and f1 by the registered formulas without change."
+undefined_fields = ["roc_thresholds", "fpr", "tpr", "roc_auc"]
+undefined_value = "JSON null"
+status_field = "roc_auc_status"
+status_value = "undefined_single_class"
+scientific_rationale = "ROC-AUC is mathematically undefined without both positive and negative examples. JSON null plus the explicit status preserves the deterministic shard and exposes missing information without imputation, a 0.5 fallback, row movement, resampling, or a changed partition acceptance rule."
+cell_summary = "This exception affects validation curves only. Each local model's final untouched test contains both classes and must report a finite defined ROC-AUC; the final untouched-test cell summary and paired contrasts therefore retain exactly four model values."
+registered_partition = "dirichlet_0.1"
+registered_occurrences = [[67, 0, 1], [67, 3, 1], [101, 0, 0], [101, 1, 0], [101, 2, 0], [101, 3, 1], [211, 0, 1], [211, 1, 0], [211, 2, 0], [307, 0, 0], [307, 3, 1], [401, 0, 1], [401, 2, 0]]
+registered_occurrence_fields = ["seed", "client_id", "missing_label"]
+
+[[metrics.classification.local_only_single_class.golden_vectors]]
+name = "positive_only_validation"
+labels = [1, 1]
+probabilities = [0.2, 0.8]
+predicted_positive = [false, true]
+confusion_matrix = [[0, 0], [1, 1]]
+accuracy = 0.5
+precision = 1.0
+recall = 0.5
+f1 = 0.6666666666666666
+roc_thresholds = "JSON null"
+fpr = "JSON null"
+tpr = "JSON null"
+roc_auc = "JSON null"
+roc_auc_status = "undefined_single_class"
+
+[[metrics.classification.local_only_single_class.golden_vectors]]
+name = "negative_only_validation"
+labels = [0, 0]
+probabilities = [0.2, 0.8]
+predicted_positive = [false, true]
+confusion_matrix = [[1, 1], [0, 0]]
+accuracy = 0.5
+precision = 0.0
+recall = 0.0
+f1 = 0.0
+roc_thresholds = "JSON null"
+fpr = "JSON null"
+tpr = "JSON null"
+roc_auc = "JSON null"
+roc_auc_status = "undefined_single_class"
+
+[[metrics.classification.golden_vectors]]
+name = "fixed_threshold_and_mixed_roc_tie"
+labels = [0, 0, 1, 1, 1, 0]
+probabilities = [0.1, 0.5, 0.5, 0.9, 0.2, 0.8]
+predicted_positive = [false, true, true, true, false, true]
+confusion_matrix = [[1, 2], [1, 2]]
+accuracy = 0.5
+precision = 0.5
+recall = 0.6666666666666666
+f1 = 0.5714285714285714
+roc_thresholds = ["inf", 0.9, 0.8, 0.5, 0.2, 0.1]
+fpr = [0.0, 0.0, 0.3333333333333333, 0.6666666666666666, 0.6666666666666666, 1.0]
+tpr = [0.0, 0.3333333333333333, 0.3333333333333333, 0.6666666666666666, 1.0, 1.0]
+roc_auc = 0.6111111111111112
+
+[[metrics.classification.golden_vectors]]
+name = "zero_division_and_all_scores_tied"
+labels = [0, 1, 0, 1]
+probabilities = [0.4, 0.4, 0.4, 0.4]
+predicted_positive = [false, false, false, false]
+confusion_matrix = [[2, 0], [2, 0]]
+accuracy = 0.5
+precision = 0.0
+recall = 0.0
+f1 = 0.0
+roc_thresholds = ["inf", 0.4]
+fpr = [0.0, 1.0]
+tpr = [0.0, 1.0]
+roc_auc = 0.5
+
+[provenance]
+implementation_status = "Preregistered contract for the future experiment runner. src/server_app.py and src/run_provenance.py do not implement this schema, must not claim conformance, and must not be interpreted as having produced protocol experiment provenance."
+schema_name = "federated-imdb-experiment-provenance"
+schema_version = 1
+manifest_filename = "provenance.json"
+checksum_filename = "provenance.json.sha256"
+additional_fields = "forbidden_without_a_schema_version_change"
+write_policy = "Write a manifest for every started cell, including terminal failed cells. Finalize it only after the terminal status, every attempt and failure, results available at that status, and artifact checksums are known; write both files atomically before considering the cell recorded."
+required_top_level_fields = ["schema", "run_id", "cell", "config", "code", "environment", "hardware", "data", "seeds", "execution", "results", "artifacts"]
+
+[provenance.canonical_serialization]
+format = "json"
+encoding = "utf-8"
+ensure_ascii = true
+sort_keys = true
+separators = [",", ":"]
+allow_nan = false
+trailing_newline = true
+number_policy = "Only JSON integers and finite JSON binary64 numbers are permitted; booleans are not numbers. Preserve integer type and serialize finite floats with Python 3.11 json.dumps under the registered options."
+hash_algorithm = "sha256"
+manifest_hash_scope = "SHA-256 over the exact canonical UTF-8 provenance.json bytes including the single trailing LF byte."
+checksum_encoding = "lowercase_hex"
+checksum_sidecar = "Exactly 64 lowercase hexadecimal manifest hash characters, two ASCII spaces, provenance.json, and one LF byte."
+subobject_hash_scope = "Every registered SHA-256 of a JSON object or array uses the same canonical serialization, including the single trailing LF byte. Raw artifact and source-file hashes instead cover their exact file bytes."
+
+[provenance.required_fields]
+schema = ["name", "version"]
+cell = ["cell_id", "matrix_kind", "strategy", "partition", "alpha", "client_scale", "seed", "threat"]
+config = ["protocol_path", "protocol_sha256", "protocol_version", "effective", "effective_sha256"]
+code = ["commit", "dirty", "tracked_diff_sha256", "untracked_files"]
+untracked_file = ["path", "size_bytes", "sha256"]
+environment = ["os", "architecture", "python", "packages", "variables"]
+hardware = ["cpu_model", "logical_cpu_count", "memory_bytes", "accelerators"]
+accelerator = ["vendor", "model", "count", "driver", "runtime"]
+data = ["dataset", "vocabulary", "partition"]
+dataset = ["id", "revision", "splits"]
+dataset_split = ["name", "rows", "raw_sha256", "content_sha256"]
+vocabulary = ["size", "sha256"]
+partition = ["name", "alpha", "client_scale", "accepted_attempt", "fitted_indices_sha256", "validation_indices_sha256"]
+seeds = ["master_seed", "derived"]
+derived_seed = ["namespace", "attempt", "uint64", "tensorflow_seed"]
+execution = ["status", "started_at_utc", "finished_at_utc", "attempts"]
+attempt = ["attempt", "retry_of", "status", "started_at_utc", "finished_at_utc", "duration_ns", "failure"]
+failure = ["category", "type", "message", "traceback_sha256"]
+results = ["metrics", "raw_results"]
+artifact = ["path", "size_bytes", "sha256"]
+
+[provenance.identities]
+run_id = "A unique canonical lowercase UUID string for one cell execution, stable across its retries and never reused."
+cell = "The seven seeding.cell_id fields must equal the registered cell exactly; cell_id must equal seeding.cell_id canonical serialization of those seven fields with no extra field."
+effective_config = "config.effective contains every resolved runner setting affecting execution or reporting, including registered defaults and explicit overrides, not merely user-supplied overrides. effective_sha256 is the canonical subobject hash of config.effective. protocol_sha256 hashes the exact checked-in protocol TOML bytes."
+clean_code = "code.commit is the 40-character lowercase git rev-parse HEAD object ID, dirty=false, tracked_diff_sha256 is SHA-256 of zero bytes, and untracked_files is empty."
+dirty_code = "Run git -c core.autocrlf=false diff --binary --full-index --no-ext-diff --no-textconv --no-renames HEAD -- . from the repository root and hash its exact stdout bytes as tracked_diff_sha256. Enumerate every non-ignored untracked regular file from git ls-files --others --exclude-standard -z, sort paths by their UTF-8 byte strings, and record relative POSIX path, exact byte size, and raw-file SHA-256. dirty is true exactly when the diff bytes are nonempty or untracked_files is nonempty. Symlinks, devices, undecodable paths, or a git command failure hard-fail the cell before training."
+environment = "Record the exact OS release string, machine architecture, Python version, every installed package name and version sorted by normalized package name, and every framework.execution_environment_before_import key/value. Missing or additional execution-affecting environment variables must be represented in config.effective."
+hardware = "Record CPU model, positive logical CPU count, total physical memory bytes, and zero or more accelerators sorted by vendor/model/driver/runtime. Each accelerator records vendor, model, positive count, driver version, and compute-runtime version; use an empty list only when no accelerator is visible."
+dataset = "Record dataset id and immutable revision plus every consumed split sorted by split name, with registered row count and both exact raw and canonical content SHA-256 identities."
+vocabulary = "Record the exact preprocessing vocabulary size and preprocessing.vocabulary_sha256."
+partition = "Record partition name, nullable registered alpha, client scale, accepted retry attempt, and hashes of fitted and validation assignments. For each assignment serialize a JSON array in ascending client_id order whose item is that client's ascending integer official row-index array, then apply canonical subobject hashing. Centralized cells use name='centralized', alpha/client_scale/accepted_attempt JSON null, and both hashes over an empty JSON array."
+seeds = "Record the master seed and one derived record for every expanded stochastic namespace actually used by every initial attempt or retry, sorted by namespace UTF-8 bytes then attempt. uint64 and tensorflow_seed must equal seeding derivation; duplicate namespace/attempt pairs or an omitted stochastic operation hard-fail provenance finalization."
+attempts = "Use zero-based contiguous attempt values. The first has retry_of=null; every retry points to the immediately preceding failed attempt. Record status as succeeded or failed, UTC timestamps in RFC 3339 second-or-finer precision ending Z, non-negative measured duration_ns, and failure=null exactly for success. A failed attempt requires the exact failure object with category in infrastructure, timeout, oom, nonfinite, validation, or execution; fully qualified exception type, stable human-readable message, and SHA-256 of the UTF-8 normalized traceback text."
+results = "Always record results. For succeeded cells, metrics and raw_results contain every registered per-run scalar, curve, confusion matrix, privacy result, timing, communication count, and raw-result artifact reference applicable to the cell, including the explicit JSON null and status for an undefined local-only validation ROC-AUC. For failed cells retain any values observed before failure and use empty objects only when none exist; never fabricate or impute a successful metric."
+artifacts = "List every regular output artifact except provenance.json and provenance.json.sha256, sorted by relative POSIX path, with exact byte size and raw-file SHA-256. Paths must be unique, remain beneath the run directory after resolution, and may not be symlinks. Missing, extra, mutable, duplicate, or checksum-mismatched artifacts hard-fail provenance finalization."
+
+[provenance.golden_probe]
+effective_config_sha256 = "44c94a87af9330f808178ddb866daa6180001aaf3a3bc42dd6883672e49c29f9"
+manifest_sha256 = "ae51e1d1ca7fa26d6c3ce69da3b2c4c2991861459469b66438f3011408e2a29f"
+canonical_json = '''{"artifacts":[{"path":"metrics.json","sha256":"5555555555555555555555555555555555555555555555555555555555555555","size_bytes":128},{"path":"predictions.npy","sha256":"6666666666666666666666666666666666666666666666666666666666666666","size_bytes":256}],"cell":{"alpha":null,"cell_id":"{\"alpha\":null,\"client_scale\":4,\"matrix_kind\":\"primary_federated\",\"partition\":\"iid_stratified\",\"seed\":67,\"strategy\":\"fedavg\",\"threat\":null}","client_scale":4,"matrix_kind":"primary_federated","partition":"iid_stratified","seed":67,"strategy":"fedavg","threat":null},"code":{"commit":"0000000000000000000000000000000000000000","dirty":false,"tracked_diff_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","untracked_files":[]},"config":{"effective":{"batch_size":64,"strategy":"fedavg"},"effective_sha256":"44c94a87af9330f808178ddb866daa6180001aaf3a3bc42dd6883672e49c29f9","protocol_path":"docs/scientific-protocol-v1.toml","protocol_sha256":"1111111111111111111111111111111111111111111111111111111111111111","protocol_version":1},"data":{"dataset":{"id":"stanfordnlp/imdb","revision":"e6281661ce1c48d982bc483cf8a173c1bbeb5d31","splits":[{"content_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","name":"test","raw_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","rows":25000},{"content_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","name":"train","raw_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","rows":25000}]},"partition":{"accepted_attempt":0,"alpha":null,"client_scale":4,"fitted_indices_sha256":"2222222222222222222222222222222222222222222222222222222222222222","name":"iid_stratified","validation_indices_sha256":"3333333333333333333333333333333333333333333333333333333333333333"},"vocabulary":{"sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","size":20000}},"environment":{"architecture":"x86_64","os":"Linux-6.0","packages":{"keras":"3.14.0","numpy":"2.4.4","tensorflow":"2.20.0"},"python":"3.11.9","variables":{"KERAS_BACKEND":"tensorflow","TF_DETERMINISTIC_OPS":"1","TF_ENABLE_ONEDNN_OPTS":"0"}},"execution":{"attempts":[{"attempt":0,"duration_ns":10000000000,"failure":{"category":"infrastructure","message":"deadline exceeded","traceback_sha256":"4444444444444444444444444444444444444444444444444444444444444444","type":"builtins.TimeoutError"},"finished_at_utc":"2026-01-01T00:00:10Z","retry_of":null,"started_at_utc":"2026-01-01T00:00:00Z","status":"failed"},{"attempt":1,"duration_ns":40000000000,"failure":null,"finished_at_utc":"2026-01-01T00:01:00Z","retry_of":0,"started_at_utc":"2026-01-01T00:00:20Z","status":"succeeded"}],"finished_at_utc":"2026-01-01T00:01:00Z","started_at_utc":"2026-01-01T00:00:00Z","status":"succeeded"},"hardware":{"accelerators":[],"cpu_model":"Example CPU","logical_cpu_count":8,"memory_bytes":17179869184},"results":{"metrics":{"accuracy":0.5,"confusion_matrix":[[1,1],[1,1]],"f1":0.5,"precision":0.5,"recall":0.5,"roc_auc":0.5},"raw_results":{"prediction_artifact":"predictions.npy"}},"run_id":"00000000-0000-4000-8000-000000000001","schema":{"name":"federated-imdb-experiment-provenance","version":1},"seeds":{"derived":[{"attempt":0,"namespace":"model/example","tensorflow_seed":123,"uint64":123}],"master_seed":67}}'''
+
+[metrics.system]
+convergence_scope = "federated matrices only: primary_federated, scale, and robustness"
+convergence = "first zero-based federated round index whose registered validation accuracy is at least 0.95 times the maximum registered validation accuracy over round indices 0 through 19"
+convergence_evaluation_data = "union_of_registered_train_split_validation_rows"
+pre_training_state_included_for_convergence = false
+centralized_local_only_curves = "centralized and local_only report registered validation metric curves over zero-based epoch indices 0 through 19 and never report convergence_round; local_only uses metrics.classification.local_only_single_class for fixed one-class validation rows"
+test_evaluation_schedule = "final_trained_model_only_after_round_20_or_epoch_20_and_never_for_convergence"
+client_fit_timer = "time.perf_counter_ns"
+client_fit_timer_start = "immediately_before_invoking_the_clients_model_fit_training_call_after_parameters_and_fitted_batches_are_ready"
+client_fit_timer_stop = "immediately_after_the_training_call_returns_or_raises_and_before_update_serialization_or_metric_evaluation"
+client_fit_timer_retry_rule = "Record each attempt separately and include every attempt duration in the registered per-round, per-model, and per-run sums; a supervisor-terminated timeout records elapsed nanoseconds from the same start boundary through termination."
+client_fit_timer_report_unit = "nanoseconds"
+federated_round_reduction = "For each round, sum client fit attempt durations over every client in ascending client_id order and over every initial attempt, failed attempt, timeout, and retry; overlapping client wall-clock intervals remain additive compute time."
+federated_run_reduction = "Sum the 20 federated round totals to client_training_time_ns for the cell and seed. Do not average by clients, rounds, successful attempts, or retries."
+local_only_model_reduction = "For each of the four local models, sum every initial and retried 20-epoch fit-call duration to model_training_time_ns; local-only cell training_time_ns is the sum of the four model totals in client_id order."
+local_only_timer_boundaries = "For each local model and attempt, use the client_fit_timer_start and client_fit_timer_stop boundaries around its single model.fit call covering epochs 0 through 19."
+centralized_timer_start = "immediately before the single model.fit call covering registered epochs 0 through 19, after the model, optimizer, fitted batches, and validation batches are ready"
+centralized_timer_stop = "immediately after that model.fit call returns or raises and before final test or privacy evaluation"
+centralized_retry_reduction = "centralized training_time_ns is the sum of every initial and retried full-fit attempt duration, including failed and supervisor-terminated attempts"
+statistics_reduction = "Retain one reduced training-time scalar per cell and seed; apply only the registered five-seed statistics afterward. Never sum timing across seeds, strategies, partitions, threats, or matrix cells."
+communication_volume = "exact_serialized_application_bytes"
+communication_flower_version = "1.32.1"
+communication_serialization_boundary = "complete Flower application Message byte string after application serialization and immediately before transport framing"
+communication_counting_point = "sender_once_per_message"
+communication_directions = ["server_to_client", "client_to_server"]
+communication_included_messages = ["fit_request", "fit_response"]
+communication_evaluation_messages = "none because registered validation and final evaluation execute at the server"
+communication_excluded_bytes = ["transport_framing", "grpc_http2_headers", "tls", "tcp_ip", "lower_layer_retransmissions", "liveness_and_control_messages"]
+communication_retry_rule = "count every complete application message emitted by every initial attempt and retry; count a response only when its complete byte string is emitted; never double-count the receiver copy"
+communication_reporting = "report server_to_client_bytes client_to_server_bytes and their exact sum per run"
+reported_federated = ["convergence_round", "communication_bytes", "client_training_time_ns"]
+reported_centralized_local_only = ["epoch_validation_curve", "training_time_ns"]
+
+[statistics]
+replicates = 5
+raw_per_run_metrics = true
+mean = true
+sample_variance = true
+sample_standard_deviation = true
+confidence_interval = 0.95
+confidence_interval_method = "two_sided_student_t"
+t_critical = 2.776
+variance_ddof = 1
+paired_deltas = true
+paired_by = "seed"
+paired_delta_dtype = "float64"
+paired_delta_operation = "candidate_minus_baseline"
+paired_delta_formula = "For every registered contrast, paired metric, candidate cell c, and master seed s, delta(c,s,metric)=float64(candidate_value(c,s,metric))-float64(baseline_value(mapped_baseline(c),s,metric)). Compute the five raw deltas before the registered mean, sample variance, sample standard deviation, or confidence interval; never reverse the subtraction."
+
+[[statistics.paired_contrasts]]
+name = "primary_strategy_vs_fedavg"
+candidate_matrix = "primary_federated"
+candidate_exclude = { strategy = ["fedavg"] }
+baseline_matrix = "primary_federated"
+preserve_fields = ["partition", "alpha", "client_scale", "seed", "threat"]
+set_fields = { strategy = "fedavg" }
+clear_fields = []
+metrics = ["accuracy", "precision", "recall", "f1", "roc_auc", "convergence_round", "communication_bytes", "client_training_time_ns"]
+
+[[statistics.paired_contrasts]]
+name = "primary_partition_vs_iid"
+candidate_matrix = "primary_federated"
+candidate_exclude = { partition = ["iid_stratified"] }
+baseline_matrix = "primary_federated"
+preserve_fields = ["strategy", "client_scale", "seed", "threat"]
+set_fields = { partition = "iid_stratified" }
+clear_fields = ["alpha"]
+metrics = ["accuracy", "precision", "recall", "f1", "roc_auc", "convergence_round", "communication_bytes", "client_training_time_ns"]
+
+[[statistics.paired_contrasts]]
+name = "local_partition_vs_iid"
+candidate_matrix = "local_only"
+candidate_exclude = { partition = ["iid_stratified"] }
+baseline_matrix = "local_only"
+preserve_fields = ["strategy", "client_scale", "seed", "threat"]
+set_fields = { partition = "iid_stratified" }
+clear_fields = ["alpha"]
+metrics = ["accuracy", "precision", "recall", "f1", "roc_auc", "training_time_ns"]
+
+[[statistics.paired_contrasts]]
+name = "scale_vs_4_clients"
+candidate_matrix = "scale"
+candidate_exclude = {}
+baseline_matrix = "primary_federated"
+preserve_fields = ["strategy", "partition", "alpha", "seed", "threat"]
+set_fields = { client_scale = 4 }
+clear_fields = []
+metrics = ["accuracy", "precision", "recall", "f1", "roc_auc", "convergence_round", "communication_bytes", "client_training_time_ns"]
+
+[[statistics.paired_contrasts]]
+name = "robustness_vs_no_attack"
+candidate_matrix = "robustness"
+candidate_exclude = {}
+baseline_matrix = "primary_federated"
+preserve_fields = ["strategy", "partition", "alpha", "client_scale", "seed"]
+set_fields = {}
+clear_fields = ["threat"]
+metrics = ["accuracy", "precision", "recall", "f1", "roc_auc", "convergence_round", "communication_bytes", "client_training_time_ns"]
+
+[[statistics.paired_contrasts]]
+name = "membership_fedavg_vs_centralized"
+candidate_matrix = "membership_inference"
+candidate_exclude = { strategy = ["centralized"] }
+baseline_matrix = "membership_inference"
+preserve_fields = ["seed", "threat"]
+set_fields = { strategy = "centralized" }
+clear_fields = ["partition", "alpha", "client_scale"]
+metrics = ["roc_auc", "max_tpr_minus_fpr", "tpr_at_1_percent_fpr"]
+
+[matrix.primary_federated]
+strategies = ["fedavg", "fedprox", "fedprox_huber", "fedmedian", "fedtrimmedavg"]
+partitions = ["iid_stratified", "dirichlet_1.0", "dirichlet_0.5", "dirichlet_0.1"]
+seeds = 5
+client_scale = 4
+cells = 100
+paired_contrasts = ["primary_strategy_vs_fedavg", "primary_partition_vs_iid"]
+
+[matrix.centralized]
+strategies = ["centralized"]
+seeds = 5
+cells = 5
+paired_contrasts = []
+paired_delta_policy = "none_because_no_registered_factor_has_multiple_levels"
+
+[matrix.local_only]
+strategies = ["local_only"]
+partitions = ["iid_stratified", "dirichlet_1.0", "dirichlet_0.5", "dirichlet_0.1"]
+seeds = 5
+client_scale = 4
+cells = 20
+training_invocations_per_cell = 4
+training_invocations = 80
+paired_contrasts = ["local_partition_vs_iid"]
+
+[matrix.scale]
+strategies = ["fedavg", "fedprox_huber"]
+seeds = 5
+client_scales = [16, 64]
+partitions_by_client_scale = { "16" = ["iid_stratified", "dirichlet_1.0", "dirichlet_0.5", "dirichlet_0.1"], "64" = ["iid_stratified", "dirichlet_1.0", "dirichlet_0.5"] }
+excluded_cells = "dirichlet_0.1 at 64 clients is not registered because no master seed satisfies minimum_samples_per_client within attempts 0 through 9999"
+excluded_partition = "dirichlet_0.1"
+excluded_client_scale = 64
+excluded_seeds = [67, 101, 211, 307, 401]
+exclusion_attempt_range = [0, 9999]
+cells = 70
+paired_contrasts = ["scale_vs_4_clients"]
+
+[matrix.robustness]
+strategies = ["fedavg", "fedprox_huber", "fedmedian", "fedtrimmedavg"]
+attacks = ["outlier", "sign_flip"]
+malicious_fractions = [0.25, 0.5]
+seeds = 5
+client_scale = 4
+partition = "dirichlet_0.5"
+cells = 80
+paired_contrasts = ["robustness_vs_no_attack"]
+
+[matrix.membership_inference]
+models = ["centralized", "fedavg"]
+seeds = 5
+centralized_model_source = "matrix.centralized_same_seed_final_model"
+fedavg_model_source = "matrix.primary_federated_fedavg_dirichlet_0.5_4_clients_same_seed_final_model"
+fedavg_client_scale = 4
+fedavg_partition = "dirichlet_0.5"
+cells = 10
+paired_contrasts = ["membership_fedavg_vs_centralized"]
+
+[matrix.update_leakage]
+models = ["fedavg"]
+seeds = 5
+fedavg_model_source = "matrix.primary_federated_fedavg_dirichlet_0.5_4_clients_same_seed_round_index_0_selected_client_update"
+client_scale = 4
+partition = "dirichlet_0.5"
+cells = 5
+paired_contrasts = []
+paired_delta_policy = "none_because_no_registered_factor_has_multiple_levels"
+
+[matrix.totals]
+maximum_cells = 290
+planned_training_invocations = 335
+maximum_training_invocations = 350
+training_invocation_retry_reserve = 15
+analysis_only_cells = 15
+privacy_analyses_reuse_trained_models = true
+
+[budget]
+maximum_cells = 290
+planned_training_invocations = 335
+maximum_training_invocations = 350
+training_invocation_retry_reserve = 15
+maximum_gpu_hours = 500
+maximum_cpu_hours = 5000
+compute_limit_operator = "either"
+maximum_memory_gib_per_job = 32
+maximum_vram_gib_per_job = 12
+maximum_storage_gib = 50
+timeout_hours_4_clients = 2
+timeout_hours_16_clients = 3
+timeout_hours_64_clients = 6
+campaign_days = 14
+retry_limit = 1
+retry_counts_toward_budget = true
+second_timeout_oom_or_nonfinite = "cell_failed"
+abort_at_first_compute_or_storage_limit = true
+abort_when_failed_cell_fraction_exceeds = 0.05
+retuning_after_start = false
+incomplete_matrix_label = "incomplete"
+incomplete_matrix_may_support_readme_evidence = false

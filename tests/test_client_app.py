@@ -4,9 +4,11 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
+from flwr.common import ndarrays_to_parameters
 
 import src
 import src.client_app as client_app
+import src.server_app as server_app
 
 
 class RunConfigBoolTests(unittest.TestCase):
@@ -146,6 +148,7 @@ class UpdateNoiseFitTests(unittest.TestCase):
         )
         client.epochs = 1
         client.batch_size = 1
+        client.client_id = 3
         client.use_update_noise = use_update_noise
         client.update_noise_l2_norm_clip = 1.0
         client.update_noise_multiplier = 0.001
@@ -162,7 +165,7 @@ class UpdateNoiseFitTests(unittest.TestCase):
         client._add_update_noise.assert_not_called()
         np.testing.assert_array_equal(weights[0], np.array([1.0, 2.0], dtype="float32"))
         self.assertEqual(num_examples, 2)
-        self.assertEqual(metrics, {"loss": 0.2, "accuracy": 0.9})
+        self.assertEqual(metrics, {"loss": 0.2, "accuracy": 0.9, "client_id": 3})
 
     def test_fit_applies_update_noise_when_enabled(self) -> None:
         client = self.make_client(use_update_noise=True)
@@ -173,6 +176,46 @@ class UpdateNoiseFitTests(unittest.TestCase):
 
         client._add_update_noise.assert_called_once()
         self.assertIs(weights, noisy_weights)
+
+    def test_real_update_noise_remains_float32_through_server_validation(
+        self,
+    ) -> None:
+        client = self.make_client(use_update_noise=True)
+        client.client_id = 0
+        np.random.seed(17)
+
+        weights, num_examples, metrics = client.fit(
+            [np.array([0.0, 0.0], dtype=np.float32)], {}
+        )
+        result = (
+            object(),
+            SimpleNamespace(
+                parameters=ndarrays_to_parameters(weights),
+                num_examples=num_examples,
+                metrics=metrics,
+            ),
+        )
+        _, decoded = server_app._validate_fit_results([result], frozenset({0}), ((2,),))
+
+        self.assertEqual(weights[0].dtype, np.dtype(np.float32))
+        self.assertEqual(decoded[0][0].dtype, np.dtype(np.float32))
+        np.testing.assert_array_equal(decoded[0][0], weights[0])
+
+    def test_update_noise_rejects_incompatible_weight_tensors(self) -> None:
+        client = self.make_client(use_update_noise=True)
+        valid = np.array([0.0, 1.0], dtype=np.float32)
+        invalid_pairs = [
+            ([valid.astype(np.float64)], [valid]),
+            ([valid], [valid.astype(np.float64)]),
+            ([valid], [np.array([[0.0, 1.0]], dtype=np.float32)]),
+            ([valid], [np.array([0.0, np.nan], dtype=np.float32)]),
+            ([], []),
+        ]
+
+        for before, after in invalid_pairs:
+            with self.subTest(before=before, after=after):
+                with self.assertRaises(ValueError):
+                    client._add_update_noise(before, after)
 
     def test_fit_configures_client_side_fedprox_loss(self) -> None:
         client = self.make_client(use_update_noise=False)
