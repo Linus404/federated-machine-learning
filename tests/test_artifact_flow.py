@@ -897,6 +897,85 @@ class ArtifactFlowTests(unittest.TestCase):
                 self.assertFalse((generations / stage_name).exists())
                 self.assertIsNone(data_prep._read_preparation_state_at(parent))
 
+    def test_preparation_state_rejects_post_link_replacement(self) -> None:
+        """Preserve a foreign preparation-state replacement and close its source."""
+        from src import data_prep
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generations = Path(tmpdir) / ".prepared-generations"
+            generations.mkdir()
+            baseline_descriptors = len(os.listdir("/proc/self/fd"))
+            with RetainedDirectoryChain.open(
+                generations, check_platform=False
+            ) as chain:
+                parent = chain.directory.descriptor
+                parent_stat = os.fstat(parent)
+                state = data_prep._PreparationStageState(
+                    "reserved",
+                    parent_stat.st_dev,
+                    parent_stat.st_ino,
+                    "1" * 32,
+                    f".prepare-{'1' * 32}.staging",
+                )
+                real_capture = data_prep.capture_published_unnamed_file_at
+
+                def replace_before_capture(
+                    source_descriptor: int,
+                    parent_descriptor: int,
+                    name: str,
+                    *,
+                    expected_content: bytes,
+                ):
+                    """Replace the state name immediately after its unnamed link.
+
+                    Parameters
+                    ----------
+                    source_descriptor : int
+                        Retained unnamed source descriptor.
+                    parent_descriptor : int
+                        Retained state-directory descriptor.
+                    name : str
+                        Direct committed state name.
+                    expected_content : bytes
+                        Canonical state bytes.
+
+                    Returns
+                    -------
+                    RegularFileSnapshot
+                        Snapshot returned by the real capture helper.
+                    """
+                    os.unlink(name, dir_fd=parent_descriptor)
+                    replacement = os.open(
+                        name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=parent_descriptor,
+                    )
+                    try:
+                        os.write(replacement, b"foreign")
+                    finally:
+                        os.close(replacement)
+                    return real_capture(
+                        source_descriptor,
+                        parent_descriptor,
+                        name,
+                        expected_content=expected_content,
+                    )
+
+                with (
+                    patch.object(
+                        data_prep,
+                        "capture_published_unnamed_file_at",
+                        side_effect=replace_before_capture,
+                    ),
+                    self.assertRaisesRegex(ValueError, "contained regular file"),
+                ):
+                    data_prep._write_preparation_stage_state(chain, state, None)
+
+                state_path = generations / data_prep._preparation_state_name(0)
+                self.assertEqual(state_path.read_bytes(), b"foreign")
+            self.assertEqual(len(os.listdir("/proc/self/fd")), baseline_descriptors)
+
     def test_recovery_accepts_equal_content_with_distinct_split_identities(
         self,
     ) -> None:
@@ -2408,6 +2487,296 @@ class ArtifactFlowTests(unittest.TestCase):
                 },
                 {"manifest.json", "vocab.txt"},
             )
+
+    def test_journal_publication_failures_retain_bound_stage_for_retry(self) -> None:
+        """Retain and recover an exact journal across both directory barriers."""
+        from src import data_prep
+
+        for boundary in ("publisher fsync", "caller fsync", "caller return"):
+            with (
+                self.subTest(boundary=boundary),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                roots = {
+                    "client": root / "clients",
+                    "public": root / "public",
+                    "evaluation": root / "evaluation",
+                }
+                stage = root / ".prepared-generations" / f".prepare-{'1' * 32}.staging"
+                protocol = write_complete_prepared_stage(stage)
+                generations = stage.parent
+                with RetainedDirectoryChain.open(
+                    generations, check_platform=False
+                ) as chain:
+                    parent_stat = os.fstat(chain.directory.descriptor)
+                    stage_stat = stage.stat(follow_symlinks=False)
+                    state = data_prep._PreparationStageState(
+                        "build",
+                        parent_stat.st_dev,
+                        parent_stat.st_ino,
+                        "1" * 32,
+                        stage.name,
+                        stage_stat.st_dev,
+                        stage_stat.st_ino,
+                    )
+                    data_prep._write_preparation_stage_state(chain, state, None)
+                    stages = {name: stage / name for name in roots}
+                    real_fsync = data_prep.RetainedDirectoryChain.fsync
+                    journal_syncs = 0
+
+                    def fail_journal_fsync(retained_chain, *args, **kwargs):
+                        """Fail one selected journal-directory synchronization.
+
+                        Parameters
+                        ----------
+                        retained_chain : RetainedDirectoryChain
+                            Chain whose target directory may own the journal.
+                        *args : object
+                            Positional arguments passed to the real method.
+                        **kwargs : object
+                            Keyword arguments passed to the real method.
+
+                        Returns
+                        -------
+                        None
+                        """
+                        nonlocal journal_syncs
+                        journal = root / ".prepared-migration.json"
+                        if journal.exists():
+                            journal_syncs += 1
+                            selected = 1 if boundary == "publisher fsync" else 2
+                            if (
+                                boundary != "caller return"
+                                and journal_syncs == selected
+                            ):
+                                raise OSError("injected journal fsync failure")
+                        real_fsync(retained_chain, *args, **kwargs)
+
+                    def fail_journal_return(phase: str) -> None:
+                        """Fail immediately after the caller's journal barrier.
+
+                        Parameters
+                        ----------
+                        phase : str
+                            Publication checkpoint name.
+
+                        Returns
+                        -------
+                        None
+                        """
+                        if boundary == "caller return" and phase == (
+                            "parent:journal-fsynced"
+                        ):
+                            raise OSError("injected journal return failure")
+
+                    with (
+                        patch.object(
+                            data_prep.RetainedDirectoryChain,
+                            "fsync",
+                            side_effect=fail_journal_fsync,
+                            autospec=True,
+                        ),
+                        patch.object(
+                            data_prep,
+                            "_publication_checkpoint",
+                            side_effect=fail_journal_return,
+                        ),
+                        patch(
+                            "src.data_prep.load_scientific_protocol",
+                            return_value=protocol,
+                        ),
+                        self.assertRaisesRegex(OSError, "journal") as raised,
+                    ):
+                        _publish_prepared_roots(roots, stages, preparation_request())
+
+                    self.assertTrue(
+                        getattr(
+                            raised.exception,
+                            data_prep._RETAIN_PREPARATION_STAGE_ATTRIBUTE,
+                            False,
+                        )
+                    )
+                    journal = root / ".prepared-migration.json"
+                    self.assertEqual(journal.stat(follow_symlinks=False).st_nlink, 1)
+                    self.assertTrue(stage.is_dir())
+                    self.assertIsNotNone(
+                        data_prep._read_preparation_state_at(chain.directory.descriptor)
+                    )
+
+                    with patch(
+                        "src.data_prep.load_scientific_protocol",
+                        return_value=protocol,
+                    ):
+                        self.assertTrue(
+                            _recover_prepared_migration(roots, preparation_request())
+                        )
+                    _recover_preparation_stage(chain)
+                    self.assertFalse(journal.exists())
+                    self.assertFalse(stage.exists())
+                    self.assertIsNone(
+                        data_prep._read_preparation_state_at(chain.directory.descriptor)
+                    )
+
+    def test_ambiguous_journal_replacement_is_preserved_without_stage_cleanup(
+        self,
+    ) -> None:
+        """Preserve a foreign journal and its state-bound stage after fsync failure."""
+        from src import data_prep
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            roots = {
+                "client": root / "clients",
+                "public": root / "public",
+                "evaluation": root / "evaluation",
+            }
+            stage = root / ".prepared-generations" / f".prepare-{'1' * 32}.staging"
+            protocol = write_complete_prepared_stage(stage)
+            prior = stage.parent / "prior-generation"
+            prior.mkdir()
+            (prior / "preserve").write_bytes(b"prior")
+            with RetainedDirectoryChain.open(
+                stage.parent, check_platform=False
+            ) as chain:
+                parent_stat = os.fstat(chain.directory.descriptor)
+                stage_stat = stage.stat(follow_symlinks=False)
+                state = data_prep._PreparationStageState(
+                    "build",
+                    parent_stat.st_dev,
+                    parent_stat.st_ino,
+                    "1" * 32,
+                    stage.name,
+                    stage_stat.st_dev,
+                    stage_stat.st_ino,
+                )
+                data_prep._write_preparation_stage_state(chain, state, None)
+                stages = {name: stage / name for name in roots}
+                real_fsync = data_prep.RetainedDirectoryChain.fsync
+                journal_syncs = 0
+
+                def replace_before_caller_fsync(retained_chain, *args, **kwargs):
+                    """Replace the exact journal before its second directory barrier.
+
+                    Parameters
+                    ----------
+                    retained_chain : RetainedDirectoryChain
+                        Chain whose target directory owns the journal.
+                    *args : object
+                        Positional arguments passed to the real method.
+                    **kwargs : object
+                        Keyword arguments passed to the real method.
+
+                    Returns
+                    -------
+                    None
+                    """
+                    nonlocal journal_syncs
+                    journal_name = ".prepared-migration.json"
+                    journal = root / journal_name
+                    if journal.exists():
+                        journal_syncs += 1
+                        if journal_syncs == 2:
+                            os.unlink(
+                                journal_name, dir_fd=retained_chain.directory.descriptor
+                            )
+                            replacement = os.open(
+                                journal_name,
+                                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                0o600,
+                                dir_fd=retained_chain.directory.descriptor,
+                            )
+                            try:
+                                os.write(replacement, b"foreign journal")
+                            finally:
+                                os.close(replacement)
+                            raise OSError("injected journal replacement")
+                    real_fsync(retained_chain, *args, **kwargs)
+
+                with (
+                    patch.object(
+                        data_prep.RetainedDirectoryChain,
+                        "fsync",
+                        side_effect=replace_before_caller_fsync,
+                        autospec=True,
+                    ),
+                    patch(
+                        "src.data_prep.load_scientific_protocol",
+                        return_value=protocol,
+                    ),
+                    self.assertRaisesRegex(OSError, "journal replacement") as raised,
+                ):
+                    _publish_prepared_roots(roots, stages, preparation_request())
+
+                self.assertTrue(
+                    getattr(
+                        raised.exception,
+                        data_prep._RETAIN_PREPARATION_STAGE_ATTRIBUTE,
+                        False,
+                    )
+                )
+                journal = root / ".prepared-migration.json"
+                self.assertEqual(journal.read_bytes(), b"foreign journal")
+                self.assertTrue(stage.is_dir())
+                self.assertEqual((prior / "preserve").read_bytes(), b"prior")
+                with self.assertRaises(ValueError):
+                    _recover_prepared_migration(roots, preparation_request())
+                self.assertEqual(journal.read_bytes(), b"foreign journal")
+                self.assertTrue(stage.is_dir())
+                self.assertEqual((prior / "preserve").read_bytes(), b"prior")
+
+    def test_absent_journal_failure_allows_bound_stage_cleanup(self) -> None:
+        """Clean the bound stage only when journal absence is proven before link."""
+        from src import data_prep
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            roots = {
+                "client": root / "clients",
+                "public": root / "public",
+                "evaluation": root / "evaluation",
+            }
+            stage = root / ".prepared-generations" / f".prepare-{'1' * 32}.staging"
+            write_complete_prepared_stage(stage)
+            with RetainedDirectoryChain.open(
+                stage.parent, check_platform=False
+            ) as chain:
+                parent_stat = os.fstat(chain.directory.descriptor)
+                stage_stat = stage.stat(follow_symlinks=False)
+                state = data_prep._PreparationStageState(
+                    "build",
+                    parent_stat.st_dev,
+                    parent_stat.st_ino,
+                    "1" * 32,
+                    stage.name,
+                    stage_stat.st_dev,
+                    stage_stat.st_ino,
+                )
+                data_prep._write_preparation_stage_state(chain, state, None)
+                stages = {name: stage / name for name in roots}
+                with (
+                    patch.object(
+                        data_prep,
+                        "publish_bytes_immutably",
+                        side_effect=OSError("injected pre-link journal failure"),
+                    ),
+                    self.assertRaisesRegex(OSError, "pre-link") as raised,
+                ):
+                    _publish_prepared_roots(roots, stages, preparation_request())
+
+                self.assertFalse(
+                    getattr(
+                        raised.exception,
+                        data_prep._RETAIN_PREPARATION_STAGE_ATTRIBUTE,
+                        False,
+                    )
+                )
+                self.assertFalse((root / ".prepared-migration.json").exists())
+                _recover_preparation_stage(chain)
+                self.assertFalse(stage.exists())
+                self.assertIsNone(
+                    data_prep._read_preparation_state_at(chain.directory.descriptor)
+                )
 
     def test_prepare_retry_discards_mismatched_request_and_regenerates(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

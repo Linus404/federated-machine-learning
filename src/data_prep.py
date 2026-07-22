@@ -25,13 +25,19 @@ from src.app_manifest import (
 from src.artifact_compatibility import (
     PUBLIC_ARTIFACT_SCHEMA_VERSION,
     RetainedDirectoryChain,
+    capture_published_unnamed_file_at,
     canonical_json_bytes,
+    immutable_publication_state,
     link_unnamed_file_at,
+    open_unnamed_file_at,
+    publish_bytes_immutably,
     read_regular_file,
     require_secure_artifact_platform,
+    retained_publication_state_at,
     sha256_bytes,
     sha256_file,
     strict_json_loads,
+    verify_published_unnamed_file_at,
     write_json_atomically,
 )
 from src.contracts import (
@@ -65,6 +71,7 @@ from src.paths import (
 from src.text_preprocessing import create_text_vectorizer
 
 _PREPARATION_STAGE_STATE_FILENAME = ".prepare-stage.state"
+_RETAIN_PREPARATION_STAGE_ATTRIBUTE = "_fml_retain_preparation_stage"
 _PREPARATION_STAGE_STATE_SCHEMA_VERSION = 1
 _PREPARATION_STAGE_STATE_FIELDS = {
     "schema_version",
@@ -693,15 +700,7 @@ def _write_preparation_stage_state(
         raise ValueError("preparation stage state generation is exhausted")
     document = canonical_json_bytes({**state.payload(), "generation": generation})
     name = _preparation_state_name(generation)
-    try:
-        descriptor = os.open(
-            ".",
-            os.O_RDWR | os.O_TMPFILE | os.O_CLOEXEC,
-            0o600,
-            dir_fd=parent_descriptor,
-        )
-    except OSError as error:
-        raise RuntimeError("Linux O_TMPFILE support is required") from error
+    descriptor = open_unnamed_file_at(parent_descriptor)
     try:
         written = 0
         while written < len(document):
@@ -712,8 +711,21 @@ def _write_preparation_stage_state(
         os.fsync(descriptor)
         chain.verify()
         link_unnamed_file_at(descriptor, parent_descriptor, name)
+        snapshot = capture_published_unnamed_file_at(
+            descriptor,
+            parent_descriptor,
+            name,
+            expected_content=document,
+        )
         os.fsync(parent_descriptor)
         chain.verify()
+        verify_published_unnamed_file_at(
+            descriptor,
+            snapshot,
+            parent_descriptor,
+            name,
+            expected_content=document,
+        )
         installed_document, installed_identity = _read_preparation_record_at(
             parent_descriptor, name
         )
@@ -757,6 +769,20 @@ def _write_preparation_stage_state(
         if retired:
             os.fsync(parent_descriptor)
             chain.verify()
+            verify_published_unnamed_file_at(
+                descriptor,
+                snapshot,
+                parent_descriptor,
+                name,
+                expected_content=document,
+            )
+        verify_published_unnamed_file_at(
+            descriptor,
+            snapshot,
+            parent_descriptor,
+            name,
+            expected_content=document,
+        )
         return installed
     finally:
         os.close(descriptor)
@@ -1785,10 +1811,44 @@ def _publish_prepared_roots(
         "previous_pointer_target": previous_pointer_target,
     }
     journal = parent / PREPARED_MIGRATION_FILENAME
-    write_json_atomically(journal, transaction, overwrite=False)
-    _publication_checkpoint("journal:published")
-    _fsync_directory(parent)
-    _publication_checkpoint("parent:journal-fsynced")
+    journal_bytes = canonical_json_bytes(transaction)
+    with RetainedDirectoryChain.open(parent, check_platform=False) as journal_chain:
+        retained_journal = None
+        try:
+            retained_journal = publish_bytes_immutably(journal, journal_bytes)
+            retained_journal.verify(
+                journal_chain.directory.descriptor,
+                journal.name,
+                expected_content=journal_bytes,
+            )
+            _publication_checkpoint("journal:published")
+            journal_chain.fsync()
+            retained_journal.verify(
+                journal_chain.directory.descriptor,
+                journal.name,
+                expected_content=journal_bytes,
+            )
+            _publication_checkpoint("parent:journal-fsynced")
+            retained_journal.verify(
+                journal_chain.directory.descriptor,
+                journal.name,
+                expected_content=journal_bytes,
+            )
+        except BaseException as error:
+            state = immutable_publication_state(error)
+            if retained_journal is not None:
+                state = retained_publication_state_at(
+                    retained_journal,
+                    journal_chain.directory.descriptor,
+                    journal.name,
+                    expected_content=journal_bytes,
+                )
+            if state is not None and state != "absent":
+                setattr(error, _RETAIN_PREPARATION_STAGE_ATTRIBUTE, True)
+            raise
+        finally:
+            if retained_journal is not None:
+                retained_journal.close()
     try:
         if not _recover_prepared_migration(roots, request):
             raise RuntimeError("prepared migration journal disappeared")
@@ -2406,7 +2466,12 @@ def prepare_all(
         )
         os.close(verification_descriptor)
         lock.verify()
-        _publish_prepared_roots(roots, stages, request)
+        try:
+            _publish_prepared_roots(roots, stages, request)
+        except BaseException as error:
+            if getattr(error, _RETAIN_PREPARATION_STAGE_ATTRIBUTE, False):
+                stages = {}
+            raise
         lock.verify()
         _recover_preparation_stage(generation_chain)
         lock.verify()

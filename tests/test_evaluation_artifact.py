@@ -978,6 +978,83 @@ with parent.chain:
                         )
                     )
 
+    def test_ownership_state_rejects_post_link_replacement(self) -> None:
+        """Preserve a foreign evaluation-state replacement and close its source."""
+        from src import evaluation_artifact
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "evaluation"
+            baseline_descriptors = len(os.listdir("/proc/self/fd"))
+            parent, output_name = evaluation_artifact._open_new_artifact_parent(output)
+            with parent.chain:
+                parent_stat = os.fstat(parent.descriptor)
+                state = evaluation_artifact._EvaluationOwnershipState(
+                    "reserved",
+                    parent_stat.st_dev,
+                    parent_stat.st_ino,
+                    output_name,
+                    "1" * 32,
+                    f".evaluation.{'1' * 32}.staging",
+                )
+                real_capture = evaluation_artifact.capture_published_unnamed_file_at
+
+                def replace_before_capture(
+                    source_descriptor: int,
+                    parent_descriptor: int,
+                    name: str,
+                    *,
+                    expected_content: bytes,
+                ):
+                    """Replace the state name immediately after its unnamed link.
+
+                    Parameters
+                    ----------
+                    source_descriptor : int
+                        Retained unnamed source descriptor.
+                    parent_descriptor : int
+                        Retained state-directory descriptor.
+                    name : str
+                        Direct committed state name.
+                    expected_content : bytes
+                        Canonical state bytes.
+
+                    Returns
+                    -------
+                    RegularFileSnapshot
+                        Snapshot returned by the real capture helper.
+                    """
+                    os.unlink(name, dir_fd=parent_descriptor)
+                    replacement = os.open(
+                        name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=parent_descriptor,
+                    )
+                    try:
+                        os.write(replacement, b"foreign")
+                    finally:
+                        os.close(replacement)
+                    return real_capture(
+                        source_descriptor,
+                        parent_descriptor,
+                        name,
+                        expected_content=expected_content,
+                    )
+
+                with (
+                    patch.object(
+                        evaluation_artifact,
+                        "capture_published_unnamed_file_at",
+                        side_effect=replace_before_capture,
+                    ),
+                    self.assertRaisesRegex(ValueError, "contained regular file"),
+                ):
+                    evaluation_artifact._write_evaluation_state(parent, state, None)
+
+                state_name = evaluation_artifact._evaluation_state_name(output_name, 0)
+                self.assertEqual(Path(tmpdir, state_name).read_bytes(), b"foreign")
+            self.assertEqual(len(os.listdir("/proc/self/fd")), baseline_descriptors)
+
     def test_publication_rejects_corrupt_state_and_preserves_residues(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

@@ -16,14 +16,17 @@ from typing import Any, Iterable, Mapping
 
 from src.artifact_compatibility import (
     RetainedDirectoryChain,
+    capture_published_unnamed_file_at,
     canonical_json_bytes,
     deep_freeze,
     link_unnamed_file_at,
+    open_unnamed_file_at,
     read_regular_file_snapshot_at,
     rename_noreplace_at,
     require_secure_artifact_platform,
     sha256_bytes,
     strict_json_loads,
+    verify_published_unnamed_file_at,
 )
 from src.paths import RunArtifactLock, resolve_prepared_artifact_dir
 
@@ -758,15 +761,7 @@ def _write_evaluation_state(
         raise ValueError("evaluation ownership state generation is exhausted")
     document = canonical_json_bytes({**state.payload(), "generation": generation})
     name = _evaluation_state_name(state.output_name, generation)
-    try:
-        descriptor = os.open(
-            ".",
-            os.O_RDWR | os.O_TMPFILE | os.O_CLOEXEC,
-            0o600,
-            dir_fd=parent.descriptor,
-        )
-    except OSError as error:
-        raise RuntimeError("Linux O_TMPFILE support is required") from error
+    descriptor = open_unnamed_file_at(parent.descriptor)
     try:
         written = 0
         while written < len(document):
@@ -778,6 +773,12 @@ def _write_evaluation_state(
         if require_visible_parent:
             _verify_evaluation_parent(parent)
         link_unnamed_file_at(descriptor, parent.descriptor, name)
+        snapshot = capture_published_unnamed_file_at(
+            descriptor,
+            parent.descriptor,
+            name,
+            expected_content=document,
+        )
         if require_visible_parent:
             _fsync_evaluation_descriptor(parent, parent.descriptor)
         else:
@@ -788,6 +789,13 @@ def _write_evaluation_state(
             ):
                 raise ValueError("evaluation ownership state selects another parent")
             os.fsync(parent.descriptor)
+        verify_published_unnamed_file_at(
+            descriptor,
+            snapshot,
+            parent.descriptor,
+            name,
+            expected_content=document,
+        )
         installed_document, installed_identity = _read_regular_bytes_at(
             parent.descriptor, name
         )
@@ -833,6 +841,20 @@ def _write_evaluation_state(
                 _fsync_evaluation_descriptor(parent, parent.descriptor)
             else:
                 os.fsync(parent.descriptor)
+            verify_published_unnamed_file_at(
+                descriptor,
+                snapshot,
+                parent.descriptor,
+                name,
+                expected_content=document,
+            )
+        verify_published_unnamed_file_at(
+            descriptor,
+            snapshot,
+            parent.descriptor,
+            name,
+            expected_content=document,
+        )
         return installed
     finally:
         os.close(descriptor)

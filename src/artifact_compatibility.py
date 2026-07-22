@@ -55,6 +55,13 @@ _MODEL_DIMENSION_FIELDS = {"vocabulary_size", "sequence_length", "embedding_dim"
 _AT_EMPTY_PATH = 0x1000
 _RENAME_NOREPLACE = 1
 _RENAME_EXCHANGE = 2
+_UNSUPPORTED_O_TMPFILE_ERRNOS = {
+    errno.EINVAL,
+    errno.EISDIR,
+    errno.ENOSYS,
+    errno.EOPNOTSUPP,
+}
+_IMMUTABLE_PUBLICATION_STATE_ATTRIBUTE = "_fml_immutable_publication_state"
 
 
 def _libc_call(name: str, *arguments: object) -> None:
@@ -225,6 +232,41 @@ def link_unnamed_file_at(
             raise FileExistsError(
                 error.errno, error.strerror, destination_name
             ) from error
+        raise
+
+
+def open_unnamed_file_at(parent_descriptor: int, *, mode: int = 0o600) -> int:
+    """Open one unnamed regular file below a retained directory.
+
+    Parameters
+    ----------
+    parent_descriptor : int
+        Retained destination-directory descriptor.
+    mode : int, optional
+        Permissions requested for the unnamed inode.
+
+    Returns
+    -------
+    int
+        Caller-owned ``O_TMPFILE`` descriptor.
+
+    Raises
+    ------
+    RuntimeError
+        If Linux or the destination filesystem lacks ``O_TMPFILE`` support.
+    OSError
+        If the open fails for an operational reason.
+    """
+    try:
+        return os.open(
+            ".",
+            os.O_RDWR | os.O_TMPFILE | os.O_CLOEXEC,
+            mode,
+            dir_fd=parent_descriptor,
+        )
+    except OSError as error:
+        if error.errno in _UNSUPPORTED_O_TMPFILE_ERRNOS:
+            raise RuntimeError("Linux O_TMPFILE support is required") from error
         raise
 
 
@@ -1577,11 +1619,21 @@ class RetainedRegularFile(AbstractContextManager["RetainedRegularFile"]):
         RetainedDirectoryChain._require_child_name(name)
         if self._closed:
             raise ValueError(f"artifact changed while retained: {name}")
+        visible_descriptor = -1
         try:
-            entry = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
             current = _read_regular_file_descriptor(self.descriptor)
+            visible_descriptor = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=parent_descriptor,
+            )
+            visible = _read_regular_file_descriptor(visible_descriptor)
+            entry = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
         except (OSError, ValueError) as error:
             raise ValueError(f"artifact changed while retained: {name}") from error
+        finally:
+            if visible_descriptor >= 0:
+                os.close(visible_descriptor)
         captured = self.snapshot
         identity = (
             captured.device,
@@ -1609,7 +1661,16 @@ class RetainedRegularFile(AbstractContextManager["RetainedRegularFile"]):
                 current.changed_ns,
             )
             != identity
+            or (
+                visible.device,
+                visible.inode,
+                visible.size_bytes,
+                visible.modified_ns,
+                visible.changed_ns,
+            )
+            != identity
             or current.content != captured.content
+            or visible.content != captured.content
             or current.content
             != (captured.content if expected_content is None else expected_content)
         ):
@@ -1639,6 +1700,144 @@ class RetainedRegularFile(AbstractContextManager["RetainedRegularFile"]):
         None
         """
         self.close()
+
+
+def retained_publication_state_at(
+    retained: RetainedRegularFile,
+    parent_descriptor: int,
+    name: str,
+    *,
+    expected_content: bytes,
+) -> Literal["exact", "absent", "foreign", "unknown"]:
+    """Classify a retained immutable publication without following its name.
+
+    Parameters
+    ----------
+    retained : RetainedRegularFile
+        Retained source descriptor and post-link snapshot.
+    parent_descriptor : int
+        Retained owning-directory descriptor.
+    name : str
+        Direct destination child name.
+    expected_content : bytes
+        Exact bytes required at the destination.
+
+    Returns
+    -------
+    {"exact", "absent", "foreign", "unknown"}
+        Descriptor-relative publication state.
+    """
+    try:
+        retained.verify(
+            parent_descriptor,
+            name,
+            expected_content=expected_content,
+        )
+    except ValueError:
+        try:
+            os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            try:
+                return (
+                    "absent"
+                    if os.fstat(retained.descriptor).st_nlink == 0
+                    else "unknown"
+                )
+            except OSError:
+                return "unknown"
+        except OSError:
+            return "unknown"
+        return "foreign"
+    return "exact"
+
+
+def capture_published_unnamed_file_at(
+    source_descriptor: int,
+    parent_descriptor: int,
+    name: str,
+    *,
+    expected_content: bytes,
+) -> RegularFileSnapshot:
+    """Capture and verify one newly linked unnamed source inode.
+
+    Parameters
+    ----------
+    source_descriptor : int
+        Retained linked ``O_TMPFILE`` descriptor.
+    parent_descriptor : int
+        Retained owning-directory descriptor.
+    name : str
+        Direct published child name.
+    expected_content : bytes
+        Exact bytes required in the source and destination.
+
+    Returns
+    -------
+    RegularFileSnapshot
+        Stable post-link source snapshot.
+    """
+    snapshot = _read_regular_file_descriptor(source_descriptor)
+    verify_published_unnamed_file_at(
+        source_descriptor,
+        snapshot,
+        parent_descriptor,
+        name,
+        expected_content=expected_content,
+    )
+    return snapshot
+
+
+def verify_published_unnamed_file_at(
+    source_descriptor: int,
+    snapshot: RegularFileSnapshot,
+    parent_descriptor: int,
+    name: str,
+    *,
+    expected_content: bytes,
+) -> None:
+    """Require a published name to retain its exact unnamed source inode.
+
+    Parameters
+    ----------
+    source_descriptor : int
+        Retained linked ``O_TMPFILE`` descriptor.
+    snapshot : RegularFileSnapshot
+        Stable post-link source snapshot.
+    parent_descriptor : int
+        Retained owning-directory descriptor.
+    name : str
+        Direct published child name.
+    expected_content : bytes
+        Exact bytes required in the source and destination.
+
+    Returns
+    -------
+    None
+    """
+    RetainedRegularFile(source_descriptor, snapshot).verify(
+        parent_descriptor,
+        name,
+        expected_content=expected_content,
+    )
+
+
+def immutable_publication_state(
+    error: BaseException,
+) -> Literal["exact", "absent", "foreign", "unknown"] | None:
+    """Return immutable-publication state attached to a failed operation.
+
+    Parameters
+    ----------
+    error : BaseException
+        Failure raised after an immutable link may have occurred.
+
+    Returns
+    -------
+    {"exact", "absent", "foreign", "unknown"} or None
+        Recorded state, or ``None`` when publication was never attempted.
+    """
+    state = getattr(error, _IMMUTABLE_PUBLICATION_STATE_ATTRIBUTE, None)
+    return state if state in {"exact", "absent", "foreign", "unknown"} else None
 
 
 @dataclass(frozen=True)
@@ -1956,6 +2155,145 @@ def sha256_file(path: Path) -> str:
     return f"sha256:{digest.hexdigest()}"
 
 
+def _unnamed_publication_state_at(
+    source_descriptor: int,
+    parent_descriptor: int,
+    name: str,
+    expected_content: bytes,
+) -> Literal["exact", "absent", "foreign", "unknown"]:
+    """Classify a possibly linked unnamed inode after publication failure.
+
+    Parameters
+    ----------
+    source_descriptor : int
+        Retained unnamed source descriptor.
+    parent_descriptor : int
+        Retained destination-directory descriptor.
+    name : str
+        Direct destination child name.
+    expected_content : bytes
+        Exact bytes expected in the source and destination.
+
+    Returns
+    -------
+    {"exact", "absent", "foreign", "unknown"}
+        Descriptor-relative publication state.
+    """
+    try:
+        source = os.fstat(source_descriptor)
+    except OSError:
+        return "unknown"
+    try:
+        entry = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return "absent" if source.st_nlink == 0 else "unknown"
+    except OSError:
+        return "unknown"
+    if (
+        not stat.S_ISREG(entry.st_mode)
+        or entry.st_nlink != 1
+        or (entry.st_dev, entry.st_ino) != (source.st_dev, source.st_ino)
+    ):
+        return "foreign"
+    try:
+        snapshot = _read_regular_file_descriptor(source_descriptor)
+        retained = RetainedRegularFile(source_descriptor, snapshot)
+        retained.verify(
+            parent_descriptor,
+            name,
+            expected_content=expected_content,
+        )
+    except (OSError, ValueError):
+        return "foreign"
+    return "exact"
+
+
+def publish_bytes_immutably(path: Path, content: bytes) -> RetainedRegularFile:
+    """Publish exact bytes once while retaining the installed source inode.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Absent immutable destination path.
+    content : bytes
+        Exact bytes to publish.
+
+    Returns
+    -------
+    RetainedRegularFile
+        Source descriptor and post-link snapshot retained by the caller.
+
+    Raises
+    ------
+    FileExistsError
+        If the destination already exists.
+    RuntimeError
+        If immutable publication requires an unavailable Linux primitive.
+    ValueError
+        If the destination parent or installed file changes.
+    OSError
+        If writing or synchronizing the file fails.
+    """
+    with RetainedDirectoryChain.open(
+        path.parent,
+        create=True,
+        mode=0o777,
+        error_message="artifact directory chain changed",
+    ) as chain:
+        chain.commit()
+        parent_descriptor = chain.directory.descriptor
+        descriptor = open_unnamed_file_at(parent_descriptor)
+        retained: RetainedRegularFile | None = None
+        link_attempted = False
+        try:
+            with os.fdopen(descriptor, "wb", closefd=False) as file:
+                file.write(content)
+                os.fchmod(descriptor, 0o644)
+                file.flush()
+                os.fsync(descriptor)
+            chain.verify()
+            link_attempted = True
+            link_unnamed_file_at(descriptor, parent_descriptor, path.name)
+            snapshot = capture_published_unnamed_file_at(
+                descriptor,
+                parent_descriptor,
+                path.name,
+                expected_content=content,
+            )
+            retained = RetainedRegularFile(descriptor, snapshot)
+            chain.fsync()
+            verify_published_unnamed_file_at(
+                descriptor,
+                snapshot,
+                parent_descriptor,
+                path.name,
+                expected_content=content,
+            )
+            chain.verify()
+            verify_published_unnamed_file_at(
+                descriptor,
+                snapshot,
+                parent_descriptor,
+                path.name,
+                expected_content=content,
+            )
+            return retained
+        except BaseException as error:
+            if link_attempted:
+                state = _unnamed_publication_state_at(
+                    descriptor,
+                    parent_descriptor,
+                    path.name,
+                    content,
+                )
+                setattr(error, _IMMUTABLE_PUBLICATION_STATE_ATTRIBUTE, state)
+            if retained is not None:
+                retained.close()
+            else:
+                os.close(descriptor)
+            raise
+
+
 def write_json_atomically(
     path: Path, payload: Mapping[str, Any], *, overwrite: bool = True
 ) -> Path:
@@ -2043,35 +2381,19 @@ def write_bytes_atomically(
             raise
         return path
 
-    with RetainedDirectoryChain.open(
-        path.parent,
-        create=True,
-        mode=0o777,
-        error_message="artifact directory chain changed",
-    ) as chain:
-        chain.commit()
-        parent_descriptor = chain.directory.descriptor
-        try:
-            descriptor = os.open(
-                ".",
-                os.O_RDWR | os.O_TMPFILE | os.O_CLOEXEC,
-                0o600,
-                dir_fd=parent_descriptor,
+    retained = publish_bytes_immutably(path, content)
+    try:
+        with RetainedDirectoryChain.open(path.parent) as chain:
+            verify_published_unnamed_file_at(
+                retained.descriptor,
+                retained.snapshot,
+                chain.directory.descriptor,
+                path.name,
+                expected_content=content,
             )
-        except OSError as error:
-            raise RuntimeError("Linux O_TMPFILE support is required") from error
-        try:
-            with os.fdopen(descriptor, "wb", closefd=False) as file:
-                file.write(content)
-                os.fchmod(descriptor, 0o644)
-                file.flush()
-                os.fsync(descriptor)
-            chain.verify()
-            link_unnamed_file_at(descriptor, parent_descriptor, path.name)
-            chain.fsync()
-        finally:
-            os.close(descriptor)
-    return path
+            return path
+    finally:
+        retained.close()
 
 
 def sync_directory(path: Path) -> None:

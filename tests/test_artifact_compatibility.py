@@ -1,3 +1,4 @@
+import errno
 import hashlib
 import json
 import os
@@ -672,7 +673,10 @@ class ArtifactCompatibilityTests(unittest.TestCase):
                     Descriptor returned by the real ``os.open``.
                 """
                 if name == "." and flags & os.O_TMPFILE:
-                    raise OSError("injected O_TMPFILE failure")
+                    raise OSError(
+                        errno.EOPNOTSUPP,
+                        "injected O_TMPFILE failure",
+                    )
                 return real_open(name, flags, *args, **kwargs)
 
             with (
@@ -705,6 +709,166 @@ class ArtifactCompatibilityTests(unittest.TestCase):
 
             self.assertEqual(list(outside.iterdir()), [])
             self.assertEqual(len(os.listdir("/proc/self/fd")), baseline_descriptors)
+
+    @unittest.skipUnless(hasattr(os, "O_TMPFILE"), "immutable writes require Linux")
+    def test_immutable_atomic_write_rejects_replacement_at_every_boundary(
+        self,
+    ) -> None:
+        """Reject foreign names after link, fsync, and both return boundaries."""
+        from src import artifact_compatibility
+
+        real_verify = artifact_compatibility.verify_published_unnamed_file_at
+        for boundary in range(1, 5):
+            with (
+                self.subTest(boundary=boundary),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                target = root / "artifact.bin"
+                calls = 0
+
+                def replace_before_verify(
+                    source_descriptor: int,
+                    snapshot,
+                    parent_descriptor: int,
+                    name: str,
+                    *,
+                    expected_content: bytes,
+                ) -> None:
+                    """Replace the published name before one selected verification.
+
+                    Parameters
+                    ----------
+                    source_descriptor : int
+                        Retained unnamed source descriptor.
+                    snapshot : RegularFileSnapshot
+                        Captured source snapshot.
+                    parent_descriptor : int
+                        Retained destination-directory descriptor.
+                    name : str
+                        Direct destination child name.
+                    expected_content : bytes
+                        Exact expected destination bytes.
+
+                    Returns
+                    -------
+                    None
+                    """
+                    nonlocal calls
+                    calls += 1
+                    if calls == boundary:
+                        os.unlink(name, dir_fd=parent_descriptor)
+                        replacement = os.open(
+                            name,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                            0o600,
+                            dir_fd=parent_descriptor,
+                        )
+                        try:
+                            os.write(replacement, b"foreign")
+                        finally:
+                            os.close(replacement)
+                    real_verify(
+                        source_descriptor,
+                        snapshot,
+                        parent_descriptor,
+                        name,
+                        expected_content=expected_content,
+                    )
+
+                baseline_descriptors = len(os.listdir("/proc/self/fd"))
+                with (
+                    patch.object(
+                        artifact_compatibility,
+                        "verify_published_unnamed_file_at",
+                        side_effect=replace_before_verify,
+                    ),
+                    self.assertRaisesRegex(ValueError, "changed while retained"),
+                ):
+                    write_bytes_atomically(target, b"published", overwrite=False)
+
+                self.assertEqual(target.read_bytes(), b"foreign")
+                self.assertEqual(set(root.iterdir()), {target})
+                self.assertEqual(len(os.listdir("/proc/self/fd")), baseline_descriptors)
+
+    @unittest.skipUnless(hasattr(os, "O_TMPFILE"), "immutable writes require Linux")
+    def test_immutable_atomic_write_classifies_only_capability_open_errors(
+        self,
+    ) -> None:
+        """Preserve operational ``O_TMPFILE`` failures and classify support errors."""
+        from src import artifact_compatibility
+
+        unsupported = (errno.ENOSYS, errno.EOPNOTSUPP, errno.EINVAL, errno.EISDIR)
+        operational = (
+            errno.ENOSPC,
+            errno.EDQUOT,
+            errno.EACCES,
+            errno.EROFS,
+            errno.EINTR,
+            errno.EMFILE,
+            errno.ENFILE,
+        )
+        real_open = artifact_compatibility.os.open
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            baseline_descriptors = len(os.listdir("/proc/self/fd"))
+            for error_number in (*unsupported, *operational):
+                with self.subTest(error_number=error_number):
+                    injected = OSError(error_number, os.strerror(error_number))
+
+                    def reject_unnamed_file(name, flags, *args, **kwargs):
+                        """Inject one selected ``O_TMPFILE`` open error.
+
+                        Parameters
+                        ----------
+                        name : object
+                            Name passed to ``os.open``.
+                        flags : int
+                            Flags passed to ``os.open``.
+                        *args : object
+                            Positional arguments passed to ``os.open``.
+                        **kwargs : object
+                            Keyword arguments passed to ``os.open``.
+
+                        Returns
+                        -------
+                        int
+                            Descriptor returned by the real ``os.open``.
+                        """
+                        if name == "." and flags & os.O_TMPFILE:
+                            raise injected
+                        return real_open(name, flags, *args, **kwargs)
+
+                    context = (
+                        self.assertRaises(RuntimeError)
+                        if error_number in unsupported
+                        else self.assertRaises(OSError)
+                    )
+                    with (
+                        patch.object(
+                            artifact_compatibility,
+                            "require_secure_artifact_platform",
+                        ),
+                        patch.object(
+                            artifact_compatibility.os,
+                            "open",
+                            side_effect=reject_unnamed_file,
+                        ),
+                        context as raised,
+                    ):
+                        write_bytes_atomically(
+                            root / f"artifact-{error_number}.bin",
+                            b"content",
+                            overwrite=False,
+                        )
+
+                    if error_number in operational:
+                        self.assertIs(raised.exception, injected)
+                        self.assertEqual(raised.exception.errno, error_number)
+                    self.assertEqual(list(root.iterdir()), [])
+                    self.assertEqual(
+                        len(os.listdir("/proc/self/fd")), baseline_descriptors
+                    )
 
     def test_compatibility_policy_records_client_schema_two_migration(self) -> None:
         policy = (
