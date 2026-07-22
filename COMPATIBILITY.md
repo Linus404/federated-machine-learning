@@ -55,10 +55,13 @@ index use schema `1`:
 Both current-pointer and explicit historical consumers validate completed-run
 provenance bytes, directory/run identity, frozen public dataset and vocabulary
 bindings, checksums, and exact inventory before returning artifact bytes.
-Publication flushes captured regular files, then the completed run directory, then
-the canonical `runs/` directory before writing `current.json`, and finally the
-artifact root after replacing that pointer; a pointer is never returned before
-those POSIX durability barriers succeed.
+Publication retains no-follow descriptors and filesystem identities for the root,
+canonical `runs/` directory, selected run, and captured files. It flushes the
+retained files, completed run directory, and `runs/` directory, revalidates the exact
+entry inventory, identities, and bytes, replaces `current.json` descriptor-relatively,
+and finally flushes the retained artifact root. An exact matching pointer left by a
+failed final root flush may be recovered once by repeating full validation and every
+barrier; successful publication and recovery still reject later refinalization.
 
 Each consumer accepts only its artifact kind's current schema. Missing,
 non-integer, older, and newer versions are rejected before the artifact is used.

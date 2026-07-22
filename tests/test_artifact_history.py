@@ -309,7 +309,7 @@ class ArtifactHistoryTests(unittest.TestCase):
                     run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
                     with (
                         patch(
-                            "src.artifact_history.write_json_atomically",
+                            "src.artifact_history._write_current_index_at",
                             side_effect=OSError("current-index failure"),
                         ),
                         self.assertRaisesRegex(OSError, "current-index failure"),
@@ -348,7 +348,7 @@ class ArtifactHistoryTests(unittest.TestCase):
                 run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
                 with (
                     patch(
-                        "src.artifact_history.write_json_atomically",
+                        "src.artifact_history._write_current_index_at",
                         side_effect=OSError("current-index failure"),
                     ),
                     self.assertRaisesRegex(OSError, "current-index failure"),
@@ -1241,7 +1241,7 @@ class ArtifactHistoryTests(unittest.TestCase):
 
             with (
                 patch(
-                    "src.artifact_history.write_json_atomically",
+                    "src.artifact_history._write_current_index_at",
                     side_effect=OSError("simulated current-index write failure"),
                 ),
                 self.assertRaisesRegex(OSError, "current-index write failure"),
@@ -1265,77 +1265,319 @@ class ArtifactHistoryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cannot be finalized again"):
                 publish_completed_run(root, run)
 
+    def test_publication_rejects_root_and_runs_directory_redirection(self) -> None:
+        for redirected in ("root", "runs"):
+            with (
+                self.subTest(redirected=redirected),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                base = Path(tmpdir)
+                root = base / "artifacts"
+                root.mkdir()
+                run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+                root_identity = (root.stat().st_dev, root.stat().st_ino)
+                runs_identity = (
+                    (root / "runs").stat().st_dev,
+                    (root / "runs").stat().st_ino,
+                )
+                parked = base / f"parked-{redirected}"
+                redirected_once = False
+                real_fsync = os.fsync
+
+                def redirect_after_barrier(descriptor):
+                    nonlocal redirected_once
+                    result = real_fsync(descriptor)
+                    identity = (
+                        os.fstat(descriptor).st_dev,
+                        os.fstat(descriptor).st_ino,
+                    )
+                    if redirected_once or identity != runs_identity:
+                        return result
+                    redirected_once = True
+                    if redirected == "root":
+                        root.rename(parked)
+                        root.mkdir()
+                        (root / "runs").mkdir()
+                    else:
+                        (root / "runs").rename(parked)
+                        (root / "runs").mkdir()
+                    return result
+
+                with (
+                    patch("src.artifact_history.os.fsync", redirect_after_barrier),
+                    self.assertRaisesRegex(ValueError, "changed during finalization"),
+                ):
+                    publish_completed_run(root, run)
+
+                self.assertTrue(redirected_once)
+                parked_identity = (parked.stat().st_dev, parked.stat().st_ino)
+                self.assertEqual(
+                    parked_identity,
+                    root_identity if redirected == "root" else runs_identity,
+                )
+                self.assertFalse((root / "current.json").exists())
+                self.assertFalse((parked / "current.json").exists())
+
+    def test_publication_rejects_artifact_mutation_after_runs_barrier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            runs_stat = (root / "runs").stat()
+            runs_identity = (runs_stat.st_dev, runs_stat.st_ino)
+            metrics_path = run / "metrics.csv"
+            mutated = False
+            real_fsync = os.fsync
+
+            def mutate_after_barrier(descriptor):
+                nonlocal mutated
+                result = real_fsync(descriptor)
+                file_stat = os.fstat(descriptor)
+                if (
+                    not mutated
+                    and (file_stat.st_dev, file_stat.st_ino) == runs_identity
+                ):
+                    mutated = True
+                    metrics_path.write_bytes(b"attacker-controlled")
+                return result
+
+            with (
+                patch("src.artifact_history.os.fsync", mutate_after_barrier),
+                self.assertRaisesRegex(ValueError, "changed during finalization"),
+            ):
+                publish_completed_run(root, run)
+
+            self.assertTrue(mutated)
+            self.assertFalse((root / "current.json").exists())
+
+    def test_publication_rejects_run_directory_replacement_after_barrier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            runs_stat = (root / "runs").stat()
+            runs_identity = (runs_stat.st_dev, runs_stat.st_ino)
+            parked_run = root / "runs" / "parked-run"
+            replaced = False
+            real_fsync = os.fsync
+
+            def replace_after_barrier(descriptor):
+                nonlocal replaced
+                result = real_fsync(descriptor)
+                file_stat = os.fstat(descriptor)
+                if (
+                    not replaced
+                    and (file_stat.st_dev, file_stat.st_ino) == runs_identity
+                ):
+                    replaced = True
+                    run.rename(parked_run)
+                    run.mkdir()
+                return result
+
+            with (
+                patch("src.artifact_history.os.fsync", replace_after_barrier),
+                self.assertRaisesRegex(ValueError, "changed during finalization"),
+            ):
+                publish_completed_run(root, run)
+
+            self.assertTrue(replaced)
+            self.assertFalse((root / "current.json").exists())
+
+    def test_exact_retry_recovers_after_post_replacement_root_fsync_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            root_stat = root.stat()
+            root_identity = (root_stat.st_dev, root_stat.st_ino)
+            failed = False
+            real_fsync = os.fsync
+
+            def fail_pointer_barrier(descriptor):
+                nonlocal failed
+                file_stat = os.fstat(descriptor)
+                if (
+                    not failed
+                    and (file_stat.st_dev, file_stat.st_ino) == root_identity
+                    and (root / "current.json").exists()
+                ):
+                    failed = True
+                    raise OSError("simulated artifact-root fsync failure")
+                return real_fsync(descriptor)
+
+            with (
+                patch("src.artifact_history.os.fsync", fail_pointer_barrier),
+                self.assertRaisesRegex(OSError, "artifact-root fsync failure"),
+            ):
+                publish_completed_run(root, run)
+
+            current_bytes = (root / "current.json").read_bytes()
+            self.assertTrue(failed)
+            self.assertEqual(publish_completed_run(root, run), root / "current.json")
+            self.assertEqual((root / "current.json").read_bytes(), current_bytes)
+            self.assertEqual(resolve_current_run_dir(root), run.resolve())
+
+    def test_successful_exact_recovery_does_not_allow_repeated_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            root_identity = (root.stat().st_dev, root.stat().st_ino)
+            failed = False
+            real_fsync = os.fsync
+
+            def fail_pointer_barrier(descriptor):
+                nonlocal failed
+                file_stat = os.fstat(descriptor)
+                if (
+                    not failed
+                    and (file_stat.st_dev, file_stat.st_ino) == root_identity
+                    and (root / "current.json").exists()
+                ):
+                    failed = True
+                    raise OSError("simulated artifact-root fsync failure")
+                return real_fsync(descriptor)
+
+            with (
+                patch("src.artifact_history.os.fsync", fail_pointer_barrier),
+                self.assertRaises(OSError),
+            ):
+                publish_completed_run(root, run)
+            publish_completed_run(root, run)
+
+            with self.assertRaisesRegex(ValueError, "cannot be finalized again"):
+                publish_completed_run(root, run)
+
+    def test_exact_retry_rejects_mismatched_existing_pointer(self) -> None:
+        for mismatch in ("run_id", "artifact_manifest_checksum"):
+            with (
+                self.subTest(mismatch=mismatch),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+                root_identity = (root.stat().st_dev, root.stat().st_ino)
+                failed = False
+                real_fsync = os.fsync
+
+                def fail_pointer_barrier(descriptor):
+                    nonlocal failed
+                    file_stat = os.fstat(descriptor)
+                    if (
+                        not failed
+                        and (file_stat.st_dev, file_stat.st_ino) == root_identity
+                        and (root / "current.json").exists()
+                    ):
+                        failed = True
+                        raise OSError("simulated artifact-root fsync failure")
+                    return real_fsync(descriptor)
+
+                with (
+                    patch("src.artifact_history.os.fsync", fail_pointer_barrier),
+                    self.assertRaises(OSError),
+                ):
+                    publish_completed_run(root, run)
+
+                current_path = root / "current.json"
+                current = json.loads(current_path.read_bytes())
+                current[mismatch] = (
+                    RUN_IDS[1] if mismatch == "run_id" else "sha256:" + "0" * 64
+                )
+                current_path.write_bytes(canonical_json_bytes(current))
+
+                with self.assertRaisesRegex(ValueError, "cannot be finalized again"):
+                    publish_completed_run(root, run)
+
+    def test_finalization_closes_retained_descriptors_after_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            runs_identity = (
+                (root / "runs").stat().st_dev,
+                (root / "runs").stat().st_ino,
+            )
+            baseline = len(os.listdir("/proc/self/fd"))
+            real_fsync = os.fsync
+
+            def fail_runs_barrier(descriptor):
+                file_stat = os.fstat(descriptor)
+                if (file_stat.st_dev, file_stat.st_ino) == runs_identity:
+                    raise OSError("simulated runs fsync failure")
+                return real_fsync(descriptor)
+
+            for _ in range(3):
+                with (
+                    patch("src.artifact_history.os.fsync", fail_runs_barrier),
+                    self.assertRaisesRegex(OSError, "runs fsync failure"),
+                ):
+                    publish_completed_run(root, run)
+                self.assertEqual(len(os.listdir("/proc/self/fd")), baseline)
+
     def test_publication_crosses_durability_barriers_before_returning_current(
         self,
     ) -> None:
-        from src import artifact_compatibility, artifact_history
+        from src import artifact_history
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
             events: list[str] = []
-            real_sync_files = artifact_history.sync_server_artifact_files
-            real_sync_directory = artifact_compatibility.sync_directory
-            real_run_sync = artifact_history.sync_directory
-            real_write_current = artifact_history.write_json_atomically
+            root_identity = (root.stat().st_dev, root.stat().st_ino)
+            run_identity = (run.stat().st_dev, run.stat().st_ino)
+            runs_identity = (
+                (root / "runs").stat().st_dev,
+                (root / "runs").stat().st_ino,
+            )
+            real_sync_files = artifact_history._sync_retained_files
+            real_sync_directory = artifact_history._sync_retained_directory
+            real_write_current = artifact_history._write_current_index_at
 
-            def sync_files(*args, **kwargs):
-                events.append("captured-files:sync")
-                return real_sync_files(*args, **kwargs)
+            def sync_files(inventory):
+                events.append("files:sync")
+                return real_sync_files(inventory)
 
-            def sync_written_directory(path):
-                events.append(f"atomic-directory:{Path(path).resolve()}")
-                return real_sync_directory(path)
+            def sync_directory(directory):
+                identity = (directory.device, directory.inode)
+                labels = {
+                    root_identity: "root",
+                    runs_identity: "runs",
+                    run_identity: "run",
+                }
+                events.append(f"{labels[identity]}:sync")
+                return real_sync_directory(directory)
 
-            def sync_completed_run(path):
-                events.append(f"history-directory:{Path(path).resolve()}")
-                return real_run_sync(path)
-
-            def write_current(path, payload, *, overwrite=True):
+            def write_current(*args, **kwargs):
                 events.append("current:start")
-                result = real_write_current(path, payload, overwrite=overwrite)
+                result = real_write_current(*args, **kwargs)
                 events.append("current:return")
                 return result
 
             with (
                 patch.object(
                     artifact_history,
-                    "sync_server_artifact_files",
+                    "_sync_retained_files",
                     side_effect=sync_files,
                 ),
                 patch.object(
-                    artifact_compatibility,
-                    "sync_directory",
-                    side_effect=sync_written_directory,
+                    artifact_history,
+                    "_sync_retained_directory",
+                    side_effect=sync_directory,
                 ),
                 patch.object(
                     artifact_history,
-                    "sync_directory",
-                    side_effect=sync_completed_run,
-                ),
-                patch.object(
-                    artifact_history,
-                    "write_json_atomically",
+                    "_write_current_index_at",
                     side_effect=write_current,
                 ),
             ):
                 publish_completed_run(root, run)
 
-            files_sync = events.index("captured-files:sync")
-            completed_manifest_sync = events.index(
-                f"atomic-directory:{run.resolve()}", files_sync
+            files_sync = max(
+                index for index, event in enumerate(events) if event == "files:sync"
             )
-            completed_run_sync = events.index(f"history-directory:{run.resolve()}")
-            runs_root_sync = events.index(
-                f"history-directory:{(root / 'runs').resolve()}"
-            )
+            completed_run_sync = events.index("run:sync", files_sync)
+            runs_root_sync = events.index("runs:sync", completed_run_sync)
             current_start = events.index("current:start")
-            root_sync = events.index(
-                f"atomic-directory:{root.resolve()}", current_start
-            )
+            root_sync = events.index("root:sync", current_start)
             current_return = events.index("current:return")
-            self.assertLess(files_sync, completed_manifest_sync)
-            self.assertLess(completed_manifest_sync, completed_run_sync)
+            self.assertLess(files_sync, completed_run_sync)
             self.assertLess(completed_run_sync, runs_root_sync)
             self.assertLess(runs_root_sync, current_start)
             self.assertLess(current_start, root_sync)
@@ -1345,7 +1587,7 @@ class ArtifactHistoryTests(unittest.TestCase):
     def test_durability_checkpoint_failures_do_not_select_and_are_recoverable(
         self,
     ) -> None:
-        from src import artifact_compatibility, artifact_history
+        from src import artifact_history
 
         for checkpoint in (
             "captured files",
@@ -1361,39 +1603,30 @@ class ArtifactHistoryTests(unittest.TestCase):
                 if checkpoint == "captured files":
                     durability_patch = patch.object(
                         artifact_history,
-                        "sync_server_artifact_files",
+                        "_sync_retained_files",
                         side_effect=OSError("captured-file fsync failure"),
                     )
-                elif checkpoint == "completed manifest directory":
-                    real_sync = artifact_compatibility.sync_directory
-                    run_sync_count = 0
-
-                    def fail_completed_manifest_sync(path):
-                        nonlocal run_sync_count
-                        if Path(path).resolve() == run.resolve():
-                            run_sync_count += 1
-                            if run_sync_count == 3:
-                                raise OSError("completed-directory fsync failure")
-                        return real_sync(path)
-
-                    durability_patch = patch.object(
-                        artifact_compatibility,
-                        "sync_directory",
-                        side_effect=fail_completed_manifest_sync,
-                    )
                 else:
-                    real_sync = artifact_history.sync_directory
-                    canonical_runs_root = (root / "runs").resolve()
+                    real_sync = artifact_history._sync_retained_directory
+                    target_path = (
+                        run
+                        if checkpoint == "completed manifest directory"
+                        else root / "runs"
+                    )
+                    target_identity = (
+                        target_path.stat().st_dev,
+                        target_path.stat().st_ino,
+                    )
 
-                    def fail_runs_root_sync(path):
-                        if Path(path) == canonical_runs_root:
-                            raise OSError("runs-directory fsync failure")
-                        return real_sync(path)
+                    def fail_directory_sync(directory):
+                        if (directory.device, directory.inode) == target_identity:
+                            raise OSError(f"{checkpoint} fsync failure")
+                        return real_sync(directory)
 
                     durability_patch = patch.object(
                         artifact_history,
-                        "sync_directory",
-                        side_effect=fail_runs_root_sync,
+                        "_sync_retained_directory",
+                        side_effect=fail_directory_sync,
                     )
 
                 with durability_patch, self.assertRaisesRegex(OSError, "fsync"):
@@ -1402,56 +1635,6 @@ class ArtifactHistoryTests(unittest.TestCase):
                 self.assertFalse((root / "current.json").exists())
                 publish_completed_run(root, run)
                 self.assertEqual(resolve_current_run_dir(root), run.resolve())
-
-    def test_runs_root_durability_barrier_cannot_be_redirected(self) -> None:
-        from src import artifact_compatibility, artifact_history
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir) / "root"
-            outside = Path(tmpdir) / "outside"
-            root.mkdir()
-            outside.mkdir()
-            run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
-            canonical_runs_root = (root / "runs").resolve()
-            parked_runs_root = root / "parked-runs"
-            targets: list[Path] = []
-            real_sync = artifact_history.sync_directory
-
-            def redirect_runs_root(path):
-                target = Path(path)
-                targets.append(target)
-                if target != canonical_runs_root:
-                    return real_sync(target)
-                canonical_runs_root.rename(parked_runs_root)
-                canonical_runs_root.symlink_to(outside, target_is_directory=True)
-                try:
-                    with patch.object(
-                        artifact_compatibility.os,
-                        "fsync",
-                        wraps=os.fsync,
-                    ) as redirected_fsync:
-                        try:
-                            return real_sync(target)
-                        finally:
-                            redirected_fsync.assert_not_called()
-                finally:
-                    canonical_runs_root.unlink()
-                    parked_runs_root.rename(canonical_runs_root)
-
-            with (
-                patch.object(
-                    artifact_history,
-                    "sync_directory",
-                    side_effect=redirect_runs_root,
-                ),
-                self.assertRaisesRegex(ValueError, "artifact directory is unsafe"),
-            ):
-                publish_completed_run(root, run)
-
-            self.assertEqual(targets, [run.resolve(), canonical_runs_root])
-            self.assertFalse((root / "current.json").exists())
-            publish_completed_run(root, run)
-            self.assertEqual(resolve_current_run_dir(root), run.resolve())
 
     def test_concurrent_finalization_has_exactly_one_publisher(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

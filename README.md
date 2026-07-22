@@ -178,12 +178,15 @@ Client shard identities and checksums are not collected by the server manifest.
 In this demo the operator still created all shards centrally; the boundary only
 describes what ServerApp reads at runtime.
 
-Completed-run publication flushes every captured regular artifact before publishing
-the completed manifest, flushes the run directory after that replacement, flushes
-the canonical `runs/` directory before writing `current.json`, and flushes the
-artifact root after atomically replacing that pointer. A failed pre-pointer
-durability barrier leaves the run unselected and can be retried safely; no
-publication call reports success unless every barrier completes.
+Completed-run publication retains no-follow descriptors and filesystem identities
+for the artifact root, canonical `runs/` directory, selected run, and every captured
+file. It flushes those retained file and directory descriptors, then revalidates the
+entire entry inventory, identities, and bytes immediately before replacing
+`current.json` descriptor-relatively under the retained root. A failed pre-pointer
+durability barrier leaves the run unselected and can be retried safely. If the final
+artifact-root flush fails after replacement, one exact retry may revalidate and
+repeat every barrier for the already matching pointer; later retries remain rejected.
+No publication call reports success unless every required barrier completes.
 
 `artifact-retention-runs` defaults to `10`. Retention orders validated run
 manifests by `(created_at, run_id)`, keeps the newest configured count, and never

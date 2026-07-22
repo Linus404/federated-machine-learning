@@ -8,8 +8,10 @@ import shutil
 import stat
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Iterator, Mapping
 
 if TYPE_CHECKING:
@@ -18,19 +20,18 @@ if TYPE_CHECKING:
 from src.artifact_compatibility import (
     ARTIFACT_SCHEMA_VERSION,
     SERVER_ARTIFACT_MANIFEST_FILENAME,
+    RegularFileSnapshot,
     ServerArtifactSnapshot,
-    capture_server_artifact_files,
+    ServerFinalizationSnapshot,
+    canonical_json_bytes,
     load_server_artifact_snapshot,
     read_regular_file,
     read_regular_file_snapshot,
+    require_secure_artifact_platform,
     sha256_bytes,
     strict_json_loads,
-    sync_directory,
-    sync_server_artifact_files,
     validate_run_provenance_evidence,
-    verify_server_artifact_files,
     write_bytes_atomically,
-    write_json_atomically,
     write_server_artifact_manifest,
 )
 from src.paths import resolve_dir, run_manifest_path
@@ -42,33 +43,510 @@ from src.run_provenance import (
 RUNS_DIRECTORY = "runs"
 CURRENT_RUN_FILENAME = "current.json"
 DEFAULT_ARTIFACT_RETENTION_RUNS = 10
+_PUBLICATION_PENDING = "pending"
+_PUBLICATION_COMPLETE = "complete"
+
+
+@dataclass(frozen=True)
+class _RetainedDirectory:
+    """Keep one directory descriptor and its original filesystem identity."""
+
+    descriptor: int
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class _RetainedFile:
+    """Keep one regular-file descriptor and its immutable capture."""
+
+    descriptor: int
+    snapshot: RegularFileSnapshot
+
+
+@dataclass(frozen=True)
+class _HistoryDescriptors:
+    """Retain the canonical root-to-run directory chain."""
+
+    root_parent: _RetainedDirectory
+    root: _RetainedDirectory
+    runs: _RetainedDirectory
+    run: _RetainedDirectory
+    root_name: str
+    run_name: str
+
+
+def _directory_identity(descriptor: int) -> tuple[int, int]:
+    """Return the stable device and inode identity of a directory descriptor.
+
+    Parameters
+    ----------
+    descriptor : int
+        Open directory descriptor.
+
+    Returns
+    -------
+    tuple of int
+        Device and inode identity.
+    """
+    file_stat = os.fstat(descriptor)
+    if not stat.S_ISDIR(file_stat.st_mode):
+        raise ValueError("artifact history changed during finalization")
+    return file_stat.st_dev, file_stat.st_ino
+
+
+def _open_retained_directory(
+    name: str | Path, *, parent_descriptor: int | None = None
+) -> _RetainedDirectory:
+    """Open one directory without following its final path component.
+
+    Parameters
+    ----------
+    name : str or pathlib.Path
+        Absolute path or descriptor-relative entry name.
+    parent_descriptor : int or None, optional
+        Parent directory descriptor for a relative entry.
+
+    Returns
+    -------
+    _RetainedDirectory
+        Open descriptor and stable identity.
+
+    Raises
+    ------
+    ValueError
+        If the entry is missing, linked, or not a directory.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        descriptor = (
+            os.open(name, flags)
+            if parent_descriptor is None
+            else os.open(name, flags, dir_fd=parent_descriptor)
+        )
+    except OSError as error:
+        raise ValueError("artifact history changed during finalization") from error
+    try:
+        device, inode = _directory_identity(descriptor)
+        return _RetainedDirectory(descriptor, device, inode)
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 @contextmanager
-def _finalization_lock(artifact_root: Path, run_id: str) -> Iterator[None]:
+def _retain_history_descriptors(
+    root: Path, runs_root: Path, run_dir: Path
+) -> Iterator[_HistoryDescriptors]:
+    """Retain the exact root, runs, and selected-run directory chain.
+
+    Parameters
+    ----------
+    root : pathlib.Path
+        Canonical artifact root.
+    runs_root : pathlib.Path
+        Canonical ``runs`` directory.
+    run_dir : pathlib.Path
+        Canonical selected run directory.
+
+    Yields
+    ------
+    _HistoryDescriptors
+        Secure open descriptors for finalization.
+    """
+    require_secure_artifact_platform()
+    retained: list[_RetainedDirectory] = []
+    try:
+        root_parent = _open_retained_directory(root.parent)
+        retained.append(root_parent)
+        root_descriptor = _open_retained_directory(
+            root.name, parent_descriptor=root_parent.descriptor
+        )
+        retained.append(root_descriptor)
+        runs_descriptor = _open_retained_directory(
+            runs_root.name, parent_descriptor=root_descriptor.descriptor
+        )
+        retained.append(runs_descriptor)
+        run_descriptor = _open_retained_directory(
+            run_dir.name, parent_descriptor=runs_descriptor.descriptor
+        )
+        retained.append(run_descriptor)
+        descriptors = _HistoryDescriptors(
+            root_parent,
+            root_descriptor,
+            runs_descriptor,
+            run_descriptor,
+            root.name,
+            run_dir.name,
+        )
+        _verify_history_descriptors(descriptors)
+        yield descriptors
+    finally:
+        for directory in reversed(retained):
+            os.close(directory.descriptor)
+
+
+def _verify_directory_entry(
+    parent_descriptor: int, name: str, retained: _RetainedDirectory
+) -> None:
+    """Require one directory entry to retain its captured identity.
+
+    Parameters
+    ----------
+    parent_descriptor : int
+        Retained parent directory descriptor.
+    name : str
+        Direct child entry name.
+    retained : _RetainedDirectory
+        Expected directory identity.
+
+    Returns
+    -------
+    None
+    """
+    try:
+        current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except OSError as error:
+        raise ValueError("artifact history changed during finalization") from error
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or (current.st_dev, current.st_ino) != (retained.device, retained.inode)
+        or _directory_identity(retained.descriptor) != (retained.device, retained.inode)
+    ):
+        raise ValueError("artifact history changed during finalization")
+
+
+def _verify_history_descriptors(descriptors: _HistoryDescriptors) -> None:
+    """Revalidate every retained directory entry in the history chain.
+
+    Parameters
+    ----------
+    descriptors : _HistoryDescriptors
+        Retained root-to-run descriptor chain.
+
+    Returns
+    -------
+    None
+    """
+    _verify_directory_entry(
+        descriptors.root_parent.descriptor,
+        descriptors.root_name,
+        descriptors.root,
+    )
+    _verify_directory_entry(
+        descriptors.root.descriptor, RUNS_DIRECTORY, descriptors.runs
+    )
+    _verify_directory_entry(
+        descriptors.runs.descriptor, descriptors.run_name, descriptors.run
+    )
+
+
+def _read_descriptor_bytes(descriptor: int) -> tuple[bytes, os.stat_result]:
+    """Read exact bytes while requiring stable descriptor metadata.
+
+    Parameters
+    ----------
+    descriptor : int
+        Open regular-file descriptor.
+
+    Returns
+    -------
+    tuple of bytes and os.stat_result
+        Exact content and stable descriptor metadata.
+    """
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise ValueError("server artifact changed during finalization")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    while chunk := os.read(descriptor, 1024 * 1024):
+        chunks.append(chunk)
+    content = b"".join(chunks)
+    after = os.fstat(descriptor)
+    identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    if (
+        identity
+        != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        or len(content) != after.st_size
+    ):
+        raise ValueError("server artifact changed during finalization")
+    return content, after
+
+
+def _open_retained_file(parent_descriptor: int, name: str) -> _RetainedFile:
+    """Open and capture one no-follow, single-link regular file.
+
+    Parameters
+    ----------
+    parent_descriptor : int
+        Owning directory descriptor.
+    name : str
+        Direct child filename.
+
+    Returns
+    -------
+    _RetainedFile
+        Open descriptor and exact captured bytes and identity.
+    """
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    except OSError as error:
+        raise ValueError("server artifact changed during finalization") from error
+    try:
+        content, file_stat = _read_descriptor_bytes(descriptor)
+        snapshot = RegularFileSnapshot(
+            content,
+            file_stat.st_dev,
+            file_stat.st_ino,
+            file_stat.st_size,
+            file_stat.st_mtime_ns,
+            file_stat.st_ctime_ns,
+        )
+        return _RetainedFile(descriptor, snapshot)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+@contextmanager
+def _capture_run_inventory(
+    run_descriptor: int, *, exclude_manifest: bool
+) -> Iterator[Mapping[str, _RetainedFile]]:
+    """Capture and retain every regular entry in one run directory.
+
+    Parameters
+    ----------
+    run_descriptor : int
+        Retained selected-run directory descriptor.
+    exclude_manifest : bool
+        Omit the artifact manifest while constructing its checksums.
+
+    Yields
+    ------
+    collections.abc.Mapping
+        Immutable filename-to-retained-file mapping.
+    """
+    files: dict[str, _RetainedFile] = {}
+    try:
+        for name in sorted(os.listdir(run_descriptor)):
+            if exclude_manifest and name == SERVER_ARTIFACT_MANIFEST_FILENAME:
+                continue
+            try:
+                files[name] = _open_retained_file(run_descriptor, name)
+            except ValueError as error:
+                raise ValueError("server artifact is missing or unsafe") from error
+        yield MappingProxyType(files)
+    finally:
+        for retained in files.values():
+            os.close(retained.descriptor)
+
+
+def _snapshot_from_inventory(
+    inventory: Mapping[str, _RetainedFile],
+) -> ServerFinalizationSnapshot:
+    """Adapt retained files to the compatibility manifest writer.
+
+    Parameters
+    ----------
+    inventory : mapping of str to _RetainedFile
+        Securely captured finalizable files.
+
+    Returns
+    -------
+    ServerFinalizationSnapshot
+        Immutable compatibility-layer snapshot.
+    """
+    return ServerFinalizationSnapshot(
+        MappingProxyType(
+            {name: retained.snapshot for name, retained in inventory.items()}
+        )
+    )
+
+
+def _verify_run_inventory(
+    run_descriptor: int,
+    inventory: Mapping[str, _RetainedFile],
+    expected_content: Mapping[str, bytes],
+) -> None:
+    """Revalidate exact entries, identities, metadata, and bytes.
+
+    Parameters
+    ----------
+    run_descriptor : int
+        Retained selected-run directory descriptor.
+    inventory : mapping of str to _RetainedFile
+        Entire retained completed-run inventory.
+    expected_content : mapping of str to bytes
+        Validated manifest and artifact bytes.
+
+    Returns
+    -------
+    None
+    """
+    if set(os.listdir(run_descriptor)) != set(inventory) or set(inventory) != set(
+        expected_content
+    ):
+        raise ValueError("server artifact inventory changed during finalization")
+    for name, retained in inventory.items():
+        try:
+            entry = os.stat(name, dir_fd=run_descriptor, follow_symlinks=False)
+        except OSError as error:
+            raise ValueError(
+                f"server artifact changed during finalization: {name}"
+            ) from error
+        captured = retained.snapshot
+        identity = (
+            entry.st_dev,
+            entry.st_ino,
+            entry.st_size,
+            entry.st_mtime_ns,
+            entry.st_ctime_ns,
+        )
+        content, current = _read_descriptor_bytes(retained.descriptor)
+        if (
+            not stat.S_ISREG(entry.st_mode)
+            or entry.st_nlink != 1
+            or identity
+            != (
+                captured.device,
+                captured.inode,
+                captured.size_bytes,
+                captured.modified_ns,
+                captured.changed_ns,
+            )
+            or (current.st_dev, current.st_ino) != (entry.st_dev, entry.st_ino)
+            or content != captured.content
+            or content != expected_content[name]
+        ):
+            raise ValueError(f"server artifact changed during finalization: {name}")
+
+
+def _sync_retained_files(inventory: Mapping[str, _RetainedFile]) -> None:
+    """Flush every retained artifact descriptor.
+
+    Parameters
+    ----------
+    inventory : mapping of str to _RetainedFile
+        Retained regular-file descriptors.
+
+    Returns
+    -------
+    None
+    """
+    for retained in inventory.values():
+        os.fsync(retained.descriptor)
+
+
+def _sync_retained_directory(directory: _RetainedDirectory) -> None:
+    """Flush one retained directory descriptor.
+
+    Parameters
+    ----------
+    directory : _RetainedDirectory
+        Retained directory descriptor.
+
+    Returns
+    -------
+    None
+    """
+    os.fsync(directory.descriptor)
+
+
+@dataclass(frozen=True)
+class _FinalizationLock:
+    """Hold the per-run lock descriptor and durable publication state."""
+
+    descriptor: int
+
+    def state(self) -> tuple[str, str] | None:
+        """Read the publication state stored in the lock file.
+
+        Returns
+        -------
+        tuple of str and str or None
+            State name and artifact-manifest checksum, or ``None`` when no
+            publication attempt has reached pointer replacement.
+        """
+        os.lseek(self.descriptor, 0, os.SEEK_SET)
+        document = os.read(self.descriptor, 256)
+        if not document:
+            return None
+        try:
+            state, checksum = document.decode("ascii").rstrip("\n").split(":", 1)
+        except (UnicodeDecodeError, ValueError) as error:
+            raise ValueError("run finalization state is unsafe") from error
+        checksum = f"sha256:{checksum}"
+        if state not in {_PUBLICATION_PENDING, _PUBLICATION_COMPLETE} or not (
+            len(checksum) == 71
+            and all(character in "0123456789abcdef" for character in checksum[7:])
+        ):
+            raise ValueError("run finalization state is unsafe")
+        return state, checksum
+
+    def record(self, state: str, checksum: str) -> None:
+        """Durably record one publication state transition.
+
+        Parameters
+        ----------
+        state : str
+            ``pending`` before pointer replacement or ``complete`` after every
+            required durability barrier.
+        checksum : str
+            Exact artifact-manifest checksum bound by the pointer.
+
+        Returns
+        -------
+        None
+        """
+        if state not in {_PUBLICATION_PENDING, _PUBLICATION_COMPLETE}:
+            raise ValueError("run finalization state is unsafe")
+        document = f"{state}:{checksum.removeprefix('sha256:')}\n".encode("ascii")
+        os.ftruncate(self.descriptor, 0)
+        os.lseek(self.descriptor, 0, os.SEEK_SET)
+        _write_all(self.descriptor, document)
+        os.fsync(self.descriptor)
+
+
+@contextmanager
+def _finalization_lock(
+    root_descriptor: int, run_id: str
+) -> Iterator[_FinalizationLock]:
     """Serialize finalization attempts for one run across threads and processes.
 
     Parameters
     ----------
-    artifact_root : pathlib.Path
-        Canonical history root that owns the lock file.
+    root_descriptor : int
+        Retained no-follow artifact-root descriptor.
     run_id : str
         Run identity used to isolate unrelated finalizations.
 
     Yields
     ------
-    None
-        Control while the exclusive finalization lock is held.
+    _FinalizationLock
+        Locked descriptor and publication-state access.
 
     Raises
     ------
     ValueError
         If the lock path is not a contained single-link regular file.
     """
-    path = artifact_root / f".{run_id}.finalize.lock"
+    name = f".{run_id}.finalize.lock"
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(path, flags, 0o600)
+        descriptor = os.open(name, flags, 0o600, dir_fd=root_descriptor)
     except OSError as error:
         raise ValueError("run finalization lock is unsafe") from error
     try:
@@ -88,7 +566,7 @@ def _finalization_lock(artifact_root: Path, run_id: str) -> Iterator[None]:
             import fcntl
 
             fcntl.flock(descriptor, fcntl.LOCK_EX)
-        yield
+        yield _FinalizationLock(descriptor)
     finally:
         os.close(descriptor)
 
@@ -166,31 +644,22 @@ def create_run_artifact_dir(
     return run_dir
 
 
-def _load_current_index(artifact_root: str | Path) -> Mapping[str, Any] | None:
-    """Load and validate the atomic current-run index when present.
+def _validate_current_index(document: bytes, *, source: str) -> Mapping[str, Any]:
+    """Validate exact current-run index bytes.
 
     Parameters
     ----------
-    artifact_root : str or pathlib.Path
-        Root containing ``current.json``.
+    document : bytes
+        Exact current pointer bytes.
+    source : str
+        Diagnostic source label.
 
     Returns
     -------
-    collections.abc.Mapping or None
-        Validated index, or ``None`` for a legacy flat directory.
+    collections.abc.Mapping
+        Validated current-run index.
     """
-    root, _ = _history_paths(artifact_root)
-    path = root / CURRENT_RUN_FILENAME
-    if not path.exists() and not path.is_symlink():
-        return None
-    try:
-        document = read_regular_file(path, parent=root)
-    except ValueError as error:
-        raise ValueError(f"invalid current-run index: {path}") from error
-    payload = strict_json_loads(
-        document,
-        source=f"current-run index: {path}",
-    )
+    payload = strict_json_loads(document, source=source)
     if not isinstance(payload, Mapping):
         raise ValueError("current-run index must be a JSON object")
     schema_version = payload.get("schema_version")
@@ -218,6 +687,205 @@ def _load_current_index(artifact_root: str | Path) -> Mapping[str, Any] | None:
     ):
         raise ValueError("current-run index has an invalid artifact manifest checksum")
     return payload
+
+
+def _load_current_index(artifact_root: str | Path) -> Mapping[str, Any] | None:
+    """Load and validate the atomic current-run index when present.
+
+    Parameters
+    ----------
+    artifact_root : str or pathlib.Path
+        Root containing ``current.json``.
+
+    Returns
+    -------
+    collections.abc.Mapping or None
+        Validated index, or ``None`` for a legacy flat directory.
+    """
+    root, _ = _history_paths(artifact_root)
+    path = root / CURRENT_RUN_FILENAME
+    if not path.exists() and not path.is_symlink():
+        return None
+    try:
+        document = read_regular_file(path, parent=root)
+    except ValueError as error:
+        raise ValueError(f"invalid current-run index: {path}") from error
+    return _validate_current_index(document, source=f"current-run index: {path}")
+
+
+def _load_current_index_at(
+    root: Path, root_descriptor: int
+) -> tuple[Mapping[str, Any], bytes] | None:
+    """Load the current index through a retained artifact-root descriptor.
+
+    Parameters
+    ----------
+    root : pathlib.Path
+        Canonical artifact root used for diagnostics.
+    root_descriptor : int
+        Retained artifact-root descriptor.
+
+    Returns
+    -------
+    tuple of mapping and bytes or None
+        Validated payload and exact bytes, or ``None`` when absent.
+    """
+    try:
+        retained = _open_retained_file(root_descriptor, CURRENT_RUN_FILENAME)
+    except ValueError as error:
+        try:
+            os.stat(
+                CURRENT_RUN_FILENAME,
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return None
+        raise ValueError(
+            f"invalid current-run index: {root / CURRENT_RUN_FILENAME}"
+        ) from error
+    try:
+        document = retained.snapshot.content
+    finally:
+        os.close(retained.descriptor)
+    return (
+        _validate_current_index(
+            document, source=f"current-run index: {root / CURRENT_RUN_FILENAME}"
+        ),
+        document,
+    )
+
+
+def _write_all(descriptor: int, content: bytes) -> None:
+    """Write all bytes to one descriptor.
+
+    Parameters
+    ----------
+    descriptor : int
+        Writable regular-file descriptor.
+    content : bytes
+        Exact bytes to write.
+
+    Returns
+    -------
+    None
+    """
+    written = 0
+    while written < len(content):
+        count = os.write(descriptor, content[written:])
+        if count == 0:
+            raise OSError("artifact write made no progress")
+        written += count
+
+
+def _replace_bytes_at(root_descriptor: int, name: str, content: bytes) -> None:
+    """Atomically replace one file descriptor-relatively.
+
+    Parameters
+    ----------
+    root_descriptor : int
+        Retained owning directory descriptor.
+    name : str
+        Direct child destination name.
+    content : bytes
+        Exact replacement bytes.
+
+    Returns
+    -------
+    None
+    """
+    temporary = f".{name}.{uuid.uuid4().hex}.tmp"
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=root_descriptor,
+        )
+        _write_all(descriptor, content)
+        os.fchmod(descriptor, 0o644)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.rename(
+            temporary,
+            name,
+            src_dir_fd=root_descriptor,
+            dst_dir_fd=root_descriptor,
+        )
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=root_descriptor)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _rollback_current_index(
+    descriptors: _HistoryDescriptors, previous_bytes: bytes | None
+) -> None:
+    """Restore the pre-publication pointer after an identity failure.
+
+    Parameters
+    ----------
+    descriptors : _HistoryDescriptors
+        Retained history descriptor chain.
+    previous_bytes : bytes or None
+        Exact prior pointer, or ``None`` when publication created it.
+
+    Returns
+    -------
+    None
+    """
+    if previous_bytes is None:
+        os.unlink(CURRENT_RUN_FILENAME, dir_fd=descriptors.root.descriptor)
+    else:
+        _replace_bytes_at(
+            descriptors.root.descriptor, CURRENT_RUN_FILENAME, previous_bytes
+        )
+    _sync_retained_directory(descriptors.root)
+
+
+def _write_current_index_at(
+    root: Path,
+    descriptors: _HistoryDescriptors,
+    index: Mapping[str, Any],
+    previous_bytes: bytes | None,
+) -> Path:
+    """Publish and durably flush ``current.json`` under the retained root.
+
+    Parameters
+    ----------
+    root : pathlib.Path
+        Canonical artifact root used for the returned path.
+    descriptors : _HistoryDescriptors
+        Retained history descriptor chain.
+    index : mapping of str to Any
+        Valid current-run index payload.
+    previous_bytes : bytes or None
+        Exact prior pointer for fail-closed rollback.
+
+    Returns
+    -------
+    pathlib.Path
+        Published current pointer path.
+    """
+    _verify_history_descriptors(descriptors)
+    _replace_bytes_at(
+        descriptors.root.descriptor,
+        CURRENT_RUN_FILENAME,
+        canonical_json_bytes(index),
+    )
+    try:
+        _verify_history_descriptors(descriptors)
+    except ValueError:
+        _rollback_current_index(descriptors, previous_bytes)
+        raise
+    _sync_retained_directory(descriptors.root)
+    return root / CURRENT_RUN_FILENAME
 
 
 def resolve_current_run_dir(artifact_root: str | Path) -> Path:
@@ -348,92 +1016,229 @@ def publish_completed_run(
     expected_parent = runs_root.resolve(strict=True)
     if resolved_run_dir.parent != expected_parent:
         raise ValueError("run directory must be directly below the artifact runs root")
-    with _finalization_lock(root, resolved_run_dir.name):
-        current = _load_current_index(root)
-        if current is not None and current["run_id"] == resolved_run_dir.name:
-            raise ValueError("completed run cannot be finalized again")
+    with _retain_history_descriptors(
+        root, expected_parent, resolved_run_dir
+    ) as descriptors:
+        with _finalization_lock(
+            descriptors.root.descriptor, resolved_run_dir.name
+        ) as finalization_lock:
+            _verify_history_descriptors(descriptors)
+            current_record = _load_current_index_at(root, descriptors.root.descriptor)
 
-        from src.app_manifest import validate_app_manifest_bytes
+            from src.app_manifest import validate_app_manifest_bytes
 
-        validated_manifest = validate_app_manifest_bytes(
-            app_manifest.manifest_bytes,
-            app_manifest.vocabulary_bytes,
-            vocabulary_path=Path("vocab.txt"),
-        )
-        manifest_path = resolved_run_dir / SERVER_ARTIFACT_MANIFEST_FILENAME
-        if manifest_path.exists():
-            existing_manifest_bytes = read_regular_file(
-                manifest_path, parent=resolved_run_dir
+            validated_manifest = validate_app_manifest_bytes(
+                app_manifest.manifest_bytes,
+                app_manifest.vocabulary_bytes,
+                vocabulary_path=Path("vocab.txt"),
             )
-            existing_snapshot = load_server_artifact_snapshot(
-                resolved_run_dir,
-                manifest_bytes=existing_manifest_bytes,
-                app_manifest=validated_manifest,
-            )
-            if existing_snapshot.manifest.get("lifecycle") != "complete":
-                _retain_public_artifacts(resolved_run_dir, validated_manifest)
-        else:
-            _retain_public_artifacts(resolved_run_dir, validated_manifest)
-
-        try:
-            artifact_snapshot = capture_server_artifact_files(resolved_run_dir)
-        except ValueError as error:
-            raise ValueError("server artifact is missing or unsafe") from error
-        provenance_path = run_manifest_path(resolved_run_dir)
-        provenance_bytes = artifact_snapshot.files["run_manifest.json"].content
-        provenance = load_run_provenance_manifest(
-            provenance_path, manifest_bytes=provenance_bytes
-        )
-        if provenance["run_id"] != resolved_run_dir.name:
-            raise ValueError("run directory does not match its provenance run_id")
-        sync_server_artifact_files(resolved_run_dir, artifact_snapshot)
-        if manifest_path.exists():
-            manifest_bytes = read_regular_file(manifest_path, parent=resolved_run_dir)
-            snapshot = load_server_artifact_snapshot(
-                resolved_run_dir,
-                manifest_bytes=manifest_bytes,
-                app_manifest=validated_manifest,
-            )
-            validate_run_provenance_evidence(
-                provenance, snapshot.manifest, validated_manifest
-            )
-            if snapshot.manifest.get("lifecycle") != "complete":
-                manifest_path = write_server_artifact_manifest(
+            try:
+                os.stat(
+                    SERVER_ARTIFACT_MANIFEST_FILENAME,
+                    dir_fd=descriptors.run.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                existing_manifest_bytes = None
+                existing_snapshot = None
+            else:
+                retained_existing_manifest = _open_retained_file(
+                    descriptors.run.descriptor,
+                    SERVER_ARTIFACT_MANIFEST_FILENAME,
+                )
+                try:
+                    existing_manifest_bytes = (
+                        retained_existing_manifest.snapshot.content
+                    )
+                finally:
+                    os.close(retained_existing_manifest.descriptor)
+                existing_snapshot = load_server_artifact_snapshot(
                     resolved_run_dir,
+                    manifest_bytes=existing_manifest_bytes,
                     app_manifest=validated_manifest,
-                    finalized=True,
-                    artifact_snapshot=artifact_snapshot,
                 )
-                manifest_bytes = read_regular_file(
-                    manifest_path, parent=resolved_run_dir
-                )
-            elif dict(snapshot.files) != {
-                name: retained.content
-                for name, retained in artifact_snapshot.files.items()
-            }:
-                raise ValueError("completed run differs from its retained snapshot")
-        else:
-            manifest_path = write_server_artifact_manifest(
-                resolved_run_dir,
-                app_manifest=validated_manifest,
-                finalized=True,
-                artifact_snapshot=artifact_snapshot,
+            was_complete = (
+                existing_snapshot is not None
+                and existing_snapshot.manifest.get("lifecycle") == "complete"
             )
-            manifest_bytes = read_regular_file(manifest_path, parent=resolved_run_dir)
-        load_server_artifact_snapshot(
-            resolved_run_dir,
-            manifest_bytes=manifest_bytes,
-            app_manifest=validated_manifest,
-        )
-        verify_server_artifact_files(resolved_run_dir, artifact_snapshot)
-        sync_directory(resolved_run_dir)
-        sync_directory(expected_parent)
-        index = {
-            "schema_version": ARTIFACT_SCHEMA_VERSION,
-            "run_id": resolved_run_dir.name,
-            "artifact_manifest_checksum": sha256_bytes(manifest_bytes),
-        }
-        return write_json_atomically(root / CURRENT_RUN_FILENAME, index)
+            if not was_complete:
+                _retain_public_artifacts(resolved_run_dir, validated_manifest)
+                _verify_history_descriptors(descriptors)
+
+            try:
+                inventory_context = _capture_run_inventory(
+                    descriptors.run.descriptor, exclude_manifest=True
+                )
+                with inventory_context as artifact_inventory:
+                    artifact_snapshot = _snapshot_from_inventory(artifact_inventory)
+                    provenance_path = run_manifest_path(resolved_run_dir)
+                    try:
+                        provenance_bytes = artifact_snapshot.files[
+                            "run_manifest.json"
+                        ].content
+                    except KeyError as error:
+                        raise ValueError(
+                            "server artifact is missing or unsafe"
+                        ) from error
+                    provenance = load_run_provenance_manifest(
+                        provenance_path, manifest_bytes=provenance_bytes
+                    )
+                    if provenance["run_id"] != resolved_run_dir.name:
+                        raise ValueError(
+                            "run directory does not match its provenance run_id"
+                        )
+                    _sync_retained_files(artifact_inventory)
+                    _verify_history_descriptors(descriptors)
+
+                    if existing_manifest_bytes is not None:
+                        snapshot = load_server_artifact_snapshot(
+                            resolved_run_dir,
+                            manifest_bytes=existing_manifest_bytes,
+                            app_manifest=validated_manifest,
+                        )
+                        validate_run_provenance_evidence(
+                            provenance, snapshot.manifest, validated_manifest
+                        )
+                        if snapshot.manifest.get("lifecycle") != "complete":
+                            write_server_artifact_manifest(
+                                resolved_run_dir,
+                                app_manifest=validated_manifest,
+                                finalized=True,
+                                artifact_snapshot=artifact_snapshot,
+                            )
+                        elif dict(snapshot.files) != {
+                            name: retained.snapshot.content
+                            for name, retained in artifact_inventory.items()
+                        }:
+                            raise ValueError(
+                                "completed run differs from its retained snapshot"
+                            )
+                    else:
+                        write_server_artifact_manifest(
+                            resolved_run_dir,
+                            app_manifest=validated_manifest,
+                            finalized=True,
+                            artifact_snapshot=artifact_snapshot,
+                        )
+                    _verify_history_descriptors(descriptors)
+                    retained_manifest = _open_retained_file(
+                        descriptors.run.descriptor,
+                        SERVER_ARTIFACT_MANIFEST_FILENAME,
+                    )
+                    try:
+                        manifest_bytes = retained_manifest.snapshot.content
+                        snapshot = load_server_artifact_snapshot(
+                            resolved_run_dir,
+                            manifest_bytes=manifest_bytes,
+                            app_manifest=validated_manifest,
+                        )
+                        validate_run_provenance_evidence(
+                            provenance, snapshot.manifest, validated_manifest
+                        )
+                        expected_content = {
+                            SERVER_ARTIFACT_MANIFEST_FILENAME: manifest_bytes,
+                            **dict(snapshot.files),
+                        }
+                        completed_inventory = MappingProxyType(
+                            {
+                                **dict(artifact_inventory),
+                                SERVER_ARTIFACT_MANIFEST_FILENAME: retained_manifest,
+                            }
+                        )
+                        _verify_run_inventory(
+                            descriptors.run.descriptor,
+                            completed_inventory,
+                            expected_content,
+                        )
+                        checksum = sha256_bytes(manifest_bytes)
+                        index = {
+                            "schema_version": ARTIFACT_SCHEMA_VERSION,
+                            "run_id": resolved_run_dir.name,
+                            "artifact_manifest_checksum": checksum,
+                        }
+                        state = finalization_lock.state()
+                        if was_complete:
+                            if state != (_PUBLICATION_PENDING, checksum):
+                                raise ValueError(
+                                    "completed run cannot be finalized again"
+                                )
+                        elif state is None:
+                            finalization_lock.record(_PUBLICATION_PENDING, checksum)
+                            _sync_retained_directory(descriptors.root)
+                            state = (_PUBLICATION_PENDING, checksum)
+                        elif state != (_PUBLICATION_PENDING, checksum):
+                            raise ValueError("run finalization state is unsafe")
+                        _sync_retained_files(completed_inventory)
+                        _sync_retained_directory(descriptors.run)
+                        _sync_retained_directory(descriptors.runs)
+                        _verify_history_descriptors(descriptors)
+                        _verify_run_inventory(
+                            descriptors.run.descriptor,
+                            completed_inventory,
+                            expected_content,
+                        )
+
+                        if current_record is not None:
+                            current, current_bytes = current_record
+                            exact_current = (
+                                current["run_id"] == resolved_run_dir.name
+                                and current["artifact_manifest_checksum"] == checksum
+                            )
+                            if exact_current and state == (
+                                _PUBLICATION_PENDING,
+                                checksum,
+                            ):
+                                _sync_retained_directory(descriptors.root)
+                                _verify_history_descriptors(descriptors)
+                                _verify_run_inventory(
+                                    descriptors.run.descriptor,
+                                    completed_inventory,
+                                    expected_content,
+                                )
+                                recovered = _load_current_index_at(
+                                    root, descriptors.root.descriptor
+                                )
+                                if recovered != current_record:
+                                    raise ValueError(
+                                        "current-run index changed during finalization"
+                                    )
+                                finalization_lock.record(
+                                    _PUBLICATION_COMPLETE, checksum
+                                )
+                                return root / CURRENT_RUN_FILENAME
+                            if was_complete:
+                                raise ValueError(
+                                    "completed run cannot be finalized again"
+                                )
+
+                        _verify_history_descriptors(descriptors)
+                        _verify_run_inventory(
+                            descriptors.run.descriptor,
+                            completed_inventory,
+                            expected_content,
+                        )
+                        previous_bytes = (
+                            None if current_record is None else current_record[1]
+                        )
+                        pointer = _write_current_index_at(
+                            root, descriptors, index, previous_bytes
+                        )
+                        try:
+                            _verify_history_descriptors(descriptors)
+                            _verify_run_inventory(
+                                descriptors.run.descriptor,
+                                completed_inventory,
+                                expected_content,
+                            )
+                        except ValueError:
+                            _rollback_current_index(descriptors, previous_bytes)
+                            raise
+                        finalization_lock.record(_PUBLICATION_COMPLETE, checksum)
+                        return pointer
+                    finally:
+                        os.close(retained_manifest.descriptor)
+            except FileNotFoundError as error:
+                raise ValueError("server artifact is missing or unsafe") from error
 
 
 def prune_run_history(
