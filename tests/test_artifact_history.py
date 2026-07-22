@@ -14,7 +14,12 @@ from src.artifact_history import (
     publish_completed_run,
     resolve_current_run_dir,
 )
+from src.artifact_compatibility import (
+    ARTIFACT_SCHEMA_VERSION,
+    write_server_artifact_manifest,
+)
 from src.run_provenance import write_run_provenance_manifest
+from tests.artifact_helpers import fake_app_manifest
 from tests.test_run_provenance import runtime_environment
 
 
@@ -58,6 +63,7 @@ def create_run(root: Path, run_id: str, created_at: str) -> Path:
     (run_dir / "metrics.csv").write_text(
         "round,loss,accuracy\n1,0.5,0.75\n", encoding="utf-8"
     )
+    write_server_artifact_manifest(run_dir, app_manifest=fake_app_manifest())
     return run_dir
 
 
@@ -125,6 +131,41 @@ class ArtifactHistoryTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "invalid run_id"):
                 resolve_current_run_dir(root)
+
+    def test_current_index_checks_each_schema_version_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            current = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            index_path = publish_completed_run(root, current)
+            valid_index = json.loads(index_path.read_text(encoding="utf-8"))
+            missing = object()
+            versions = (
+                missing,
+                None,
+                False,
+                True,
+                float(ARTIFACT_SCHEMA_VERSION),
+                ARTIFACT_SCHEMA_VERSION - 1,
+                ARTIFACT_SCHEMA_VERSION,
+                ARTIFACT_SCHEMA_VERSION + 1,
+            )
+
+            for version in versions:
+                payload = dict(valid_index)
+                if version is missing:
+                    payload.pop("schema_version")
+                else:
+                    payload["schema_version"] = version
+                index_path.write_text(json.dumps(payload), encoding="utf-8")
+
+                with self.subTest(version="missing" if version is missing else version):
+                    if type(version) is int and version == ARTIFACT_SCHEMA_VERSION:
+                        self.assertEqual(
+                            resolve_current_run_dir(root), current.resolve()
+                        )
+                    else:
+                        with self.assertRaisesRegex(ValueError, "schema_version"):
+                            resolve_current_run_dir(root)
 
     def test_retention_refuses_a_symlinked_runs_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -204,7 +245,7 @@ class ArtifactHistoryTests(unittest.TestCase):
             except OSError as error:
                 self.skipTest(f"file symlinks are unavailable: {error}")
 
-            with self.assertRaisesRegex(ValueError, "contained regular file"):
+            with self.assertRaisesRegex(ValueError, "missing or unsafe"):
                 publish_completed_run(root, run)
 
     def test_completed_run_cannot_be_finalized_twice(self) -> None:

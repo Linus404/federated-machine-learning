@@ -112,7 +112,7 @@ class ClientConfigTests(unittest.TestCase):
             )
 
         load_shard.assert_called_once_with(
-            client_app.resolve_dir("client-0"), manifest, 0.2
+            client_app.resolve_dir("client-0"), manifest, 0, 0.2
         )
         build_from_manifest.assert_called_once_with(manifest)
         self.assertIs(client.model, model)

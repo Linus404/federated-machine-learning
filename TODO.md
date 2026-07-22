@@ -18,7 +18,7 @@ federated learning system.
 
 ## P0 — Scientific validation
 
-- [ ] Define a fixed, untouched global test set.
+- [x] Define a fixed, untouched global test set.
 - [ ] Add a centralized-training baseline.
 - [ ] Compare local-only, FedAvg, FedProx, and FedProx plus Huber aggregation.
 - [ ] Compare IID and multiple non-IID partition settings.
@@ -29,9 +29,10 @@ federated learning system.
 - [ ] Publish reproducible commands and a results table in the README.
 - [ ] Store the code version, run configuration, dataset version, seeds, and artifact checksums for every experiment.
   - Partial: each run now records code/configuration/environment metadata, known
-    seeds, public-artifact checksums, and completed model/metrics/provenance
-    checksums for federated and local training. Experiment-level private dataset
-    identities remain part of the fixed-test-set and published experiment work.
+    seeds, exact public training-dataset identity/checksums, and completed
+    model/metrics/provenance checksums for federated and local training.
+    Experiment-level test-artifact and client-shard checksum bindings remain part
+    of the published experiment work.
 
 ## P0 — Privacy and security claims
 

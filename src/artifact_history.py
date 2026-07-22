@@ -11,7 +11,10 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, Iterator, Mapping
+
+if TYPE_CHECKING:
+    from src.app_manifest import AppManifest
 
 from src.artifact_compatibility import (
     ARTIFACT_SCHEMA_VERSION,
@@ -110,6 +113,7 @@ def create_run_artifact_dir(
     run_config: Mapping[str, Any],
     *,
     public_artifact_dir: str | Path | None = None,
+    client_shard: Mapping[str, Any] | None = None,
     flower_run_id: int | None = None,
 ) -> Path:
     """Create one immutable run namespace and its provenance manifest.
@@ -122,6 +126,8 @@ def create_run_artifact_dir(
         Complete training configuration.
     public_artifact_dir : str or pathlib.Path or None, optional
         Public artifacts used by this run.
+    client_shard : mapping of str to Any or None, optional
+        Validated private-shard evidence for a local-training run.
     flower_run_id : int or None, optional
         Flower infrastructure run identifier.
 
@@ -139,6 +145,7 @@ def create_run_artifact_dir(
             run_dir,
             run_config,
             public_artifact_dir=public_artifact_dir,
+            client_shard=client_shard,
             flower_run_id=flower_run_id,
             run_id=run_id,
         )
@@ -171,7 +178,8 @@ def _load_current_index(artifact_root: str | Path) -> Mapping[str, Any] | None:
         raise ValueError(f"invalid current-run index: {path}") from error
     if not isinstance(payload, Mapping):
         raise ValueError("current-run index must be a JSON object")
-    if payload.get("schema_version") != ARTIFACT_SCHEMA_VERSION:
+    version = payload.get("schema_version")
+    if type(version) is not int or version != ARTIFACT_SCHEMA_VERSION:
         raise ValueError("current-run index has an unsupported schema_version")
     run_id = payload.get("run_id")
     checksum = payload.get("artifact_manifest_checksum")
@@ -214,13 +222,17 @@ def resolve_current_run_dir(artifact_root: str | Path) -> Path:
     return load_current_run_snapshot(root).directory
 
 
-def load_current_run_snapshot(artifact_root: str | Path) -> ServerArtifactSnapshot:
+def load_current_run_snapshot(
+    artifact_root: str | Path, *, app_manifest: AppManifest | None = None
+) -> ServerArtifactSnapshot:
     """Read the selected run into a checksum-verified immutable snapshot.
 
     Parameters
     ----------
     artifact_root : str or pathlib.Path
         Root containing run history or legacy flat artifacts.
+    app_manifest : AppManifest or None, optional
+        Configured public snapshot that the selected server artifact must match.
 
     Returns
     -------
@@ -230,7 +242,7 @@ def load_current_run_snapshot(artifact_root: str | Path) -> ServerArtifactSnapsh
     root, runs_root = _history_paths(artifact_root)
     index = _load_current_index(root)
     if index is None:
-        return load_server_artifact_snapshot(root)
+        return load_server_artifact_snapshot(root, app_manifest=app_manifest)
     run_dir = runs_root / str(index["run_id"])
     if run_dir.is_symlink() or not run_dir.is_dir():
         raise ValueError(f"current run directory is missing or unsafe: {run_dir}")
@@ -249,7 +261,9 @@ def load_current_run_snapshot(artifact_root: str | Path) -> ServerArtifactSnapsh
     ):
         raise ValueError("current-run artifact manifest checksum does not match")
     return load_server_artifact_snapshot(
-        canonical_run_dir, manifest_bytes=manifest_bytes
+        canonical_run_dir,
+        manifest_bytes=manifest_bytes,
+        app_manifest=app_manifest,
     )
 
 

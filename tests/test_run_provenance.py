@@ -6,31 +6,96 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.artifact_compatibility import ARTIFACT_SCHEMA_VERSION
+from src.artifact_compatibility import (
+    ARTIFACT_SCHEMA_VERSION,
+    PUBLIC_ARTIFACT_SCHEMA_VERSION,
+    canonical_json_bytes,
+)
 from src.run_provenance import (
     _code_revision,
+    _dataset_metadata,
     _environment_metadata,
     load_run_provenance_manifest,
     write_run_provenance_manifest,
 )
 
 
-def write_public_dataset_contract(path: Path) -> None:
-    vocabulary = "\n[UNK]\ngood\nbad\n"
-    (path / "vocab.txt").write_text(vocabulary, encoding="utf-8")
-    (path / "manifest.json").write_text(
-        json.dumps(
+def write_public_dataset_contract(path: Path) -> dict[str, object]:
+    """Write a small valid public contract and return its frozen protocol.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Public artifact directory.
+
+    Returns
+    -------
+    dict of str to object
+        Frozen protocol matching the test artifact.
+    """
+    vocabulary = b"\n[UNK]\ngood\nbad\n"
+    vocabulary_sha256 = hashlib.sha256(vocabulary).hexdigest()
+    (path / "vocab.txt").write_bytes(vocabulary)
+    dataset = {
+        "id": "stanfordnlp/imdb",
+        "config": "plain_text",
+        "revision": "e6281661ce1c48d982bc483cf8a173c1bbeb5d31",
+        "datasets_version": "4.8.5",
+        "split": "train",
+        "rows": 25000,
+        "raw_parquet_sha256": "db47d16b" + "0" * 56,
+        "content_sha256": "4639bf10" + "0" * 56,
+    }
+    (path / "manifest.json").write_bytes(
+        canonical_json_bytes(
             {
-                "schema_version": ARTIFACT_SCHEMA_VERSION,
+                "schema_version": PUBLIC_ARTIFACT_SCHEMA_VERSION,
                 "embedding_dim": 100,
                 "sequence_length": 500,
                 "vocabulary_size": 4,
-                "vocabulary": {"filename": "vocab.txt"},
-                "provenance": "stanfordnlp/imdb training split",
+                "vocabulary": {
+                    "filename": "vocab.txt",
+                    "sha256": vocabulary_sha256,
+                    "size_bytes": len(vocabulary),
+                },
+                "dataset": dataset,
             }
-        ),
-        encoding="utf-8",
+        )
     )
+    return {
+        "dataset": {
+            **{
+                key: dataset[key]
+                for key in (
+                    "id",
+                    "config",
+                    "revision",
+                    "datasets_version",
+                )
+            },
+            "splits": {
+                "train": {
+                    key: dataset[key]
+                    for key in (
+                        "rows",
+                        "raw_parquet_sha256",
+                        "content_sha256",
+                    )
+                }
+            },
+        },
+        "preprocessing": {
+            "vocabulary_size": 4,
+            "max_tokens": 4,
+            "output_sequence_length": 500,
+            "vocabulary_sha256": vocabulary_sha256,
+        },
+        "model": {
+            "vocabulary_size": 4,
+            "sequence_length": 500,
+            "embedding_dimension": 100,
+        },
+    }
 
 
 def runtime_environment() -> dict[str, object]:
@@ -58,6 +123,46 @@ def runtime_environment() -> dict[str, object]:
 
 
 class RunProvenanceTests(unittest.TestCase):
+    def test_public_checksums_use_the_same_snapshot_as_validation(self) -> None:
+        from src.app_manifest import load_app_manifest
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            public_dir = Path(tmpdir) / "public"
+            public_dir.mkdir()
+            protocol = write_public_dataset_contract(public_dir)
+            manifest_path = public_dir / "manifest.json"
+            vocabulary_path = public_dir / "vocab.txt"
+            manifest_bytes = manifest_path.read_bytes()
+            vocabulary_bytes = vocabulary_path.read_bytes()
+
+            def load_then_mutate(**kwargs):
+                snapshot = load_app_manifest(protocol=protocol, **kwargs)
+                mutated_manifest = manifest_path.read_bytes().replace(
+                    b'"rows": 25000', b'"rows": 35000'
+                )
+                self.assertEqual(len(mutated_manifest), len(manifest_bytes))
+                manifest_path.write_bytes(mutated_manifest)
+                vocabulary_path.write_bytes(
+                    vocabulary_path.read_bytes().replace(b"good", b"evil")
+                )
+                return snapshot
+
+            with patch(
+                "src.run_provenance.load_app_manifest",
+                side_effect=load_then_mutate,
+            ):
+                metadata = _dataset_metadata(public_dir)
+
+        self.assertEqual(
+            metadata["checksums"]["manifest.json"],
+            "sha256:" + hashlib.sha256(manifest_bytes).hexdigest(),
+        )
+        self.assertEqual(
+            metadata["checksums"]["vocab.txt"],
+            "sha256:" + hashlib.sha256(vocabulary_bytes).hexdigest(),
+        )
+        self.assertEqual(json.loads(metadata["identity"])["rows"], 25000)
+
     def test_linux_environment_uses_tensorflow_cpu_distribution_version(self) -> None:
         versions = {
             "datasets": "4.8.5",
@@ -110,7 +215,7 @@ class RunProvenanceTests(unittest.TestCase):
             public_dir = root / "public"
             server_dir = root / "server"
             public_dir.mkdir()
-            write_public_dataset_contract(public_dir)
+            protocol = write_public_dataset_contract(public_dir)
             run_config = {
                 "num-server-rounds": 3,
                 "public-artifact-dir": public_dir,
@@ -134,6 +239,10 @@ class RunProvenanceTests(unittest.TestCase):
                 patch(
                     "src.run_provenance._environment_metadata",
                     return_value=runtime_environment(),
+                ),
+                patch(
+                    "src.app_manifest.load_scientific_protocol",
+                    return_value=protocol,
                 ),
             ):
                 manifest_path = write_run_provenance_manifest(
@@ -163,7 +272,22 @@ class RunProvenanceTests(unittest.TestCase):
             self.assertEqual(payload["seeds"]["run_config"], {"random-seed": 19})
             self.assertEqual(
                 payload["dataset"]["identity"],
-                "stanfordnlp/imdb training split",
+                json.dumps(
+                    {
+                        "id": "stanfordnlp/imdb",
+                        "config": "plain_text",
+                        "revision": "e6281661ce1c48d982bc483cf8a173c1bbeb5d31",
+                        "datasets_version": "4.8.5",
+                        "split": "train",
+                        "rows": 25000,
+                        "raw_parquet_sha256": "db47d16b" + "0" * 56,
+                        "content_sha256": "4639bf10" + "0" * 56,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ),
             )
             manifest_bytes = (public_dir / "manifest.json").read_bytes()
             self.assertEqual(
@@ -174,6 +298,77 @@ class RunProvenanceTests(unittest.TestCase):
                 payload["dataset"]["private_client_shards"]["status"],
                 "not_collected",
             )
+
+    def test_hostile_public_identity_is_rejected_and_not_recorded(self) -> None:
+        for field, value in (("split", "test"), ("id", "attacker/test-derived")):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                public_dir = root / "public"
+                server_dir = root / "server"
+                public_dir.mkdir()
+                protocol = write_public_dataset_contract(public_dir)
+                manifest_path = public_dir / "manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest["dataset"][field] = value
+                manifest_path.write_bytes(canonical_json_bytes(manifest))
+
+                with (
+                    patch(
+                        "src.app_manifest.load_scientific_protocol",
+                        return_value=protocol,
+                    ),
+                    self.assertRaisesRegex(ValueError, "dataset identity"),
+                ):
+                    write_run_provenance_manifest(
+                        server_dir,
+                        {},
+                        public_artifact_dir=public_dir,
+                    )
+
+                self.assertFalse((server_dir / "run_manifest.json").exists())
+
+    def test_hostile_public_vocabulary_is_rejected_and_not_recorded(self) -> None:
+        mutations = {
+            "path": lambda manifest, vocabulary: manifest["vocabulary"].__setitem__(
+                "filename", "../vocab.txt"
+            ),
+            "length": lambda manifest, vocabulary: manifest["vocabulary"].__setitem__(
+                "size_bytes", vocabulary.stat().st_size + 1
+            ),
+            "declared checksum": lambda manifest, vocabulary: manifest[
+                "vocabulary"
+            ].__setitem__("sha256", "f" * 64),
+            "artifact checksum": lambda manifest, vocabulary: vocabulary.write_bytes(
+                vocabulary.read_bytes() + b"attacker"
+            ),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                public_dir = root / "public"
+                server_dir = root / "server"
+                public_dir.mkdir()
+                protocol = write_public_dataset_contract(public_dir)
+                manifest_path = public_dir / "manifest.json"
+                vocabulary_path = public_dir / "vocab.txt"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                mutate(manifest, vocabulary_path)
+                manifest_path.write_bytes(canonical_json_bytes(manifest))
+
+                with (
+                    patch(
+                        "src.app_manifest.load_scientific_protocol",
+                        return_value=protocol,
+                    ),
+                    self.assertRaises(ValueError),
+                ):
+                    write_run_provenance_manifest(
+                        server_dir,
+                        {},
+                        public_artifact_dir=public_dir,
+                    )
+
+                self.assertFalse((server_dir / "run_manifest.json").exists())
 
     def test_manifest_is_immutable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

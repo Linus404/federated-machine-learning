@@ -10,19 +10,14 @@ This project uses [uv](https://docs.astral.sh/uv/) to manage Python versions and
 
 ### Install uv
 
-**Windows (PowerShell)**
-
-```powershell
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
-
-If execution is blocked, run `Set-ExecutionPolicy RemoteSigned -Scope CurrentUser` first.
-
 **macOS / Linux**
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
+
+The project requires POSIX filesystem semantics. On Windows, use WSL 2 rather
+than native PowerShell.
 
 ### Install dependencies
 
@@ -30,21 +25,37 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync
 ```
 
+Every documented local Python entry point uses `--env-file .env.protocol` so the
+frozen hash seed, Keras backend, and TensorFlow determinism settings exist before
+the interpreter starts. Missing or conflicting startup values are rejected; do
+not set them later from Python code.
+
 ## Artifact preparation
 
-Prepare the raw client shards and shared public vocabulary:
+Prepare the raw client shards, shared public vocabulary, and immutable untouched
+evaluation dataset:
 
 ```bash
-uv run python -m src.data_prep --partitions 4 --client-shard-dir artifacts/clients --public-artifact-dir artifacts/public
+uv run --env-file .env.protocol python -m src.data_prep --partitions 4 --client-shard-dir artifacts/clients --public-artifact-dir artifacts/public --evaluation-artifact-dir artifacts/evaluation
 ```
 
-This command loads IMDB once on the operator's machine, reads the complete
-training split, creates every raw review/label shard, and publishes a vocabulary
-adapted on the complete split. The generated directories simulate client-scoped
+This command loads `stanfordnlp/imdb` configuration `plain_text` at the frozen
+revision, verifies every official split and raw/content SHA-256, creates every raw
+review/label shard from the training split only, and publishes a vocabulary
+adapted on that same split. It writes the official test split in ascending source
+order to the selected prepared generation, with stable `test:<row-index>`
+identities and a strict checksum manifest. One atomic `.prepared-current`
+switch selects the matching client, public, and evaluation directories together;
+an interruption leaves the prior generation selected. The unsupervised split is
+verified and excluded. The
+generated directories simulate client-scoped
 storage only after this centralized preparation; they are not evidence that data
 originated at or remained hidden within independent organizations. Clients
 tokenize their own mounted reviews, and no centrally tokenized partitions are
-generated.
+generated. The evaluation directory is immutable and evaluation-only: it must not
+be mounted into ClientApp, the dashboard, or the current training ServerApp. PR14
+and PR15 will add the registered consumers and metrics; this command performs no
+evaluation.
 
 The server does not read raw shard files during training, but it receives each
 client's resulting model parameters, sample counts, training metrics, and
@@ -55,7 +66,7 @@ trainable embedding, not pretrained GloVe vectors or an embedding matrix.
 Train one client locally from its raw shard:
 
 ```bash
-uv run python -m src.local_training --client-data-dir artifacts/clients/client-0 --public-artifact-dir artifacts/public --run-artifact-dir artifacts/local-runs
+uv run --env-file .env.protocol python -m src.local_training --client-data-dir artifacts/clients/client-0 --public-artifact-dir artifacts/public --run-artifact-dir artifacts/local-runs
 ```
 
 The local command treats `--run-artifact-dir` as a reusable history root. Every
@@ -68,31 +79,26 @@ Run the Flower app directly using the per-partition raw directories generated
 above. This is the fast local development path and does not use Docker:
 
 ```bash
-uv run flwr run . --stream --federation-config "num-supernodes=4"
+uv run --env-file .env.protocol flwr run . --stream --federation-config "num-supernodes=4"
 ```
 
 Run the dashboard against the selected server artifact directory:
 
 ```bash
-FML_SERVER_ARTIFACT_DIR=artifacts/server uv run streamlit run dashboard.py
-```
-
-On PowerShell:
-
-```powershell
-$env:FML_SERVER_ARTIFACT_DIR = "artifacts/server"
-uv run streamlit run dashboard.py
+FML_SERVER_ARTIFACT_DIR=artifacts/server uv run --env-file .env.protocol streamlit run dashboard.py
 ```
 
 ### Runtime paths
 
 The Flower configuration uses separate paths for public artifacts, server output,
-and raw client shards. Its default client path is
+and raw client shards. Data preparation also uses the separate evaluation-only
+path `artifacts/evaluation`, overridable with `--evaluation-artifact-dir` or
+`FML_EVALUATION_ARTIFACT_DIR`. Its default client path is
 `artifacts/clients/client-{partition}`. You can override paths with Flower run
 config, for example:
 
 ```bash
-uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "client-data-dir='artifacts/clients/client-{partition}' server-artifact-dir='artifacts/server' public-artifact-dir='artifacts/public'"
+uv run --env-file .env.protocol flwr run . --stream --federation-config "num-supernodes=4" --run-config "client-data-dir='artifacts/clients/client-{partition}' server-artifact-dir='artifacts/server' public-artifact-dir='artifacts/public'"
 ```
 
 The dashboard reads the completed run selected by the atomic `current.json` index
@@ -105,10 +111,10 @@ The server never clears its configured artifact root. It writes each experiment 
 metrics, provenance, and verified SHA-256 checksums. Existing completed runs remain
 available for comparison:
 
-```powershell
-uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "use-update-noise=false use-huber=false"
-uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "use-update-noise=false use-huber=true huber-threshold=10.0"
-uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "use-update-noise=true use-huber=false"
+```bash
+uv run --env-file .env.protocol flwr run . --stream --federation-config "num-supernodes=4" --run-config "use-update-noise=false use-huber=false"
+uv run --env-file .env.protocol flwr run . --stream --federation-config "num-supernodes=4" --run-config "use-update-noise=false use-huber=true huber-threshold=10.0"
+uv run --env-file .env.protocol flwr run . --stream --federation-config "num-supernodes=4" --run-config "use-update-noise=true use-huber=false"
 ```
 
 `use-huber` enables an experimental robust aggregation path for outlier-resistance
@@ -137,11 +143,11 @@ directories are left untouched for manual recovery.
 
 ## Local distributed Docker runtime
 
-Prepare the four client shards and public artifacts on the host before starting
-the runtime:
+Prepare the four client shards, public artifacts, and host-only evaluation
+artifact before starting the runtime:
 
 ```bash
-uv run python -m src.data_prep --partitions 4 --client-shard-dir artifacts/clients --public-artifact-dir artifacts/public
+uv run --env-file .env.protocol python -m src.data_prep --partitions 4 --client-shard-dir artifacts/clients --public-artifact-dir artifacts/public --evaluation-artifact-dir artifacts/evaluation
 ```
 
 Build the single application image and start the separate SuperLink, ServerApp,
@@ -157,8 +163,8 @@ ClientApp without adding repository metadata to the image.
 Submit the Flower app to the running local federation:
 
 ```bash
-uv run python -m src.flower_config
-uv run flwr run . local-docker --stream
+uv run --env-file .env.protocol python -m src.flower_config
+uv run --env-file .env.protocol flwr run . local-docker --stream
 ```
 
 Flower 1.32.1 reads SuperLink connection profiles from `~/.flwr/config.toml` rather
@@ -170,10 +176,12 @@ only for this loopback-only local runtime; do not use it for a remote or public
 SuperLink.
 
 The dashboard is available at <http://127.0.0.1:8501>. Each ClientApp receives
-only its matching `artifacts/clients/client-N` shard as a read-only mount. Public
-artifacts are read-only in every consuming service; only ServerApp can write
-`artifacts/server`, which the dashboard mounts read-only. Stop the runtime with
-`docker compose down`.
+only its matching shard from the selected prepared generation as a read-only
+mount. Public artifacts from that same generation are read-only in every
+consuming service; only ServerApp can write
+`artifacts/server`, which the dashboard mounts read-only. The untouched
+`artifacts/evaluation` directory is not mounted into this PR13 runtime. Stop the
+runtime with `docker compose down`.
 
 ### Security and privacy scope
 
@@ -210,8 +218,8 @@ uv lock --upgrade
 Before committing, format and check the codebase:
 
 ```bash
-uv run ruff format .
-uv run ruff check .
+uv run --env-file .env.protocol ruff format .
+uv run --env-file .env.protocol ruff check .
 ```
 
 See [COMPATIBILITY.md](COMPATIBILITY.md) for the application and artifact

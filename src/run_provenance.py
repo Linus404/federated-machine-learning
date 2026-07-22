@@ -13,15 +13,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from src.app_manifest import load_app_manifest
+from src.app_manifest import load_app_manifest, resolve_public_artifact_dir
 from src.artifact_compatibility import (
     ARTIFACT_SCHEMA_VERSION,
+    sha256_bytes,
     validate_artifact_schema,
-    sha256_file,
     write_json_atomically,
 )
 from src.contracts import DEFAULT_SPLIT_SEED, DEFAULT_VALIDATION_SEED
-from src.paths import resolve_dir, run_manifest_path
+from src.paths import run_manifest_path
 
 CODE_REVISION_ENV = "FML_CODE_REVISION"
 RUNTIME_PACKAGES = ("datasets", "flwr", "keras", "numpy", "tensorflow")
@@ -236,14 +236,90 @@ def _validate_dataset(dataset: Mapping[str, Any]) -> None:
         raise ValueError(
             "run provenance manifest has an invalid dataset.private_client_shards"
         )
-    _required_nested_fields(
-        private_shards, {"status", "reason"}, "dataset.private_client_shards"
-    )
-    if (
-        private_shards["status"] != "not_collected"
-        or not isinstance(private_shards["reason"], str)
-        or not private_shards["reason"]
-    ):
+    private_status = private_shards.get("status")
+    if private_status == "not_collected":
+        if (
+            set(private_shards) != {"status", "reason"}
+            or not isinstance(private_shards["reason"], str)
+            or not private_shards["reason"]
+        ):
+            raise ValueError(
+                "run provenance manifest has an invalid dataset.private_client_shards"
+            )
+    elif private_status == "available":
+        if set(private_shards) != {"status", "identity", "checksums"}:
+            raise ValueError(
+                "run provenance manifest has an invalid dataset.private_client_shards"
+            )
+        shard_identity = private_shards["identity"]
+        shard_checksums = private_shards["checksums"]
+        if not isinstance(shard_identity, Mapping) or not isinstance(
+            shard_checksums, Mapping
+        ):
+            raise ValueError(
+                "run provenance manifest has an invalid dataset.private_client_shards"
+            )
+        identity_fields = {
+            "client_id",
+            "dataset",
+            "source_split",
+            "row_identity",
+            "sample_count",
+            "label_histogram",
+            "public_manifest",
+        }
+        if set(shard_identity) != identity_fields:
+            raise ValueError(
+                "run provenance manifest has an invalid dataset.private_client_shards"
+            )
+        shard_dataset = shard_identity["dataset"]
+        shard_histogram = shard_identity["label_histogram"]
+        public_manifest = shard_identity["public_manifest"]
+        if (
+            type(shard_identity["client_id"]) is not int
+            or shard_identity["client_id"] < 0
+            or shard_identity["source_split"] != "train"
+            or shard_identity["row_identity"]
+            != "train:{zero_based_official_split_row_index}"
+            or type(shard_identity["sample_count"]) is not int
+            or shard_identity["sample_count"] < 1
+            or not isinstance(shard_dataset, Mapping)
+            or shard_dataset.get("split") != "train"
+            or not isinstance(shard_histogram, Mapping)
+            or not shard_histogram
+            or any(
+                label not in {"0", "1"} or type(count) is not int or count < 1
+                for label, count in shard_histogram.items()
+            )
+            or sum(shard_histogram.values()) != shard_identity["sample_count"]
+            or not isinstance(public_manifest, Mapping)
+            or set(public_manifest) != {"filename", "size_bytes", "checksum"}
+            or public_manifest["filename"] != "manifest.json"
+            or type(public_manifest["size_bytes"]) is not int
+            or public_manifest["size_bytes"] < 1
+            or not isinstance(public_manifest["checksum"], str)
+            or len(public_manifest["checksum"]) != 71
+            or not public_manifest["checksum"].startswith("sha256:")
+            or any(
+                character not in "0123456789abcdef"
+                for character in public_manifest["checksum"][7:]
+            )
+        ):
+            raise ValueError(
+                "run provenance manifest has an invalid dataset.private_client_shards"
+            )
+        if any(
+            not isinstance(name, str)
+            or not isinstance(checksum, str)
+            or len(checksum) != 71
+            or not checksum.startswith("sha256:")
+            or any(character not in "0123456789abcdef" for character in checksum[7:])
+            for name, checksum in shard_checksums.items()
+        ):
+            raise ValueError(
+                "run provenance manifest has an invalid dataset.private_client_shards"
+            )
+    else:
         raise ValueError(
             "run provenance manifest has an invalid dataset.private_client_shards"
         )
@@ -358,13 +434,18 @@ def _code_revision() -> dict[str, Any]:
     return {"commit": commit, "dirty": bool(status), "source": "git"}
 
 
-def _dataset_metadata(public_artifact_dir: str | Path | None) -> dict[str, Any]:
+def _dataset_metadata(
+    public_artifact_dir: str | Path | None,
+    client_shard: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Capture public dataset identity and checksums available to the server.
 
     Parameters
     ----------
     public_artifact_dir : str or pathlib.Path or None
         Directory containing the public model and vocabulary manifest.
+    client_shard : mapping of str to Any or None, optional
+        Validated private-shard identity and checksums available to local training.
 
     Returns
     -------
@@ -376,11 +457,23 @@ def _dataset_metadata(public_artifact_dir: str | Path | None) -> dict[str, Any]:
     ValueError
         If a declared public artifact escapes its configured directory.
     """
-    public_dir = resolve_dir(public_artifact_dir) if public_artifact_dir else None
-    private_status = {
-        "status": "not_collected",
-        "reason": "client shard identity is not collected by the server application",
-    }
+    public_dir = (
+        resolve_public_artifact_dir(public_artifact_dir=public_artifact_dir)
+        if public_artifact_dir
+        else None
+    )
+    private_status = (
+        {
+            "status": "available",
+            "identity": client_shard["identity"],
+            "checksums": client_shard["checksums"],
+        }
+        if client_shard is not None
+        else {
+            "status": "not_collected",
+            "reason": "client shard identity is not collected by the server application",
+        }
+    )
     if public_dir is None or not (public_dir / "manifest.json").exists():
         return {
             "identity": None,
@@ -390,15 +483,18 @@ def _dataset_metadata(public_artifact_dir: str | Path | None) -> dict[str, Any]:
         }
 
     manifest = load_app_manifest(public_artifact_dir=public_dir)
-    vocabulary_path = manifest.vocabulary_path.resolve()
-    if not vocabulary_path.is_relative_to(public_dir.resolve()):
-        raise ValueError("public vocabulary must remain inside its artifact directory")
-    identity = manifest.payload.get("dataset") or manifest.payload.get("provenance")
+    identity = json.dumps(
+        json.loads(manifest.manifest_bytes)["dataset"],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
     return {
         "identity": identity,
         "checksums": {
-            "manifest.json": sha256_file(public_dir / "manifest.json"),
-            manifest.vocabulary_path.name: sha256_file(vocabulary_path),
+            "manifest.json": sha256_bytes(manifest.manifest_bytes),
+            manifest.vocabulary_path.name: sha256_bytes(manifest.vocabulary_bytes),
         },
         "status": "available",
         "private_client_shards": private_status,
@@ -410,6 +506,7 @@ def write_run_provenance_manifest(
     run_config: Mapping[str, Any],
     *,
     public_artifact_dir: str | Path | None = None,
+    client_shard: Mapping[str, Any] | None = None,
     flower_run_id: int | None = None,
     created_at: str | None = None,
     run_id: str | None = None,
@@ -424,6 +521,8 @@ def write_run_provenance_manifest(
         Complete Flower run configuration.
     public_artifact_dir : str or pathlib.Path or None, optional
         Public artifacts used by the run.
+    client_shard : mapping of str to Any or None, optional
+        Validated private shard evidence available only to local training.
     flower_run_id : int or None, optional
         Flower's infrastructure-level run identifier when available.
     created_at : str or None, optional
@@ -474,7 +573,7 @@ def write_run_provenance_manifest(
                 "data_partition": DEFAULT_SPLIT_SEED,
             },
         },
-        "dataset": _dataset_metadata(public_artifact_dir),
+        "dataset": _dataset_metadata(public_artifact_dir, client_shard),
     }
     _validate_environment(payload["environment"])
     _validate_code_revision(payload["code_revision"])

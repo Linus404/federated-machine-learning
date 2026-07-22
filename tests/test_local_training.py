@@ -1,14 +1,23 @@
 import argparse
-import json
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from src.artifact_compatibility import ARTIFACT_SCHEMA_VERSION
+from src.app_manifest import load_app_manifest
+from src.artifact_compatibility import (
+    PUBLIC_ARTIFACT_SCHEMA_VERSION,
+    canonical_json_bytes,
+)
+from tests.test_artifact_flow import write_client_artifacts
 from src.artifact_history import resolve_current_run_dir
-from src.local_training import DEFAULT_VALIDATION_SEED, train
+from src.local_training import (
+    DEFAULT_VALIDATION_SEED,
+    load_client_shard_snapshot,
+    train,
+)
 from src.run_provenance import (
     load_run_provenance_manifest,
     write_run_provenance_manifest,
@@ -16,7 +25,7 @@ from src.run_provenance import (
 
 
 class LocalTrainingTests(unittest.TestCase):
-    def test_train_writes_immutable_run_manifest_before_loading_private_data(
+    def test_train_binds_validated_private_shard_in_immutable_run_manifest(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -31,21 +40,80 @@ class LocalTrainingTests(unittest.TestCase):
                 validation_split=0.25,
             )
             args.public_artifact_dir.mkdir()
-            (args.public_artifact_dir / "vocab.txt").write_text(
-                "\n[UNK]\ngood\nbad\n", encoding="utf-8"
+            vocabulary = b"\n[UNK]\ngood\nbad\n"
+            vocabulary_sha256 = hashlib.sha256(vocabulary).hexdigest()
+            (args.public_artifact_dir / "vocab.txt").write_bytes(vocabulary)
+            dataset = {
+                "id": "example/imdb",
+                "config": "plain_text",
+                "revision": "frozen",
+                "datasets_version": "1.0.0",
+                "split": "train",
+                "rows": 4,
+                "raw_parquet_sha256": "1" * 64,
+                "content_sha256": "2" * 64,
+            }
+            public_payload = {
+                "schema_version": PUBLIC_ARTIFACT_SCHEMA_VERSION,
+                "embedding_dim": 8,
+                "sequence_length": 16,
+                "vocabulary_size": 4,
+                "vocabulary": {
+                    "filename": "vocab.txt",
+                    "sha256": vocabulary_sha256,
+                    "size_bytes": len(vocabulary),
+                },
+                "dataset": dataset,
+            }
+            (args.public_artifact_dir / "manifest.json").write_bytes(
+                canonical_json_bytes(public_payload)
             )
-            (args.public_artifact_dir / "manifest.json").write_text(
-                json.dumps(
-                    {
-                        "schema_version": ARTIFACT_SCHEMA_VERSION,
-                        "embedding_dim": 8,
-                        "sequence_length": 16,
-                        "vocabulary_size": 4,
-                        "vocabulary": {"filename": "vocab.txt"},
-                        "provenance": "test dataset",
-                    }
-                ),
-                encoding="utf-8",
+            protocol = {
+                "dataset": {
+                    **{
+                        key: dataset[key]
+                        for key in (
+                            "id",
+                            "config",
+                            "revision",
+                            "datasets_version",
+                        )
+                    },
+                    "splits": {
+                        "train": {
+                            key: dataset[key]
+                            for key in (
+                                "rows",
+                                "raw_parquet_sha256",
+                                "content_sha256",
+                            )
+                        }
+                    },
+                },
+                "preprocessing": {
+                    "vocabulary_size": 4,
+                    "max_tokens": 4,
+                    "output_sequence_length": 16,
+                    "vocabulary_sha256": vocabulary_sha256,
+                },
+                "model": {
+                    "vocabulary_size": 4,
+                    "sequence_length": 16,
+                    "embedding_dimension": 8,
+                },
+            }
+            manifest = load_app_manifest(
+                public_artifact_dir=args.public_artifact_dir, protocol=protocol
+            )
+            write_client_artifacts(
+                args.client_data_dir,
+                manifest,
+                [
+                    {"text": "good", "label": 1},
+                    {"text": "bad", "label": 0},
+                    {"text": "good good", "label": 1},
+                    {"text": "bad bad", "label": 0},
+                ],
             )
             history = SimpleNamespace(
                 history={
@@ -72,18 +140,27 @@ class LocalTrainingTests(unittest.TestCase):
                     side_effect=write_manifest,
                 ),
                 patch(
-                    "src.local_training.load_client_shard",
+                    "src.local_training.load_client_shard_snapshot",
                     side_effect=lambda *args, **kwargs: (
-                        events.append("private-data") or training_data
+                        events.append("private-data")
+                        or load_client_shard_snapshot(*args, **kwargs)
                     ),
                 ) as load_shard,
                 patch(
+                    "src.local_training._tokenize_client_shard",
+                    return_value=training_data,
+                ),
+                patch(
                     "src.local_training.build_model_from_manifest", return_value=model
+                ),
+                patch(
+                    "src.app_manifest.load_scientific_protocol",
+                    return_value=protocol,
                 ),
             ):
                 train(args)
 
-            self.assertEqual(events, ["manifest", "private-data"])
+            self.assertEqual(events, ["private-data", "manifest"])
             load_shard.assert_called_once()
             payload = load_run_provenance_manifest(
                 resolve_current_run_dir(args.run_artifact_dir) / "run_manifest.json"
@@ -93,6 +170,7 @@ class LocalTrainingTests(unittest.TestCase):
                 {
                     "artifact-retention-runs": 10,
                     "batch-size": 8,
+                    "client-id": 0,
                     "client-data-dir": str(args.client_data_dir),
                     "epochs": 2,
                     "public-artifact-dir": str(args.public_artifact_dir),
@@ -101,6 +179,9 @@ class LocalTrainingTests(unittest.TestCase):
                     "validation-seed": DEFAULT_VALIDATION_SEED,
                     "validation-split": 0.25,
                 },
+            )
+            self.assertEqual(
+                payload["dataset"]["private_client_shards"]["status"], "available"
             )
 
 

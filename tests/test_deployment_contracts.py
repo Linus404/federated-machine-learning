@@ -146,6 +146,11 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         self.assertIn(".git", dockerignore)
         self.assertNotIn("COPY .git", dockerfile)
 
+    def test_image_includes_runtime_scientific_protocol(self) -> None:
+        dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+
+        self.assertIn("COPY docs/scientific-protocol-v1.toml ./docs/", dockerfile)
+
     def test_contract_helpers_follow_project_docstring_conventions(self) -> None:
         docstring = service_block.__doc__ or ""
 
@@ -156,9 +161,10 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         for index in range(4):
             clientapp = service_block(self.compose, f"clientapp-{index}")
             with self.subTest(index=index):
-                self.assertIn(f"source: ./artifacts/clients/client-{index}", clientapp)
+                source = f"source: ./artifacts/.prepared-current/client/client-{index}"
+                self.assertIn(source, clientapp)
                 self.assertEqual(
-                    self.compose.count(f"source: ./artifacts/clients/client-{index}"),
+                    self.compose.count(source),
                     1,
                 )
                 self.assertIn("target: /app/client-data", clientapp)
@@ -191,7 +197,7 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         for service in consumers:
             with self.subTest(service=service):
                 self.assertIn(
-                    "./artifacts/public:/app/artifacts/public:ro",
+                    "./artifacts/.prepared-current/public:/app/artifacts/public:ro",
                     service_block(self.compose, service),
                 )
         for service in ["superlink"] + [f"supernode-{index}" for index in range(4)]:
@@ -199,6 +205,17 @@ class DistributedDeploymentContractTests(unittest.TestCase):
                 self.assertNotIn(
                     "/app/artifacts/public", service_block(self.compose, service)
                 )
+
+    def test_runtime_mounts_selected_generation_not_legacy_artifact_roots(self) -> None:
+        self.assertNotIn("./artifacts/public:", self.compose)
+        self.assertNotIn("source: ./artifacts/clients/", self.compose)
+
+    def test_untouched_evaluation_artifact_is_not_exposed_to_runtime_services(
+        self,
+    ) -> None:
+        self.assertNotIn("artifacts/evaluation", self.compose)
+        self.assertNotIn(".prepared-current/evaluation", self.compose)
+        self.assertNotIn("FML_EVALUATION_ARTIFACT_DIR", self.compose)
 
     def test_server_outputs_have_one_writer_and_read_only_dashboard(self) -> None:
         self.assertIn(
@@ -215,15 +232,18 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         readme = Path("README.md").read_text(encoding="utf-8")
 
         self.assertNotIn("[tool.flwr.federations.local-docker]", pyproject)
-        self.assertIn("uv run python -m src.flower_config", readme)
+        self.assertIn(
+            "uv run --env-file .env.protocol python -m src.flower_config", readme
+        )
         self.assertNotIn("grep -q", readme)
 
     def test_regeneration_uses_matching_non_destructive_artifact_paths(self) -> None:
         compatibility = Path("COMPATIBILITY.md").read_text(encoding="utf-8")
-        root = "artifacts/regenerated-schema-1"
+        root = "artifacts/regenerated-public-v2"
 
         self.assertIn(f"--client-shard-dir {root}/clients", compatibility)
         self.assertIn(f"--public-artifact-dir {root}/public", compatibility)
+        self.assertIn(f"--evaluation-artifact-dir {root}/evaluation", compatibility)
         self.assertIn(
             f"client-data-dir='{root}/clients/client-{{partition}}'", compatibility
         )

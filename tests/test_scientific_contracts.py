@@ -104,7 +104,7 @@ class ScientificContractTests(unittest.TestCase):
         readme = Path("README.md").read_text(encoding="utf-8")
 
         self.assertIn(f"FML_SERVER_ARTIFACT_DIR={artifact_dir} ", readme)
-        self.assertIn(f'$env:FML_SERVER_ARTIFACT_DIR = "{artifact_dir}"', readme)
+        self.assertIn("On Windows, use WSL 2", readme)
 
     def test_huber_aggregation_result_is_stable(self) -> None:
         result = huber_aggregate(

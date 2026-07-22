@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from src.protocol_runtime import validate_protocol_runtime
+
 import keras
 import numpy as np
 from flwr.client import NumPyClient
@@ -52,6 +54,7 @@ class SentimentClient(NumPyClient):
         update_noise_l2_norm_clip: float = UPDATE_NOISE_L2_NORM_CLIP,
         update_noise_multiplier: float = UPDATE_NOISE_MULTIPLIER,
     ) -> None:
+        validate_protocol_runtime()
         self.client_data_dir = resolve_dir(client_data_dir)
         self.client_id = client_id
         self.epochs = epochs
@@ -65,7 +68,7 @@ class SentimentClient(NumPyClient):
             public_artifact_dir=public_artifact_dir,
         )
         self.train_data, self.val_data = load_client_shard(
-            self.client_data_dir, manifest, validation_split
+            self.client_data_dir, manifest, self.client_id, validation_split
         )
         self.model = build_model_from_manifest(manifest)
 

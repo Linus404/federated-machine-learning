@@ -11,6 +11,7 @@ from flwr.common import Context, ndarrays_to_parameters, parameters_to_ndarrays
 
 import src.server_app as server_app
 from src.artifact_compatibility import load_server_artifact_manifest
+from tests.artifact_helpers import fake_app_manifest
 
 
 class ServerStartupArtifactHistoryTests(unittest.TestCase):
@@ -210,11 +211,11 @@ class MetricAggregationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch.object(server_app.FedProx, "__init__", return_value=None):
                 server_app.SentimentServer(
-                    app_manifest=object(), artifact_dir=Path(tmpdir)
+                    app_manifest=fake_app_manifest(), artifact_dir=Path(tmpdir)
                 )
 
             self.assertEqual(
-                load_server_artifact_manifest(Path(tmpdir))["schema_version"], 1
+                load_server_artifact_manifest(Path(tmpdir))["schema_version"], 2
             )
 
     def test_weighted_average_uses_num_examples(self) -> None:

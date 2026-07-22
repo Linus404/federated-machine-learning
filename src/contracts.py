@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Mapping
 
 import numpy as np
 
-from src.artifact_compatibility import ARTIFACT_SCHEMA_VERSION
+from src.artifact_compatibility import (
+    CLIENT_SHARD_SCHEMA_VERSION,
+    sha256_bytes,
+)
 
 DEFAULT_SPLIT_SEED = 67
 DEFAULT_VALIDATION_SEED = 67
@@ -14,8 +18,49 @@ DEFAULT_DIRICHLET_ALPHA = 0.5
 
 
 def label_histogram(labels: Any) -> dict[str, int]:
+    """Count labels using stable string keys.
+
+    Parameters
+    ----------
+    labels : Any
+        Array-like label values.
+
+    Returns
+    -------
+    dict of str to int
+        Counts keyed by each label's string representation.
+    """
     values, counts = np.unique(np.asarray(labels), return_counts=True)
     return {str(value): int(count) for value, count in zip(values, counts)}
+
+
+def canonical_client_row_bytes(row_id: str, text: str, label: int) -> bytes:
+    """Serialize one client record under the shard checksum contract.
+
+    Parameters
+    ----------
+    row_id : str
+        Split-qualified official source-row identity.
+    text : str
+        Review text preserved exactly.
+    label : int
+        Binary sentiment label.
+
+    Returns
+    -------
+    bytes
+        Compact canonical UTF-8 JSON followed by one LF byte.
+    """
+    return (
+        json.dumps(
+            {"label": label, "row_id": row_id, "text": text},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
 
 
 def dirichlet_split(
@@ -50,10 +95,13 @@ def client_shard_metadata(
     client_id: int,
     labels: Any,
     *,
+    records_bytes: bytes,
+    public_manifest_bytes: bytes,
+    dataset: Mapping[str, Any],
+    source_split: str = "train",
+    row_identity: str = "train:{zero_based_official_split_row_index}",
     split_seed: int = DEFAULT_SPLIT_SEED,
     alpha: float = DEFAULT_DIRICHLET_ALPHA,
-    manifest_checksum: str | None = None,
-    extra_metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build authoritative metadata for one client-scoped shard.
 
@@ -63,39 +111,48 @@ def client_shard_metadata(
         Client partition identifier.
     labels : Any
         Labels stored in the shard.
+    records_bytes : bytes
+        Exact canonical record bytes stored in ``reviews.jsonl``.
+    public_manifest_bytes : bytes
+        Exact canonical public manifest bytes used by the shard.
+    dataset : mapping of str to Any
+        Frozen official training-dataset identity.
+    source_split : str, optional
+        Official source split for every row.
+    row_identity : str, optional
+        Exact qualified row-ID contract.
     split_seed : int, optional
         Random seed used to produce the partition.
     alpha : float, optional
         Dirichlet concentration used to produce the partition.
-    manifest_checksum : str or None, optional
-        Checksum tying the shard to its public manifest.
-    extra_metadata : mapping or None, optional
-        Additional fields that do not replace schema-owned fields.
-
     Returns
     -------
     dict of str to Any
         Complete client shard metadata.
 
-    Raises
-    ------
-    ValueError
-        If additional metadata tries to replace a schema-owned field.
     """
-    metadata = {
-        "schema_version": ARTIFACT_SCHEMA_VERSION,
+    return {
+        "schema_version": CLIENT_SHARD_SCHEMA_VERSION,
+        "artifact_type": "private_client_train_shard",
         "client_id": client_id,
+        "dataset": dict(dataset),
+        "source_split": source_split,
+        "row_identity": row_identity,
         "split_seed": split_seed,
         "alpha": alpha,
         "sample_count": len(labels),
         "label_histogram": label_histogram(labels),
-        "manifest_checksum": manifest_checksum,
+        "records": {
+            "filename": "reviews.jsonl",
+            "format": "canonical-jsonl",
+            "encoding": "utf-8",
+            "newline": "LF",
+            "trailing_newline": True,
+            "checksum": sha256_bytes(records_bytes),
+        },
+        "public_manifest": {
+            "filename": "manifest.json",
+            "size_bytes": len(public_manifest_bytes),
+            "checksum": sha256_bytes(public_manifest_bytes),
+        },
     }
-    collisions = metadata.keys() & (extra_metadata or {}).keys()
-    if collisions:
-        raise ValueError(
-            "extra client shard metadata cannot replace reserved fields: "
-            + ", ".join(sorted(collisions))
-        )
-    metadata.update(extra_metadata or {})
-    return metadata
