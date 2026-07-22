@@ -42,7 +42,11 @@ from src.local_training import (
     load_client_shard,
     load_client_shard_snapshot,
 )
-from src.paths import PREPARED_GENERATION_SCHEMA_VERSION, resolve_prepared_artifact_dir
+from src.paths import (
+    PREPARED_GENERATION_SCHEMA_VERSION,
+    prepared_generation_inventory,
+    resolve_prepared_artifact_dir,
+)
 from src.text_preprocessing import create_text_vectorizer, protocol_standardize
 
 
@@ -50,6 +54,16 @@ def write_public_artifacts(path: Path, sequence_length: int = 4) -> AppManifest:
     vocabulary = b"\n[UNK]\ngood\nbad\nmovie\n"
     vocabulary_sha256 = hashlib.sha256(vocabulary).hexdigest()
     (path / "vocab.txt").write_bytes(vocabulary)
+    train_rows = [
+        {"text": "bad", "label": 0},
+        {"text": "good", "label": 1},
+        {"text": "bad movie", "label": 0},
+        {"text": "good movie", "label": 1},
+    ]
+    train_content = b"".join(
+        canonical_source_row_bytes(str(row["text"]), int(row["label"]))
+        for row in train_rows
+    )
     payload = {
         "schema_version": PUBLIC_ARTIFACT_SCHEMA_VERSION,
         "embedding_dim": 100,
@@ -68,7 +82,7 @@ def write_public_artifacts(path: Path, sequence_length: int = 4) -> AppManifest:
             "split": "train",
             "rows": 4,
             "raw_parquet_sha256": "1" * 64,
-            "content_sha256": "2" * 64,
+            "content_sha256": hashlib.sha256(train_content).hexdigest(),
         },
     }
     manifest_path = path / "manifest.json"
@@ -100,6 +114,16 @@ def public_protocol(sequence_length: int = 4) -> dict[str, object]:
         canonical_source_row_bytes(str(row["text"]), int(row["label"]))
         for row in evaluation_rows
     )
+    train_rows = [
+        {"text": "bad", "label": 0},
+        {"text": "good", "label": 1},
+        {"text": "bad movie", "label": 0},
+        {"text": "good movie", "label": 1},
+    ]
+    train_content = b"".join(
+        canonical_source_row_bytes(str(row["text"]), int(row["label"]))
+        for row in train_rows
+    )
     return {
         "dataset": {
             "id": "example/imdb",
@@ -109,8 +133,9 @@ def public_protocol(sequence_length: int = 4) -> dict[str, object]:
             "splits": {
                 "train": {
                     "rows": 4,
+                    "label_counts": [2, 2],
                     "raw_parquet_sha256": "1" * 64,
-                    "content_sha256": "2" * 64,
+                    "content_sha256": hashlib.sha256(train_content).hexdigest(),
                 },
                 "test": {
                     "rows": 2,
@@ -150,13 +175,17 @@ def preparation_request(partitions: int = 1) -> dict[str, int]:
     return {"partitions": partitions}
 
 
-def write_complete_prepared_stage(path: Path) -> dict[str, object]:
+def write_complete_prepared_stage(
+    path: Path, *, partitions: int = 1
+) -> dict[str, object]:
     """Write one complete prepared generation candidate for recovery tests.
 
     Parameters
     ----------
     path : pathlib.Path
         New generation staging or final directory.
+    partitions : int, optional
+        Exact number of non-empty client shards to write.
 
     Returns
     -------
@@ -169,16 +198,23 @@ def write_complete_prepared_stage(path: Path) -> dict[str, object]:
     manifest = write_public_artifacts(public)
     client = path / "client"
     client.mkdir()
-    write_client_artifacts(
-        client / "client-0",
-        manifest,
-        [
-            {"text": "bad", "label": 0},
-            {"text": "good", "label": 1},
-            {"text": "bad movie", "label": 0},
-            {"text": "good movie", "label": 1},
-        ],
-    )
+    records = [
+        {"text": "bad", "label": 0},
+        {"text": "good", "label": 1},
+        {"text": "bad movie", "label": 0},
+        {"text": "good movie", "label": 1},
+    ]
+    if partitions not in {1, 4}:
+        raise ValueError("flow fixture supports exactly one or four partitions")
+    for client_id in range(partitions):
+        source_indices = list(range(4)) if partitions == 1 else [client_id]
+        write_client_artifacts(
+            client / f"client-{client_id}",
+            manifest,
+            [records[index] for index in source_indices],
+            client_id=client_id,
+            source_indices=source_indices,
+        )
     publish_evaluation_artifact(
         [
             {"text": "untouched negative", "label": 0},
@@ -191,7 +227,11 @@ def write_complete_prepared_stage(path: Path) -> dict[str, object]:
 
 
 def write_pending_prepared_recovery(
-    root: Path, *, final: bool, legacy_schema: bool = False
+    root: Path,
+    *,
+    final: bool,
+    legacy_schema: bool = False,
+    partitions: int = 1,
 ) -> tuple[dict[str, Path], Path, dict[str, object]]:
     """Create one journaled stage or final generation recovery fixture.
 
@@ -203,6 +243,8 @@ def write_pending_prepared_recovery(
         Write the candidate under its final UUID name instead of its stage name.
     legacy_schema : bool, optional
         Write schema 1 metadata without a durable preparation request.
+    partitions : int, optional
+        Exact number of client shards bound by the candidate request.
 
     Returns
     -------
@@ -221,21 +263,40 @@ def write_pending_prepared_recovery(
     stage_name = ".prepare-recovery.staging"
     generations = root / ".prepared-generations"
     candidate = generations / (generation_id if final else stage_name)
-    protocol = write_complete_prepared_stage(candidate)
+    protocol = write_complete_prepared_stage(candidate, partitions=partitions)
     schema_version = 1 if legacy_schema else PREPARED_GENERATION_SCHEMA_VERSION
     index = {
         "schema_version": schema_version,
         "generation_id": generation_id,
+        **(
+            {"inventory": prepared_generation_inventory(candidate)}
+            if not legacy_schema
+            else {}
+        ),
         "logical_roots": {name: roots[name].name for name in sorted(roots)},
-        **({} if legacy_schema else {"preparation_request": preparation_request()}),
+        **(
+            {}
+            if legacy_schema
+            else {"preparation_request": preparation_request(partitions)}
+        ),
     }
     (candidate / "index.json").write_bytes(canonical_json_bytes(index))
+    index_bytes = (candidate / "index.json").read_bytes()
     journal = {
         "schema_version": schema_version,
         "generation_id": generation_id,
         "stage_name": stage_name,
+        **(
+            {"generation_index_checksum": sha256_bytes(index_bytes)}
+            if not legacy_schema
+            else {}
+        ),
         "logical_roots": {name: roots[name].name for name in sorted(roots)},
-        **({} if legacy_schema else {"preparation_request": preparation_request()}),
+        **(
+            {}
+            if legacy_schema
+            else {"preparation_request": preparation_request(partitions)}
+        ),
         "legacy_roots": sorted(roots),
         "alias_roots": sorted(roots),
         "previous_pointer_target": None,
@@ -250,6 +311,7 @@ def write_client_artifacts(
     records: list[dict[str, object]],
     *,
     client_id: int = 0,
+    source_indices: list[int] | None = None,
 ) -> Path:
     """Write one canonical client shard bound to a public manifest snapshot.
 
@@ -263,6 +325,8 @@ def write_client_artifacts(
         Review text and binary labels in official-index order.
     client_id : int, optional
         Expected client identity.
+    source_indices : list of int or None, optional
+        Official train row identities corresponding to ``records``.
 
     Returns
     -------
@@ -270,11 +334,12 @@ def write_client_artifacts(
         Written client shard directory.
     """
     path.mkdir()
+    indices = source_indices or list(range(len(records)))
     records_bytes = b"".join(
         canonical_client_row_bytes(
-            f"train:{index}", str(record["text"]), int(record["label"])
+            f"train:{source_index}", str(record["text"]), int(record["label"])
         )
-        for index, record in enumerate(records)
+        for source_index, record in zip(indices, records, strict=True)
     )
     (path / "reviews.jsonl").write_bytes(records_bytes)
     metadata = client_shard_metadata(
@@ -456,6 +521,10 @@ def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> No
     content = b"".join(
         canonical_source_row_bytes(row["text"], row["label"]) for row in test_rows
     )
+    train_content = b"".join(
+        canonical_source_row_bytes(str(text), int(label))
+        for text, label in zip(texts, labels, strict=True)
+    )
     protocol = {
         "dataset": {
             "id": "stanfordnlp/imdb",
@@ -465,8 +534,9 @@ def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> No
             "splits": {
                 "train": {
                     "rows": 12,
+                    "label_counts": [6, 6],
                     "raw_parquet_sha256": "1" * 64,
-                    "content_sha256": "2" * 64,
+                    "content_sha256": hashlib.sha256(train_content).hexdigest(),
                 },
                 "test": {
                     "rows": 2,
@@ -782,6 +852,82 @@ class ArtifactFlowTests(unittest.TestCase):
 
             self.assertTrue((root / ".prepared-current").is_symlink())
             self.assertFalse((root / ".prepared-migration.json").exists())
+
+    def test_recovery_rejects_self_consistent_poisoned_client_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            roots, candidate, protocol = write_pending_prepared_recovery(
+                root, final=False
+            )
+            shard = candidate / "client" / "client-0"
+            records_path = shard / "reviews.jsonl"
+            metadata_path = shard / "client_metadata.json"
+            rows = [json.loads(line) for line in records_path.read_bytes().splitlines()]
+            rows[0]["text"] = "untouched negative"
+            poisoned_records = b"".join(
+                canonical_client_row_bytes(
+                    str(row["row_id"]), str(row["text"]), int(row["label"])
+                )
+                for row in rows
+            )
+            records_path.write_bytes(poisoned_records)
+            metadata = json.loads(metadata_path.read_bytes())
+            metadata["records"]["checksum"] = sha256_bytes(poisoned_records)
+            metadata_path.write_bytes(canonical_json_bytes(metadata))
+
+            with (
+                patch("src.data_prep.load_scientific_protocol", return_value=protocol),
+                self.assertRaisesRegex(ValueError, "generation validation"),
+            ):
+                _recover_prepared_migration(roots, preparation_request())
+
+            index_path = candidate / "index.json"
+            index = json.loads(index_path.read_bytes())
+            index["inventory"] = prepared_generation_inventory(candidate)
+            index_path.write_bytes(canonical_json_bytes(index))
+            with (
+                patch("src.data_prep.load_scientific_protocol", return_value=protocol),
+                self.assertRaisesRegex(ValueError, "generation validation"),
+            ):
+                _recover_prepared_migration(roots, preparation_request())
+
+    def test_selected_generation_rejects_post_selection_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            roots, _, protocol = write_pending_prepared_recovery(root, final=False)
+            with patch("src.data_prep.load_scientific_protocol", return_value=protocol):
+                self.assertTrue(
+                    _recover_prepared_migration(roots, preparation_request())
+                )
+            selected = root / ".prepared-current" / "client" / "client-0"
+            (selected / "reviews.jsonl").write_bytes(b"attacker-controlled\n")
+
+            with self.assertRaisesRegex(ValueError, "bound inventory"):
+                resolve_prepared_artifact_dir(roots["client"], "client")
+
+    def test_recovery_accepts_exact_one_and_four_partition_generations(self) -> None:
+        for partitions in (1, 4):
+            with (
+                self.subTest(partitions=partitions),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                roots, _, protocol = write_pending_prepared_recovery(
+                    root, final=False, partitions=partitions
+                )
+                with patch(
+                    "src.data_prep.load_scientific_protocol", return_value=protocol
+                ):
+                    self.assertTrue(
+                        _recover_prepared_migration(
+                            roots, preparation_request(partitions)
+                        )
+                    )
+                selected = resolve_prepared_artifact_dir(roots["client"], "client")
+                self.assertEqual(
+                    {path.name for path in selected.iterdir()},
+                    {f"client-{index}" for index in range(partitions)},
+                )
 
     def test_frozen_standardizer_matches_producer_and_every_consumer(self) -> None:
         import keras
@@ -1188,6 +1334,14 @@ class ArtifactFlowTests(unittest.TestCase):
                 canonical_source_row_bytes(row["text"], row["label"])
                 for row in test_rows
             )
+            train_content = b"".join(
+                canonical_source_row_bytes(text, label)
+                for text, label in zip(
+                    dataset["train"]["text"],
+                    dataset["train"]["label"],
+                    strict=True,
+                )
+            )
             protocol = {
                 "dataset": {
                     "id": "example/imdb",
@@ -1197,8 +1351,9 @@ class ArtifactFlowTests(unittest.TestCase):
                     "splits": {
                         "train": {
                             "rows": 4,
+                            "label_counts": [2, 2],
                             "raw_parquet_sha256": "1" * 64,
-                            "content_sha256": "2" * 64,
+                            "content_sha256": hashlib.sha256(train_content).hexdigest(),
                         },
                         "test": {
                             "rows": 2,
@@ -1725,6 +1880,26 @@ class ArtifactFlowTests(unittest.TestCase):
                 self.assertEqual(
                     (logical_root / "legacy.txt").read_text(encoding="utf-8"), name
                 )
+
+    def test_schema_two_pending_preparation_is_rolled_back_not_recovered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            roots, candidate, _ = write_pending_prepared_recovery(root, final=False)
+            index_path = candidate / "index.json"
+            index = json.loads(index_path.read_bytes())
+            index["schema_version"] = 2
+            index.pop("inventory")
+            index_path.write_bytes(canonical_json_bytes(index))
+            journal_path = root / ".prepared-migration.json"
+            journal = json.loads(journal_path.read_bytes())
+            journal["schema_version"] = 2
+            journal.pop("generation_index_checksum")
+            journal_path.write_bytes(canonical_json_bytes(journal))
+
+            self.assertFalse(_recover_prepared_migration(roots, preparation_request()))
+
+            self.assertFalse(candidate.exists())
+            self.assertFalse(journal_path.exists())
 
     def test_preparation_rejects_overlapping_artifact_boundaries_before_loading(
         self,

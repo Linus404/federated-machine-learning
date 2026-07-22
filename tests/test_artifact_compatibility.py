@@ -259,8 +259,9 @@ class ArtifactCompatibilityTests(unittest.TestCase):
                 valid = manifest_path.read_text(encoding="utf-8")
             hostile_documents = (
                 valid.replace(
-                    '"schema_version": 2,',
-                    '"schema_version": 1,\n  "schema_version": 2,',
+                    f'"schema_version": {SERVER_ARTIFACT_SCHEMA_VERSION},',
+                    '"schema_version": 1,\n  '
+                    f'"schema_version": {SERVER_ARTIFACT_SCHEMA_VERSION},',
                     1,
                 ),
                 valid.replace(

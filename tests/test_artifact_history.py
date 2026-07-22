@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import tempfile
@@ -388,12 +389,151 @@ class ArtifactHistoryTests(unittest.TestCase):
                         allow_nan=False,
                     ),
                     "checksums": {"manifest.json": "sha256:" + "0" * 64},
+                    "public_manifest": {
+                        "filename": "manifest.json",
+                        "size_bytes": 1,
+                        "checksum": "sha256:" + "0" * 64,
+                    },
                     "status": "available",
                 }
                 provenance_path.write_bytes(canonical_json_bytes(provenance))
 
                 with self.assertRaisesRegex(ValueError, "dataset.identity"):
                     publish_completed_run(root, run)
+
+    def test_finalization_rejects_hostile_private_shard_provenance(self) -> None:
+        identity = expected_train_dataset()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            provenance_path = run / "run_manifest.json"
+            provenance = json.loads(provenance_path.read_bytes())
+            public_manifest = {
+                "filename": "manifest.json",
+                "size_bytes": 1,
+                "checksum": "sha256:" + "3" * 64,
+            }
+            provenance["dataset"] = {
+                "identity": json.dumps(
+                    identity,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ),
+                "checksums": {"manifest.json": public_manifest["checksum"]},
+                "public_manifest": public_manifest,
+                "status": "available",
+                "private_client_shards": {
+                    "status": "available",
+                    "identity": {
+                        "client_id": 0,
+                        "dataset": {**identity, "revision": "0" * 40},
+                        "source_split": "train",
+                        "row_identity": ("train:{zero_based_official_split_row_index}"),
+                        "sample_count": 2,
+                        "label_histogram": {"0": 1, "1": 1},
+                        "public_manifest": public_manifest,
+                    },
+                    "checksums": {
+                        "client_metadata.json": "sha256:" + "1" * 64,
+                        "reviews.jsonl": "sha256:" + "2" * 64,
+                    },
+                },
+            }
+            provenance_path.write_bytes(canonical_json_bytes(provenance))
+
+            with self.assertRaisesRegex(ValueError, "private_client_shards"):
+                publish_completed_run(root, run)
+
+    def test_finalization_rejects_mutation_after_provenance_validation(self) -> None:
+        from src.run_provenance import load_run_provenance_manifest
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            provenance_path = run / "run_manifest.json"
+            mutated = False
+
+            def validate_then_mutate(path, *, manifest_bytes=None):
+                nonlocal mutated
+                payload = load_run_provenance_manifest(
+                    path, manifest_bytes=manifest_bytes
+                )
+                if not mutated:
+                    mutated = True
+                    provenance_path.write_bytes(b'{"attacker":true}\n')
+                return payload
+
+            with (
+                patch(
+                    "src.artifact_history.load_run_provenance_manifest",
+                    side_effect=validate_then_mutate,
+                ),
+                self.assertRaisesRegex(ValueError, "changed during finalization"),
+            ):
+                publish_completed_run(root, run)
+
+            self.assertFalse((root / "current.json").exists())
+
+    def test_finalization_rejects_same_content_inode_replacement(self) -> None:
+        from src.run_provenance import load_run_provenance_manifest
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            provenance_path = run / "run_manifest.json"
+            replaced = False
+
+            def validate_then_replace(path, *, manifest_bytes=None):
+                nonlocal replaced
+                payload = load_run_provenance_manifest(
+                    path, manifest_bytes=manifest_bytes
+                )
+                if not replaced:
+                    replaced = True
+                    replacement = run / "replacement.tmp"
+                    replacement.write_bytes(provenance_path.read_bytes())
+                    os.replace(replacement, provenance_path)
+                return payload
+
+            with (
+                patch(
+                    "src.artifact_history.load_run_provenance_manifest",
+                    side_effect=validate_then_replace,
+                ),
+                self.assertRaisesRegex(ValueError, "changed during finalization"),
+            ):
+                publish_completed_run(root, run)
+
+            self.assertFalse((root / "current.json").exists())
+
+    def test_current_snapshot_validates_exact_completed_provenance_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            publish_completed_run(root, run)
+            provenance_path = run / "run_manifest.json"
+            provenance_path.write_bytes(b'{"attacker":true}\n')
+            artifact_manifest_path = run / "artifact_manifest.json"
+            artifact_manifest = json.loads(artifact_manifest_path.read_bytes())
+            artifact_manifest["sizes"]["run_manifest.json"] = (
+                provenance_path.stat().st_size
+            )
+            artifact_manifest["checksums"]["run_manifest.json"] = (
+                "sha256:" + hashlib.sha256(provenance_path.read_bytes()).hexdigest()
+            )
+            artifact_manifest_path.write_bytes(canonical_json_bytes(artifact_manifest))
+            current_path = root / "current.json"
+            current = json.loads(current_path.read_bytes())
+            current["artifact_manifest_checksum"] = (
+                "sha256:"
+                + hashlib.sha256(artifact_manifest_path.read_bytes()).hexdigest()
+            )
+            current_path.write_bytes(canonical_json_bytes(current))
+
+            with self.assertRaisesRegex(ValueError, "run provenance manifest"):
+                load_current_run_snapshot(root)
 
     def test_finalization_recovers_after_current_index_write_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

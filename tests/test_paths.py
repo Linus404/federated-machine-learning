@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,6 +23,7 @@ from src.paths import (
     default_server_artifact_dir,
     global_model_path,
     metrics_path,
+    prepared_generation_inventory,
     resolve_prepared_artifact_dir,
     run_manifest_path,
 )
@@ -60,6 +62,7 @@ def write_prepared_generation(
     }
     for kind, logical_name in logical_roots.items():
         (generation / kind).mkdir()
+        (generation / kind / "bound.txt").write_text(kind, encoding="utf-8")
         (root / logical_name).symlink_to(
             Path(PREPARED_CURRENT_FILENAME) / kind,
             target_is_directory=True,
@@ -69,6 +72,7 @@ def write_prepared_generation(
             {
                 "schema_version": PREPARED_GENERATION_SCHEMA_VERSION,
                 "generation_id": serialized_id,
+                "inventory": prepared_generation_inventory(generation),
                 "logical_roots": logical_roots,
                 "preparation_request": {"partitions": 4},
             }
@@ -233,7 +237,8 @@ class ArtifactPathContractTests(unittest.TestCase):
             root = Path(tmpdir)
             generation, generation_id = write_prepared_generation(root)
             (generation / "index.json").write_text(
-                '{"schema_version":2,"schema_version":2,'
+                f'{{"schema_version":{PREPARED_GENERATION_SCHEMA_VERSION},'
+                f'"schema_version":{PREPARED_GENERATION_SCHEMA_VERSION},'
                 f'"generation_id":"{generation_id}",'
                 '"logical_roots":{"client":"clients",'
                 '"evaluation":"evaluation","public":"public"},'
@@ -291,16 +296,16 @@ class ArtifactPathContractTests(unittest.TestCase):
                     renamed = root / "real-generations"
                     generations.rename(renamed)
                     generations.symlink_to(renamed, target_is_directory=True)
-                    expected_error = "missing or unsafe"
+                    expected_error = "unsafe"
                 elif hostile_entry == "generation":
                     for child in generation.iterdir():
                         if child.is_dir():
-                            child.rmdir()
+                            shutil.rmtree(child)
                         else:
                             child.unlink()
                     generation.rmdir()
                     generation.symlink_to(external, target_is_directory=True)
-                    expected_error = "missing or unsafe"
+                    expected_error = "unsafe"
                 elif hostile_entry == "index":
                     index = generation / "index.json"
                     index.unlink()
@@ -309,9 +314,9 @@ class ArtifactPathContractTests(unittest.TestCase):
                     expected_error = "invalid or unsafe"
                 else:
                     selected = generation / "public"
-                    selected.rmdir()
+                    shutil.rmtree(selected)
                     selected.symlink_to(external, target_is_directory=True)
-                    expected_error = "missing or unsafe"
+                    expected_error = "unsafe"
 
                 with self.assertRaisesRegex(ValueError, expected_error):
                     resolve_prepared_artifact_dir(root / "public", "public")

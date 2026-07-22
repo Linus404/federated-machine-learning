@@ -269,12 +269,19 @@ def _validate_dataset(dataset: Mapping[str, Any]) -> None:
     """
     _required_nested_fields(
         dataset,
-        {"identity", "checksums", "status", "private_client_shards"},
+        {
+            "identity",
+            "checksums",
+            "public_manifest",
+            "status",
+            "private_client_shards",
+        },
         "dataset",
     )
     identity = dataset["identity"]
     checksums = dataset["checksums"]
     status = dataset["status"]
+    authoritative_public_manifest = dataset["public_manifest"]
     private_shards = dataset["private_client_shards"]
     if identity is not None and (not isinstance(identity, str) or not identity):
         raise ValueError("run provenance manifest has an invalid dataset.identity")
@@ -294,8 +301,21 @@ def _validate_dataset(dataset: Mapping[str, Any]) -> None:
         raise ValueError("run provenance manifest has an invalid dataset.status")
     if status == "available" and (identity is None or not checksums):
         raise ValueError("run provenance manifest has inconsistent dataset metadata")
-    if status == "unavailable" and (identity is not None or checksums):
+    if status == "unavailable" and (
+        identity is not None or checksums or authoritative_public_manifest is not None
+    ):
         raise ValueError("run provenance manifest has inconsistent dataset metadata")
+    if status == "available" and (
+        not isinstance(authoritative_public_manifest, Mapping)
+        or set(authoritative_public_manifest) != {"filename", "size_bytes", "checksum"}
+        or authoritative_public_manifest["filename"] != "manifest.json"
+        or type(authoritative_public_manifest["size_bytes"]) is not int
+        or authoritative_public_manifest["size_bytes"] < 1
+        or authoritative_public_manifest["checksum"] != checksums.get("manifest.json")
+    ):
+        raise ValueError(
+            "run provenance manifest has an invalid dataset.public_manifest"
+        )
     if not isinstance(private_shards, Mapping):
         raise ValueError(
             "run provenance manifest has an invalid dataset.private_client_shards"
@@ -348,7 +368,7 @@ def _validate_dataset(dataset: Mapping[str, Any]) -> None:
             or type(shard_identity["sample_count"]) is not int
             or shard_identity["sample_count"] < 1
             or not isinstance(shard_dataset, Mapping)
-            or shard_dataset.get("split") != "train"
+            or dict(shard_dataset) != expected_train_dataset()
             or not isinstance(shard_histogram, Mapping)
             or not shard_histogram
             or any(
@@ -371,6 +391,15 @@ def _validate_dataset(dataset: Mapping[str, Any]) -> None:
         ):
             raise ValueError(
                 "run provenance manifest has an invalid dataset.private_client_shards"
+            )
+        if (
+            status != "available"
+            or not isinstance(authoritative_public_manifest, Mapping)
+            or dict(public_manifest) != dict(authoritative_public_manifest)
+        ):
+            raise ValueError(
+                "run provenance private shard public manifest binding differs from "
+                "the authoritative public manifest"
             )
         if any(
             not isinstance(name, str)
@@ -547,6 +576,7 @@ def _dataset_metadata(
         return {
             "identity": None,
             "checksums": {},
+            "public_manifest": None,
             "status": "unavailable",
             "private_client_shards": private_status,
         }
@@ -558,6 +588,11 @@ def _dataset_metadata(
         "checksums": {
             "manifest.json": sha256_bytes(manifest.manifest_bytes),
             manifest.vocabulary_path.name: sha256_bytes(manifest.vocabulary_bytes),
+        },
+        "public_manifest": {
+            "filename": "manifest.json",
+            "size_bytes": len(manifest.manifest_bytes),
+            "checksum": sha256_bytes(manifest.manifest_bytes),
         },
         "status": "available",
         "private_client_shards": private_status,

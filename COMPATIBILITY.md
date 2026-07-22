@@ -14,28 +14,31 @@ adding an optional setting with an unchanged default is compatible.
 
 ## Artifact schemas
 
-Artifact schemas are scoped by artifact kind. Public manifests, client shards,
-server artifact manifests, and the prepared-generation index use schema `2`;
-evaluation artifacts, run provenance, and the current-run index use schema `1`:
+Artifact schemas are scoped by artifact kind. Public manifests and client shards
+use schema `2`; server artifact manifests and the prepared-generation index use
+schema `3`; evaluation artifacts, run provenance, and the current-run index use
+schema `1`:
 
 - `artifacts/public/manifest.json` uses `schema_version: 2` and describes the
   frozen train-dataset identity, checksummed vocabulary, and model dimensions.
 - Each `client-N/client_metadata.json` uses `schema_version: 2`, describes its
   client-scoped raw-review shard, and binds its records to the exact public
   manifest used by the consumer.
-- `.prepared-current/index.json` uses `schema_version: 2`; the atomic
+- `.prepared-current/index.json` uses `schema_version: 3`; the atomic
   `.prepared-current` directory link selects one
   immutable directory under `.prepared-generations/<generation-id>`. Its client,
   public, and evaluation children are always selected as one generation. The
   canonical index bytes must record the same UUIDv4 as the selected directory and
-  bind the artifact-affecting preparation request, currently the positive client
-  partition count. The durable migration journal carries the same request.
+  bind the artifact-affecting preparation request and the exact size and SHA-256
+  digest of every public, client, and evaluation file. The durable migration
+  journal carries the same request and independently binds the canonical index
+  checksum.
 - `artifacts/evaluation/manifest.json` uses `schema_version: 1` and strictly
   versions and checksums the immutable official test-split JSONL artifact.
-- Each completed `server/runs/<run_id>` directory has schema-2
+- Each completed `server/runs/<run_id>` directory has schema-3
   `artifact_manifest.json`, which binds the Keras model and both metrics CSV
   layouts to the exact public manifest, vocabulary, and model dimensions as one
-  consistent, checksummed artifact set.
+  consistent artifact set with exact retained sizes and checksums.
 - Each run directory has an immutable schema-1 `run_manifest.json`, which versions
   run identity, configuration, environment, code, seed, and public-dataset
   provenance as one schema-checked record. Its string-encoded public-dataset
@@ -66,6 +69,12 @@ schema `1` artifacts do not require a schema migration. Prepared-generation sche
 pending schema-1 preparation is safely rolled back and its journal-owned candidate
 discarded before regeneration; an already selected schema-1 generation remains
 immutable until a schema-2 generation atomically supersedes it.
+
+Prepared-generation schema `2` did not independently bind the selected file
+inventory. Pending schema-2 preparations are rolled back rather than recovered;
+regenerate them as schema `3`. Server schema `2` completion did not retain file
+sizes or guarantee one retained byte snapshot for provenance validation and
+checksumming; rerun training to produce server schema `3`.
 
 Artifacts are derived outputs, so regeneration into another root remains
 non-destructive:

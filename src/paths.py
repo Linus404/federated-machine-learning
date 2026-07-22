@@ -5,12 +5,13 @@ import os
 import stat
 import uuid
 from pathlib import Path
-from typing import BinaryIO, Mapping
+from typing import Any, BinaryIO, Mapping
 
 from src.artifact_compatibility import (
     canonical_json_bytes,
     read_regular_file,
     reject_duplicate_json_keys,
+    sha256_bytes,
 )
 
 PUBLIC_ARTIFACT_DIR_ENV = "FML_PUBLIC_ARTIFACT_DIR"
@@ -29,8 +30,117 @@ PREPARED_CONTROL_BASENAME_PREFIXES = (
     ".prepare-",
     f".{PREPARED_CURRENT_FILENAME}.",
 )
-PREPARED_GENERATION_SCHEMA_VERSION = 2
+PREPARED_GENERATION_SCHEMA_VERSION = 3
 PREPARED_ARTIFACT_KINDS = frozenset({"client", "public", "evaluation"})
+
+
+def validate_prepared_generation_inventory(value: object) -> dict[str, dict[str, Any]]:
+    """Validate and canonicalize one prepared-generation file inventory.
+
+    Parameters
+    ----------
+    value : object
+        Candidate mapping from generation-relative filenames to byte bindings.
+
+    Returns
+    -------
+    dict of str to dict of str to Any
+        Canonically ordered exact file inventory.
+
+    Raises
+    ------
+    ValueError
+        If a path, size, checksum, or field set is invalid.
+    """
+    if not isinstance(value, Mapping) or not value:
+        raise ValueError("prepared generation inventory must be a non-empty object")
+    inventory: dict[str, dict[str, Any]] = {}
+    for filename in sorted(value):
+        binding = value[filename]
+        path = Path(filename) if isinstance(filename, str) else Path()
+        if (
+            not isinstance(filename, str)
+            or path.is_absolute()
+            or len(path.parts) < 2
+            or path.parts[0] not in PREPARED_ARTIFACT_KINDS
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or path.as_posix() != filename
+            or not isinstance(binding, Mapping)
+            or set(binding) != {"size_bytes", "checksum"}
+        ):
+            raise ValueError("prepared generation inventory entry is invalid")
+        size = binding["size_bytes"]
+        checksum = binding["checksum"]
+        if (
+            type(size) is not int
+            or size < 0
+            or not isinstance(checksum, str)
+            or len(checksum) != 71
+            or not checksum.startswith("sha256:")
+            or any(character not in "0123456789abcdef" for character in checksum[7:])
+        ):
+            raise ValueError("prepared generation inventory binding is invalid")
+        inventory[filename] = {"size_bytes": size, "checksum": checksum}
+    return inventory
+
+
+def prepared_generation_inventory(
+    generation: Path, *, artifact_kind: str | None = None
+) -> dict[str, dict[str, Any]]:
+    """Snapshot exact regular files beneath one prepared generation.
+
+    Parameters
+    ----------
+    generation : pathlib.Path
+        Canonical generation directory containing artifact-kind subdirectories.
+    artifact_kind : str or None, optional
+        Restrict the snapshot to one selected artifact kind.
+
+    Returns
+    -------
+    dict of str to dict of str to Any
+        Sorted relative filenames bound to exact sizes and SHA-256 checksums.
+
+    Raises
+    ------
+    ValueError
+        If the generation contains unsafe directories or files.
+    """
+    if artifact_kind is not None and artifact_kind not in PREPARED_ARTIFACT_KINDS:
+        raise ValueError(f"unsupported prepared artifact kind: {artifact_kind}")
+    if generation.is_symlink() or not generation.is_dir():
+        raise ValueError("prepared generation is missing or unsafe")
+    canonical_generation = generation.resolve(strict=True)
+    roots = (
+        [generation / artifact_kind]
+        if artifact_kind is not None
+        else [generation / name for name in sorted(PREPARED_ARTIFACT_KINDS)]
+    )
+    inventory: dict[str, dict[str, Any]] = {}
+
+    def visit(directory: Path) -> None:
+        if directory.is_symlink() or not directory.is_dir():
+            raise ValueError("prepared generation directory is unsafe")
+        canonical_directory = directory.resolve(strict=True)
+        if canonical_generation not in canonical_directory.parents:
+            raise ValueError("prepared generation directory escapes its root")
+        for child in sorted(directory.iterdir(), key=lambda item: item.name):
+            child_stat = child.lstat()
+            if stat.S_ISDIR(child_stat.st_mode):
+                visit(child)
+                continue
+            if not stat.S_ISREG(child_stat.st_mode):
+                raise ValueError("prepared generation file is unsafe")
+            content = read_regular_file(child, parent=canonical_directory)
+            relative = child.relative_to(generation).as_posix()
+            inventory[relative] = {
+                "size_bytes": len(content),
+                "checksum": sha256_bytes(content),
+            }
+
+    for root in roots:
+        visit(root)
+    return inventory
 
 
 def validate_preparation_request(value: object) -> dict[str, int]:
@@ -176,6 +286,7 @@ def resolve_prepared_artifact_dir(value: str | Path, artifact_kind: str) -> Path
     if not isinstance(payload, dict) or set(payload) != {
         "schema_version",
         "generation_id",
+        "inventory",
         "logical_roots",
         "preparation_request",
     }:
@@ -198,9 +309,11 @@ def resolve_prepared_artifact_dir(value: str | Path, artifact_kind: str) -> Path
     ):
         raise ValueError("prepared generation index does not match configured roots")
     preparation_request = validate_preparation_request(payload["preparation_request"])
+    inventory = validate_prepared_generation_inventory(payload["inventory"])
     canonical_payload = {
         "schema_version": PREPARED_GENERATION_SCHEMA_VERSION,
         "generation_id": payload["generation_id"],
+        "inventory": inventory,
         "logical_roots": {
             name: logical_roots[name] for name in sorted(PREPARED_ARTIFACT_KINDS)
         },
@@ -227,6 +340,19 @@ def resolve_prepared_artifact_dir(value: str | Path, artifact_kind: str) -> Path
         raise ValueError("prepared generation index has an invalid generation_id")
     if index_generation_id != pointer_generation_id:
         raise ValueError("prepared generation pointer and index identities differ")
+
+    selected_inventory = {
+        filename: binding
+        for filename, binding in inventory.items()
+        if Path(filename).parts[0] == artifact_kind
+    }
+    if (
+        prepared_generation_inventory(canonical_generation, artifact_kind=artifact_kind)
+        != selected_inventory
+    ):
+        raise ValueError(
+            "selected prepared generation differs from its bound inventory"
+        )
 
     selected = generation / artifact_kind
     if selected.is_symlink() or not selected.is_dir():

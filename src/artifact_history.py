@@ -19,10 +19,12 @@ from src.artifact_compatibility import (
     ARTIFACT_SCHEMA_VERSION,
     SERVER_ARTIFACT_MANIFEST_FILENAME,
     ServerArtifactSnapshot,
+    capture_server_artifact_files,
     load_server_artifact_snapshot,
     read_regular_file,
     sha256_bytes,
     strict_json_loads,
+    verify_server_artifact_files,
     write_json_atomically,
     write_server_artifact_manifest,
 )
@@ -270,11 +272,18 @@ def load_current_run_snapshot(
         sha256_bytes(manifest_bytes), index["artifact_manifest_checksum"]
     ):
         raise ValueError("current-run artifact manifest checksum does not match")
-    return load_server_artifact_snapshot(
+    snapshot = load_server_artifact_snapshot(
         canonical_run_dir,
         manifest_bytes=manifest_bytes,
         app_manifest=app_manifest,
     )
+    provenance = load_run_provenance_manifest(
+        run_manifest_path(canonical_run_dir),
+        manifest_bytes=snapshot.files["run_manifest.json"],
+    )
+    if provenance["run_id"] != canonical_run_dir.name:
+        raise ValueError("current run directory does not match its provenance run_id")
+    return snapshot
 
 
 def publish_completed_run(artifact_root: str | Path, run_dir: str | Path) -> Path:
@@ -305,8 +314,12 @@ def publish_completed_run(artifact_root: str | Path, run_dir: str | Path) -> Pat
         if current is not None and current["run_id"] == resolved_run_dir.name:
             raise ValueError("completed run cannot be finalized again")
 
+        try:
+            artifact_snapshot = capture_server_artifact_files(resolved_run_dir)
+        except ValueError as error:
+            raise ValueError("server artifact is missing or unsafe") from error
         provenance_path = run_manifest_path(resolved_run_dir)
-        provenance_bytes = read_regular_file(provenance_path, parent=resolved_run_dir)
+        provenance_bytes = artifact_snapshot.files["run_manifest.json"].content
         provenance = load_run_provenance_manifest(
             provenance_path, manifest_bytes=provenance_bytes
         )
@@ -320,16 +333,35 @@ def publish_completed_run(artifact_root: str | Path, run_dir: str | Path) -> Pat
             )
             if snapshot.manifest.get("lifecycle") != "complete":
                 manifest_path = write_server_artifact_manifest(
-                    resolved_run_dir, finalized=True
+                    resolved_run_dir,
+                    finalized=True,
+                    artifact_snapshot=artifact_snapshot,
                 )
                 manifest_bytes = read_regular_file(
                     manifest_path, parent=resolved_run_dir
                 )
+            elif dict(snapshot.files) != {
+                name: retained.content
+                for name, retained in artifact_snapshot.files.items()
+            }:
+                raise ValueError("completed run differs from its retained snapshot")
         else:
             manifest_path = write_server_artifact_manifest(
-                resolved_run_dir, finalized=True
+                resolved_run_dir,
+                finalized=True,
+                artifact_snapshot=artifact_snapshot,
             )
             manifest_bytes = read_regular_file(manifest_path, parent=resolved_run_dir)
+        completed = load_server_artifact_snapshot(
+            resolved_run_dir, manifest_bytes=manifest_bytes
+        )
+        completed_provenance = load_run_provenance_manifest(
+            provenance_path,
+            manifest_bytes=completed.files["run_manifest.json"],
+        )
+        if completed_provenance["run_id"] != resolved_run_dir.name:
+            raise ValueError("run directory does not match its provenance run_id")
+        verify_server_artifact_files(resolved_run_dir, artifact_snapshot)
         index = {
             "schema_version": ARTIFACT_SCHEMA_VERSION,
             "run_id": resolved_run_dir.name,

@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 ARTIFACT_SCHEMA_VERSION = 1
 PUBLIC_ARTIFACT_SCHEMA_VERSION = 2
 CLIENT_SHARD_SCHEMA_VERSION = 2
-SERVER_ARTIFACT_SCHEMA_VERSION = 2
+SERVER_ARTIFACT_SCHEMA_VERSION = 3
 SERVER_ARTIFACT_MANIFEST_FILENAME = "artifact_manifest.json"
 SERVER_ARTIFACTS: dict[str, dict[str, Any]] = {
     "model": {"filename": "global_model.keras", "format": "keras-v3"},
@@ -195,6 +195,47 @@ class ServerArtifactSnapshot:
     files: Mapping[str, bytes]
 
 
+@dataclass(frozen=True)
+class RegularFileSnapshot:
+    """Retain bytes and filesystem identity from one secure descriptor read.
+
+    Parameters
+    ----------
+    content : bytes
+        Exact bytes read from the opened file descriptor.
+    device : int
+        Device identity reported by ``fstat``.
+    inode : int
+        Inode identity reported by ``fstat``.
+    size_bytes : int
+        File size reported by ``fstat``.
+    modified_ns : int
+        Nanosecond modification timestamp reported by ``fstat``.
+    changed_ns : int
+        Nanosecond metadata-change timestamp reported by ``fstat``.
+    """
+
+    content: bytes
+    device: int
+    inode: int
+    size_bytes: int
+    modified_ns: int
+    changed_ns: int
+
+
+@dataclass(frozen=True)
+class ServerFinalizationSnapshot:
+    """Retain every finalizable server file from one secure capture pass.
+
+    Parameters
+    ----------
+    files : mapping of str to RegularFileSnapshot
+        Immutable filename-to-descriptor snapshot mapping.
+    """
+
+    files: Mapping[str, RegularFileSnapshot]
+
+
 def sha256_bytes(content: bytes) -> str:
     """Return the algorithm-prefixed SHA-256 digest of bytes.
 
@@ -292,6 +333,31 @@ def read_regular_file(path: Path, *, parent: Path) -> bytes:
     ValueError
         If the path escapes its parent or is not a regular file.
     """
+    return read_regular_file_snapshot(path, parent=parent).content
+
+
+def read_regular_file_snapshot(path: Path, *, parent: Path) -> RegularFileSnapshot:
+    """Read one regular file while retaining descriptor identity metadata.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        File to read.
+    parent : pathlib.Path
+        Canonical directory that must directly contain the file.
+
+    Returns
+    -------
+    RegularFileSnapshot
+        Exact bytes and stable descriptor identity from the same read.
+
+    Raises
+    ------
+    RuntimeError
+        If the process cannot enforce the Linux artifact filesystem contract.
+    ValueError
+        If the path escapes its parent, is not regular, or changes during the read.
+    """
     require_secure_artifact_platform()
     canonical_parent = parent.resolve(strict=True)
     if path.parent.resolve(strict=True) != canonical_parent or path.is_symlink():
@@ -311,12 +377,33 @@ def read_regular_file(path: Path, *, parent: Path) -> bytes:
             f"artifact must be a contained regular file: {path.name}"
         ) from error
     try:
-        file_stat = os.fstat(descriptor)
-        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
             raise ValueError(f"artifact must be a contained regular file: {path.name}")
         with os.fdopen(descriptor, "rb") as file:
             descriptor = -1
-            return file.read()
+            content = file.read()
+            after = os.fstat(file.fileno())
+            identity = (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            if (
+                identity
+                != (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_size,
+                    after.st_mtime_ns,
+                    after.st_ctime_ns,
+                )
+                or len(content) != after.st_size
+            ):
+                raise ValueError(f"artifact changed while reading: {path.name}")
+            return RegularFileSnapshot(content, *identity)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
@@ -541,6 +628,7 @@ def write_server_artifact_manifest(
     *,
     app_manifest: AppManifest | None = None,
     finalized: bool = False,
+    artifact_snapshot: ServerFinalizationSnapshot | None = None,
 ) -> Path:
     """Write the compatibility contract for one server artifact directory.
 
@@ -553,6 +641,8 @@ def write_server_artifact_manifest(
         it only when the existing in-progress manifest already contains the binding.
     finalized : bool, optional
         Require completed outputs and record their checksums.
+    artifact_snapshot : ServerFinalizationSnapshot or None, optional
+        Securely retained artifact snapshot used for finalization.
 
     Returns
     -------
@@ -607,28 +697,106 @@ def write_server_artifact_manifest(
                 raise ValueError(
                     "completed artifact manifest cannot be finalized again"
                 )
-        missing = [
-            name
-            for name in REQUIRED_COMPLETED_ARTIFACTS
-            if not (artifact_dir / name).exists()
-        ]
+        retained = (
+            capture_server_artifact_files(artifact_dir)
+            if artifact_snapshot is None
+            else artifact_snapshot
+        )
+        missing = sorted(REQUIRED_COMPLETED_ARTIFACTS - retained.files.keys())
         if missing:
             raise ValueError(
                 "cannot finalize run with missing artifacts: "
                 + ", ".join(sorted(missing))
             )
-        artifact_bytes: dict[str, bytes] = {}
-        for artifact_path in sorted(artifact_dir.iterdir()):
-            if artifact_path.name == SERVER_ARTIFACT_MANIFEST_FILENAME:
-                continue
-            artifact_bytes[artifact_path.name] = read_regular_file(
-                artifact_path, parent=canonical_dir
-            )
+        verify_server_artifact_files(artifact_dir, retained)
         payload["lifecycle"] = "complete"
+        payload["sizes"] = {
+            name: snapshot.size_bytes for name, snapshot in retained.files.items()
+        }
         payload["checksums"] = {
-            name: sha256_bytes(content) for name, content in artifact_bytes.items()
+            name: sha256_bytes(snapshot.content)
+            for name, snapshot in retained.files.items()
         }
     return write_json_atomically(path, payload)
+
+
+def capture_server_artifact_files(artifact_dir: Path) -> ServerFinalizationSnapshot:
+    """Retain one secure snapshot of every finalizable server artifact.
+
+    Parameters
+    ----------
+    artifact_dir : pathlib.Path
+        Direct server run directory whose regular files are retained.
+
+    Returns
+    -------
+    ServerFinalizationSnapshot
+        Immutable descriptor snapshots excluding the artifact manifest.
+
+    Raises
+    ------
+    ValueError
+        If inventory entries are missing, linked, non-regular, or unsafe.
+    """
+    if artifact_dir.is_symlink() or not artifact_dir.is_dir():
+        raise ValueError("server artifact directory must be a regular directory")
+    canonical_dir = artifact_dir.resolve(strict=True)
+    files: dict[str, RegularFileSnapshot] = {}
+    for artifact_path in sorted(artifact_dir.iterdir(), key=lambda path: path.name):
+        if artifact_path.name == SERVER_ARTIFACT_MANIFEST_FILENAME:
+            continue
+        files[artifact_path.name] = read_regular_file_snapshot(
+            artifact_path, parent=canonical_dir
+        )
+    missing = sorted(REQUIRED_COMPLETED_ARTIFACTS - files.keys())
+    if missing:
+        raise ValueError(
+            "cannot finalize run with missing artifacts: " + ", ".join(missing)
+        )
+    return ServerFinalizationSnapshot(MappingProxyType(files))
+
+
+def verify_server_artifact_files(
+    artifact_dir: Path, artifact_snapshot: ServerFinalizationSnapshot
+) -> None:
+    """Require current paths to remain identical to retained artifact bytes.
+
+    Parameters
+    ----------
+    artifact_dir : pathlib.Path
+        Direct server run directory owning the retained files.
+    artifact_snapshot : ServerFinalizationSnapshot
+        Previously retained secure snapshot.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If the inventory, path type, inode target, or content changed.
+    """
+    files = artifact_snapshot.files
+    if any(
+        not isinstance(name, str)
+        or Path(name).name != name
+        or not isinstance(snapshot, RegularFileSnapshot)
+        for name, snapshot in files.items()
+    ):
+        raise ValueError("retained server artifact snapshot is invalid")
+    current_names = {
+        path.name
+        for path in artifact_dir.iterdir()
+        if path.name != SERVER_ARTIFACT_MANIFEST_FILENAME
+    }
+    if current_names != set(files):
+        raise ValueError("server artifact inventory changed during finalization")
+    canonical_dir = artifact_dir.resolve(strict=True)
+    for name, retained in files.items():
+        current = read_regular_file_snapshot(artifact_dir / name, parent=canonical_dir)
+        if current != retained:
+            raise ValueError(f"server artifact changed during finalization: {name}")
 
 
 def load_server_artifact_snapshot(
@@ -695,14 +863,20 @@ def load_server_artifact_snapshot(
 
     lifecycle = payload.get("lifecycle")
     checksums = payload.get("checksums")
-    if lifecycle is None and checksums is None:
+    sizes = payload.get("sizes")
+    if lifecycle is None and checksums is None and sizes is None:
         filenames = {
             str(layout["filename"])
             for layout in SERVER_ARTIFACTS.values()
             if (artifact_dir / str(layout["filename"])).exists()
         }
     else:
-        if lifecycle != "complete" or not isinstance(checksums, Mapping):
+        if (
+            lifecycle != "complete"
+            or not isinstance(checksums, Mapping)
+            or not isinstance(sizes, Mapping)
+            or set(sizes) != set(checksums)
+        ):
             raise ValueError("server artifact manifest has invalid completion metadata")
         if not REQUIRED_COMPLETED_ARTIFACTS <= checksums.keys():
             raise ValueError("server artifact manifest is missing required checksums")
@@ -711,6 +885,7 @@ def load_server_artifact_snapshot(
     files: dict[str, bytes] = {}
     for filename in filenames:
         expected = checksums.get(filename) if isinstance(checksums, Mapping) else None
+        expected_size = sizes.get(filename) if isinstance(sizes, Mapping) else None
         if (
             not isinstance(filename, str)
             or Path(filename).name != filename
@@ -722,6 +897,7 @@ def load_server_artifact_snapshot(
                     or not expected.startswith("sha256:")
                 )
             )
+            or (expected_size is not None and type(expected_size) is not int)
         ):
             raise ValueError("server artifact manifest has an invalid checksum")
         try:
@@ -734,6 +910,8 @@ def load_server_artifact_snapshot(
             sha256_bytes(content), expected
         ):
             raise ValueError(f"server artifact checksum does not match: {filename}")
+        if expected_size is not None and len(content) != expected_size:
+            raise ValueError(f"server artifact size does not match: {filename}")
         files[filename] = content
     return ServerArtifactSnapshot(
         directory=canonical_dir,

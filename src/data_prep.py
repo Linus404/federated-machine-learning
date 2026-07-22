@@ -26,6 +26,7 @@ from src.artifact_compatibility import (
     canonical_json_bytes,
     read_regular_file,
     require_secure_artifact_platform,
+    sha256_bytes,
     sha256_file,
     strict_json_loads,
     write_json_atomically,
@@ -54,7 +55,9 @@ from src.paths import (
     RunArtifactLock,
     default_evaluation_artifact_dir,
     default_public_artifact_dir,
+    prepared_generation_inventory,
     validate_preparation_request,
+    validate_prepared_generation_inventory,
 )
 from src.text_preprocessing import create_text_vectorizer
 
@@ -426,11 +429,11 @@ def _validate_migration_journal(
     if not isinstance(payload, dict):
         raise ValueError("prepared migration journal must be an object")
     schema_version = payload.get("schema_version")
-    fields = (
-        legacy_fields | {"preparation_request"}
-        if schema_version == PREPARED_GENERATION_SCHEMA_VERSION
-        else legacy_fields
-    )
+    fields = legacy_fields
+    if schema_version in {2, PREPARED_GENERATION_SCHEMA_VERSION}:
+        fields |= {"preparation_request"}
+    if schema_version == PREPARED_GENERATION_SCHEMA_VERSION:
+        fields |= {"generation_index_checksum"}
     if set(payload) != fields:
         raise ValueError("prepared migration journal has an invalid field set")
     generation_id = payload["generation_id"]
@@ -440,7 +443,7 @@ def _validate_migration_journal(
         raise ValueError("prepared migration journal generation is invalid") from error
     if (
         type(schema_version) is not int
-        or schema_version not in {1, PREPARED_GENERATION_SCHEMA_VERSION}
+        or schema_version not in {1, 2, PREPARED_GENERATION_SCHEMA_VERSION}
         or parsed_id is None
         or parsed_id.version != 4
         or str(parsed_id) != generation_id
@@ -460,9 +463,17 @@ def _validate_migration_journal(
         raise ValueError("prepared migration journal does not match configured roots")
     request = (
         validate_preparation_request(payload["preparation_request"])
-        if schema_version == PREPARED_GENERATION_SCHEMA_VERSION
+        if schema_version in {2, PREPARED_GENERATION_SCHEMA_VERSION}
         else None
     )
+    index_checksum = payload.get("generation_index_checksum")
+    if schema_version == PREPARED_GENERATION_SCHEMA_VERSION and (
+        not isinstance(index_checksum, str)
+        or len(index_checksum) != 71
+        or not index_checksum.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in index_checksum[7:])
+    ):
+        raise ValueError("prepared migration journal index checksum is invalid")
     legacy_roots = payload["legacy_roots"]
     alias_roots = payload["alias_roots"]
     for value, name in (
@@ -501,6 +512,11 @@ def _validate_migration_journal(
         "schema_version": schema_version,
         "generation_id": generation_id,
         "stage_name": stage_name,
+        **(
+            {"generation_index_checksum": index_checksum}
+            if index_checksum is not None
+            else {}
+        ),
         "logical_roots": expected_roots,
         **({"preparation_request": request} if request is not None else {}),
         "legacy_roots": legacy_roots,
@@ -567,20 +583,24 @@ def _validate_owned_generation_index(
         or generation.resolve(strict=True).parent != generations.resolve(strict=True)
     ):
         raise ValueError("prepared migration generation is unsafe")
-    expected_index = {
-        "schema_version": transaction["schema_version"],
-        "generation_id": transaction["generation_id"],
-        "logical_roots": transaction["logical_roots"],
-        **(
-            {"preparation_request": transaction["preparation_request"]}
-            if "preparation_request" in transaction
-            else {}
-        ),
-    }
     index_bytes = read_regular_file(
         generation / "index.json", parent=generation.resolve(strict=True)
     )
-    if index_bytes != canonical_json_bytes(expected_index):
+    if "generation_index_checksum" in transaction:
+        matches = sha256_bytes(index_bytes) == transaction["generation_index_checksum"]
+    else:
+        expected_index = {
+            "schema_version": transaction["schema_version"],
+            "generation_id": transaction["generation_id"],
+            "logical_roots": transaction["logical_roots"],
+            **(
+                {"preparation_request": transaction["preparation_request"]}
+                if "preparation_request" in transaction
+                else {}
+            ),
+        }
+        matches = index_bytes == canonical_json_bytes(expected_index)
+    if not matches:
         raise ValueError("prepared migration generation index differs from its journal")
 
 
@@ -659,23 +679,34 @@ def _validate_recovery_generation(
         if canonical_generation.parent != canonical_generations:
             raise ValueError("prepared migration generation escapes its root")
 
-        expected_index = {
-            "schema_version": transaction["schema_version"],
-            "generation_id": transaction["generation_id"],
-            "logical_roots": transaction["logical_roots"],
-            **(
-                {"preparation_request": transaction["preparation_request"]}
-                if "preparation_request" in transaction
-                else {}
-            ),
-        }
         index_bytes = read_regular_file(
             generation / "index.json", parent=canonical_generation
         )
-        if index_bytes != canonical_json_bytes(expected_index):
+        if sha256_bytes(index_bytes) != transaction["generation_index_checksum"]:
             raise ValueError(
                 "prepared migration generation index differs from its journal"
             )
+        index = strict_json_loads(index_bytes, source="prepared generation index")
+        if not isinstance(index, Mapping) or set(index) != {
+            "schema_version",
+            "generation_id",
+            "inventory",
+            "logical_roots",
+            "preparation_request",
+        }:
+            raise ValueError("prepared migration generation index is invalid")
+        inventory = validate_prepared_generation_inventory(index["inventory"])
+        expected_index = {
+            "schema_version": transaction["schema_version"],
+            "generation_id": transaction["generation_id"],
+            "inventory": inventory,
+            "logical_roots": transaction["logical_roots"],
+            "preparation_request": transaction["preparation_request"],
+        }
+        if index_bytes != canonical_json_bytes(expected_index):
+            raise ValueError("prepared migration generation index is invalid")
+        if prepared_generation_inventory(canonical_generation) != inventory:
+            raise ValueError("prepared migration generation inventory differs")
 
         protocol = load_scientific_protocol()
         app_manifest = load_app_manifest(
@@ -709,22 +740,53 @@ def _validate_recovery_generation(
 
         from src.local_training import load_client_shard_snapshot
 
-        identities: set[str] = set()
+        train_spec = protocol["dataset"]["splits"]["train"]
+        ordered_rows: list[tuple[str, int] | None] = [None] * train_spec["rows"]
         for client_id in client_ids:
             snapshot = load_client_shard_snapshot(
                 client_root / f"client-{client_id}", app_manifest, client_id
             )
-            shard_identities = {row[0] for row in snapshot.rows}
-            if identities & shard_identities:
-                raise ValueError("prepared migration client row identities overlap")
-            identities.update(shard_identities)
-        if identities != {
-            f"train:{index}" for index in range(app_manifest.payload["dataset"]["rows"])
-        }:
+            for row_id, text, label in snapshot.rows:
+                source_index = int(row_id.removeprefix("train:"))
+                if ordered_rows[source_index] is not None:
+                    raise ValueError("prepared migration client row identities overlap")
+                ordered_rows[source_index] = (text, label)
+        if any(row is None for row in ordered_rows):
             raise ValueError(
                 "prepared migration clients do not exactly partition the train split"
             )
-        load_evaluation_artifact_snapshot(generation / "evaluation", protocol=protocol)
+        train_content = hashlib.sha256()
+        train_labels: Counter[int] = Counter()
+        train_rows: set[bytes] = set()
+        for row in ordered_rows:
+            assert row is not None
+            text, label = row
+            source_bytes = canonical_source_row_bytes(text, label)
+            train_content.update(source_bytes)
+            train_labels[label] += 1
+            train_rows.add(source_bytes)
+        if train_content.hexdigest() != train_spec["content_sha256"]:
+            raise ValueError(
+                "prepared migration train content differs from frozen data"
+            )
+        expected_counts = train_spec.get("label_counts")
+        if (
+            expected_counts is not None
+            and [train_labels[label] for label in range(len(expected_counts))]
+            != expected_counts
+        ):
+            raise ValueError("prepared migration train labels differ from frozen data")
+
+        evaluation = load_evaluation_artifact_snapshot(
+            generation / "evaluation", protocol=protocol
+        )
+        evaluation_rows = {
+            canonical_source_row_bytes(str(row["text"]), int(row["label"]))
+            for line in evaluation.records.splitlines()
+            for row in [strict_json_loads(line, source="evaluation record")]
+        }
+        if train_rows & evaluation_rows:
+            raise ValueError("prepared migration train content overlaps evaluation")
     except _PreparedGenerationValidationError:
         raise
     except Exception as error:
@@ -759,7 +821,10 @@ def _recover_prepared_migration(
     if transaction is None:
         return False
     request = validate_preparation_request(preparation_request)
-    if transaction.get("preparation_request") != request:
+    if (
+        transaction["schema_version"] != PREPARED_GENERATION_SCHEMA_VERSION
+        or transaction.get("preparation_request") != request
+    ):
         _discard_mismatched_prepared_migration(roots, transaction)
         return False
     parent = roots["client"].parent
@@ -992,16 +1057,15 @@ def _publish_prepared_roots(
         raise ValueError("prepared generation staging directory escapes its root")
 
     generation_id = str(uuid.uuid4())
-    write_json_atomically(
-        generation_stage / "index.json",
-        {
-            "schema_version": PREPARED_GENERATION_SCHEMA_VERSION,
-            "generation_id": generation_id,
-            "logical_roots": {name: roots[name].name for name in sorted(roots)},
-            "preparation_request": request,
-        },
-        overwrite=False,
-    )
+    index = {
+        "schema_version": PREPARED_GENERATION_SCHEMA_VERSION,
+        "generation_id": generation_id,
+        "inventory": prepared_generation_inventory(generation_stage),
+        "logical_roots": {name: roots[name].name for name in sorted(roots)},
+        "preparation_request": request,
+    }
+    index_bytes = canonical_json_bytes(index)
+    write_json_atomically(generation_stage / "index.json", index, overwrite=False)
     _fsync_directory_tree(generation_stage)
     pointer = parent / PREPARED_CURRENT_FILENAME
     if pointer.exists() and not pointer.is_symlink():
@@ -1020,6 +1084,7 @@ def _publish_prepared_roots(
         "schema_version": PREPARED_GENERATION_SCHEMA_VERSION,
         "generation_id": generation_id,
         "stage_name": generation_stage.name,
+        "generation_index_checksum": sha256_bytes(index_bytes),
         "logical_roots": {name: roots[name].name for name in sorted(roots)},
         "preparation_request": request,
         "legacy_roots": sorted(legacy_roots),

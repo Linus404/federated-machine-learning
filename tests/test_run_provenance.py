@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from src.app_manifest import expected_train_dataset
@@ -114,7 +115,137 @@ def runtime_environment() -> dict[str, object]:
     }
 
 
+def private_shard_provenance(manifest_bytes: bytes) -> dict[str, Any]:
+    """Return valid private-shard evidence bound to one public snapshot.
+
+    Parameters
+    ----------
+    manifest_bytes : bytes
+        Exact authoritative public manifest bytes.
+
+    Returns
+    -------
+    dict of str to object
+        Private shard identity and checksums accepted by run provenance.
+    """
+    return {
+        "identity": {
+            "client_id": 0,
+            "dataset": expected_train_dataset(),
+            "source_split": "train",
+            "row_identity": "train:{zero_based_official_split_row_index}",
+            "sample_count": 2,
+            "label_histogram": {"0": 1, "1": 1},
+            "public_manifest": {
+                "filename": "manifest.json",
+                "size_bytes": len(manifest_bytes),
+                "checksum": "sha256:" + hashlib.sha256(manifest_bytes).hexdigest(),
+            },
+        },
+        "checksums": {
+            "client_metadata.json": "sha256:" + "1" * 64,
+            "reviews.jsonl": "sha256:" + "2" * 64,
+        },
+    }
+
+
 class RunProvenanceTests(unittest.TestCase):
+    def test_private_shard_requires_exact_dataset_and_public_binding(self) -> None:
+        mutations = {
+            field: value
+            for field, value in (
+                ("id", "attacker/imdb"),
+                ("config", "attacker"),
+                ("revision", "0" * 40),
+                ("datasets_version", "0.0.0"),
+                ("split", "test"),
+                ("rows", 1),
+                ("raw_parquet_sha256", "0" * 64),
+                ("content_sha256", "0" * 64),
+            )
+        }
+        for field, value in mutations.items():
+            with (
+                self.subTest(field=field),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                public_dir = Path(tmpdir) / "public"
+                public_dir.mkdir()
+                protocol = write_public_dataset_contract(public_dir)
+                from src.app_manifest import load_app_manifest
+
+                snapshot = load_app_manifest(
+                    public_artifact_dir=public_dir, protocol=protocol
+                )
+                shard = private_shard_provenance(snapshot.manifest_bytes)
+                shard["identity"]["dataset"][field] = value
+                with self.assertRaisesRegex(ValueError, "private_client_shards"):
+                    write_run_provenance_manifest(
+                        Path(tmpdir) / "run",
+                        {},
+                        app_manifest=snapshot,
+                        client_shard=shard,
+                    )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            public_dir = Path(tmpdir) / "public"
+            public_dir.mkdir()
+            protocol = write_public_dataset_contract(public_dir)
+            from src.app_manifest import load_app_manifest
+
+            snapshot = load_app_manifest(
+                public_artifact_dir=public_dir, protocol=protocol
+            )
+            shard = private_shard_provenance(snapshot.manifest_bytes)
+            shard["identity"]["public_manifest"]["size_bytes"] += 1
+            with self.assertRaisesRegex(ValueError, "authoritative public manifest"):
+                write_run_provenance_manifest(
+                    Path(tmpdir) / "run",
+                    {},
+                    app_manifest=snapshot,
+                    client_shard=shard,
+                )
+
+    def test_supplied_snapshot_records_valid_private_binding_without_reopen(
+        self,
+    ) -> None:
+        from src.app_manifest import load_app_manifest
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            public_dir = Path(tmpdir) / "public"
+            public_dir.mkdir()
+            protocol = write_public_dataset_contract(public_dir)
+            snapshot = load_app_manifest(
+                public_artifact_dir=public_dir, protocol=protocol
+            )
+            shard = private_shard_provenance(snapshot.manifest_bytes)
+            with (
+                patch(
+                    "src.run_provenance.load_app_manifest",
+                    side_effect=AssertionError("public pointer reopened"),
+                ),
+                patch(
+                    "src.run_provenance.resolve_public_artifact_dir",
+                    side_effect=AssertionError("public pointer resolved"),
+                ),
+            ):
+                path = write_run_provenance_manifest(
+                    Path(tmpdir) / "run",
+                    {},
+                    public_artifact_dir=public_dir,
+                    app_manifest=snapshot,
+                    client_shard=shard,
+                )
+            payload = load_run_provenance_manifest(path)
+
+        self.assertEqual(
+            payload["dataset"]["private_client_shards"]["status"], "available"
+        )
+        self.assertEqual(
+            payload["dataset"]["private_client_shards"]["identity"]["public_manifest"],
+            payload["dataset"]["public_manifest"],
+        )
+
     def test_supplied_public_snapshot_is_not_reopened_for_provenance(self) -> None:
         from src.app_manifest import load_app_manifest
 
@@ -593,6 +724,11 @@ class RunProvenanceTests(unittest.TestCase):
                 **base["dataset"],
                 "identity": canonical_identity,
                 "checksums": {"manifest.json": "sha256:" + "3" * 64},
+                "public_manifest": {
+                    "filename": "manifest.json",
+                    "size_bytes": 1,
+                    "checksum": "sha256:" + "3" * 64,
+                },
                 "status": "available",
             }
             valid_path = root / "valid.json"

@@ -11,7 +11,10 @@ from flwr.common import Context, ndarrays_to_parameters, parameters_to_ndarrays
 
 import src.server_app as server_app
 from src.app_manifest import expected_train_dataset
-from src.artifact_compatibility import load_server_artifact_manifest
+from src.artifact_compatibility import (
+    SERVER_ARTIFACT_SCHEMA_VERSION,
+    load_server_artifact_manifest,
+)
 from tests.artifact_helpers import fake_app_manifest
 
 
@@ -304,7 +307,8 @@ class MetricAggregationTests(unittest.TestCase):
                 )
 
             self.assertEqual(
-                load_server_artifact_manifest(Path(tmpdir))["schema_version"], 2
+                load_server_artifact_manifest(Path(tmpdir))["schema_version"],
+                SERVER_ARTIFACT_SCHEMA_VERSION,
             )
 
     def test_weighted_average_uses_num_examples(self) -> None:
