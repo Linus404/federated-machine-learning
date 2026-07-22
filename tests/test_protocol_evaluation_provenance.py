@@ -13,7 +13,11 @@ PROTOCOL_PATH = Path("docs/scientific-protocol-v1.toml")
 
 
 def classification_metrics(
-    config: dict[str, Any], labels: np.ndarray, probabilities: np.ndarray
+    config: dict[str, Any],
+    labels: np.ndarray,
+    probabilities: np.ndarray,
+    *,
+    evaluation_scope: str = "standard",
 ) -> dict[str, Any]:
     """Execute the registered binary-classification metric contract.
 
@@ -25,6 +29,8 @@ def classification_metrics(
         Rank-one binary labels with exact ``int64`` dtype.
     probabilities : numpy.ndarray
         Rank-one sigmoid probabilities with exact ``float32`` dtype.
+    evaluation_scope : str, optional
+        Evaluation scope used to gate the local-only validation exception.
 
     Returns
     -------
@@ -58,7 +64,8 @@ def classification_metrics(
 
     positives = int(np.count_nonzero(labels == config["positive_label"]))
     negatives = int(labels.size - positives)
-    if positives == 0 or negatives == 0:
+    single_class = positives == 0 or negatives == 0
+    if single_class and evaluation_scope != config["local_only_single_class"]["scope"]:
         raise ValueError("classification ROC requires both classes")
 
     predicted_positive = probabilities >= np.float32(config["decision_threshold"])
@@ -71,13 +78,23 @@ def classification_metrics(
     recall_denominator = true_positive + false_negative
     f1_denominator = 2 * true_positive + false_positive + false_negative
 
-    thresholds = np.concatenate(([np.inf], np.unique(probabilities)[::-1]))
-    fpr = np.empty(thresholds.size, dtype=np.float64)
-    tpr = np.empty(thresholds.size, dtype=np.float64)
-    for index, threshold in enumerate(thresholds):
-        threshold_predictions = probabilities >= threshold
-        tpr[index] = np.count_nonzero(threshold_predictions & (labels == 1)) / positives
-        fpr[index] = np.count_nonzero(threshold_predictions & (labels == 0)) / negatives
+    thresholds = None
+    fpr = None
+    tpr = None
+    roc_auc = None
+    if not single_class:
+        thresholds = np.concatenate(([np.inf], np.unique(probabilities)[::-1]))
+        fpr = np.empty(thresholds.size, dtype=np.float64)
+        tpr = np.empty(thresholds.size, dtype=np.float64)
+        for index, threshold in enumerate(thresholds):
+            threshold_predictions = probabilities >= threshold
+            tpr[index] = (
+                np.count_nonzero(threshold_predictions & (labels == 1)) / positives
+            )
+            fpr[index] = (
+                np.count_nonzero(threshold_predictions & (labels == 0)) / negatives
+            )
+        roc_auc = float(np.trapezoid(tpr, fpr))
 
     return {
         "predicted_positive": predicted_positive,
@@ -104,7 +121,8 @@ def classification_metrics(
         "roc_thresholds": thresholds,
         "fpr": fpr,
         "tpr": tpr,
-        "roc_auc": float(np.trapezoid(tpr, fpr)),
+        "roc_auc": roc_auc,
+        "roc_auc_status": ("undefined_single_class" if single_class else "defined"),
     }
 
 
@@ -340,6 +358,32 @@ class ClassificationEvaluationContractTests(unittest.TestCase):
                 np.testing.assert_array_equal(actual["fpr"], vector["fpr"])
                 np.testing.assert_array_equal(actual["tpr"], vector["tpr"])
 
+    def test_local_only_single_class_validation_is_explicitly_undefined(self) -> None:
+        single_class = self.config["local_only_single_class"]
+        self.assertEqual(single_class["scope"], "local_only_validation_only")
+        self.assertEqual(single_class["undefined_value"], "JSON null")
+        self.assertEqual(single_class["status_value"], "undefined_single_class")
+        self.assertIn("untouched test", single_class["cell_summary"])
+
+        for vector in single_class["golden_vectors"]:
+            with self.subTest(name=vector["name"]):
+                actual = classification_metrics(
+                    self.config,
+                    np.asarray(vector["labels"], dtype=np.int64),
+                    np.asarray(vector["probabilities"], dtype=np.float32),
+                    evaluation_scope=single_class["scope"],
+                )
+                np.testing.assert_array_equal(
+                    actual["predicted_positive"], vector["predicted_positive"]
+                )
+                self.assertEqual(actual["confusion_matrix"], vector["confusion_matrix"])
+                for metric in ("accuracy", "precision", "recall", "f1"):
+                    self.assertEqual(actual[metric], vector[metric])
+                for field in ("roc_thresholds", "fpr", "tpr", "roc_auc"):
+                    self.assertEqual(vector[field], single_class["undefined_value"])
+                    self.assertIsNone(actual[field])
+                self.assertEqual(actual["roc_auc_status"], vector["roc_auc_status"])
+
     def test_classification_rejects_hostile_inputs_without_repair(self) -> None:
         labels = np.array([0, 1], dtype=np.int64)
         probabilities = np.array([0.25, 0.75], dtype=np.float32)
@@ -388,12 +432,16 @@ class ProvenanceContractTests(unittest.TestCase):
             self.manifest["config"]["effective_sha256"],
             probe["effective_config_sha256"],
         )
+        self.assertEqual(
+            self.manifest["execution"]["attempts"][0]["failure"]["type"],
+            "builtins.TimeoutError",
+        )
         sidecar = (
             f"{probe['manifest_sha256']}  {self.provenance['manifest_filename']}\n"
         )
         self.assertEqual(
             sidecar,
-            "cb92a4f27ad815de9d6cb18ef0b22b898023cf27df19ded0e83250969f39afba"
+            "ae51e1d1ca7fa26d6c3ce69da3b2c4c2991861459469b66438f3011408e2a29f"
             "  provenance.json\n",
         )
 

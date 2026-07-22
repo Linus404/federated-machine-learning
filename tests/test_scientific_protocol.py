@@ -1354,6 +1354,7 @@ print(json.dumps({
                     np.count_nonzero(self.labels[fitted[selected_client]] == label),
                     required,
                 )
+
             for earlier_client in range(selected_client):
                 self.assertTrue(
                     any(
@@ -1496,6 +1497,47 @@ print(json.dumps({
                 np.arange(499),
                 500,
             )
+
+    def test_local_only_single_class_validation_occurrences_are_frozen(self) -> None:
+        expected = [
+            [67, 0, 1],
+            [67, 3, 1],
+            [101, 0, 0],
+            [101, 1, 0],
+            [101, 2, 0],
+            [101, 3, 1],
+            [211, 0, 1],
+            [211, 1, 0],
+            [211, 2, 0],
+            [307, 0, 0],
+            [307, 3, 1],
+            [401, 0, 1],
+            [401, 2, 0],
+        ]
+        self.assertEqual(
+            self.protocol["metrics"]["classification"]["local_only_single_class"][
+                "registered_occurrences"
+            ],
+            expected,
+        )
+        actual = []
+        for seed in self.protocol["seeding"]["seeds"]:
+            result = self.partition_results()[(seed, "dirichlet_0.1", 4)]
+            self.assertIsNotNone(result)
+            _, shards = result
+            _, validation = validation_split(
+                self.protocol,
+                self.labels,
+                seed,
+                "dirichlet_0.1",
+                4,
+                shards,
+            )
+            for client_id, rows in enumerate(validation):
+                for label in self.protocol["partitioning"]["labels"]:
+                    if not np.any(self.labels[rows] == label):
+                        actual.append([seed, client_id, label])
+        self.assertEqual(actual, expected)
 
     def test_excluded_dirichlet_point_one_64_exhausts_every_seed(self) -> None:
         scale = self.protocol["matrix"]["scale"]

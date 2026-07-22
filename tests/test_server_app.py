@@ -458,6 +458,88 @@ class MetricAggregationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "finite values"):
                 strategy.aggregate_fit(1, [result], [])
 
+    def test_terminal_fit_failures_release_writer_without_publication(self) -> None:
+        valid_parameters = ndarrays_to_parameters([np.array([1.0], dtype=np.float32)])
+        valid_result = (
+            Mock(),
+            SimpleNamespace(
+                parameters=valid_parameters,
+                num_examples=1,
+                metrics={"client_id": 0},
+            ),
+        )
+        cases = {
+            "reported_client_failure": (
+                [],
+                [RuntimeError("client failed")],
+                None,
+                None,
+            ),
+            "malformed_result": (
+                [(Mock(), SimpleNamespace(metrics=None))],
+                [],
+                None,
+                None,
+            ),
+            "aggregation_error": (
+                [valid_result],
+                [],
+                RuntimeError("aggregation failed"),
+                None,
+            ),
+            "persistence_error": (
+                [valid_result],
+                [],
+                None,
+                OSError("model save failed"),
+            ),
+        }
+
+        for name, (
+            results,
+            failures,
+            aggregation_error,
+            persistence_error,
+        ) in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                run_dir = root / "runs" / "11111111-1111-4111-8111-111111111111"
+                strategy = server_app.SentimentServer.__new__(
+                    server_app.SentimentServer
+                )
+                strategy.use_huber = False
+                strategy.accept_failures = False
+                strategy.inplace = True
+                strategy.fit_metrics_aggregation_fn = None
+                strategy.expected_client_ids = frozenset({0})
+                strategy.expected_weight_shapes = ((1,),)
+                strategy.artifact_dir = run_dir
+                strategy.artifact_root = root
+                strategy.app_manifest = object()
+                strategy._artifact_lock = server_app.acquire_run_artifact_lock(run_dir)
+                model = Mock()
+                model.save.side_effect = persistence_error
+
+                with (
+                    patch.object(
+                        server_app.FedProx,
+                        "aggregate_fit",
+                        return_value=(valid_parameters, {}),
+                        side_effect=aggregation_error,
+                    ),
+                    patch.object(
+                        server_app, "build_model_from_manifest", return_value=model
+                    ),
+                    patch.object(server_app, "publish_completed_run") as publish,
+                    self.assertRaises((RuntimeError, ValueError, OSError)),
+                ):
+                    strategy.aggregate_fit(1, results, failures)
+
+                publish.assert_not_called()
+                self.assertFalse((root / "current.json").exists())
+                replacement_lock = server_app.acquire_run_artifact_lock(run_dir)
+                replacement_lock.release()
+
     def test_client_evaluation_metrics_are_written_per_round(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             strategy = server_app.SentimentServer.__new__(server_app.SentimentServer)
@@ -599,39 +681,52 @@ class MetricAggregationTests(unittest.TestCase):
     def test_final_evaluation_rejects_invalid_aggregate_without_publication(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            strategy = server_app.SentimentServer.__new__(server_app.SentimentServer)
-            strategy.artifact_dir = Path(tmpdir)
-            strategy.artifact_root = Path(tmpdir)
-            strategy.artifact_retention_runs = 3
-            strategy.final_round = 1
-            artifact_lock = Mock()
-            strategy._artifact_lock = artifact_lock
-            strategy.expected_client_ids = frozenset({0})
-            result = (
-                Mock(),
-                SimpleNamespace(
-                    loss=0.4,
-                    num_examples=2,
-                    metrics={"accuracy": 0.75, "client_id": 0},
-                ),
-            )
+        invalid_aggregates = [
+            (np.nan, {"accuracy": 0.75}),
+            (-0.1, {"accuracy": 0.75}),
+            (0.4, {"accuracy": -0.1}),
+            (0.4, {"accuracy": 1.1}),
+        ]
 
+        for aggregate in invalid_aggregates:
             with (
-                patch.object(
-                    server_app.FedProx,
-                    "aggregate_evaluate",
-                    return_value=(np.nan, {"accuracy": 0.75}),
-                ),
-                patch.object(server_app, "publish_completed_run") as publish,
-                self.assertRaisesRegex(ValueError, "aggregate evaluation loss"),
+                self.subTest(aggregate=aggregate),
+                tempfile.TemporaryDirectory() as tmpdir,
             ):
-                strategy.aggregate_evaluate(1, [result], [])
+                strategy = server_app.SentimentServer.__new__(
+                    server_app.SentimentServer
+                )
+                strategy.artifact_dir = Path(tmpdir)
+                strategy.artifact_root = Path(tmpdir)
+                strategy.artifact_retention_runs = 3
+                strategy.final_round = 1
+                artifact_lock = Mock()
+                strategy._artifact_lock = artifact_lock
+                strategy.expected_client_ids = frozenset({0})
+                result = (
+                    Mock(),
+                    SimpleNamespace(
+                        loss=0.4,
+                        num_examples=2,
+                        metrics={"accuracy": 0.75, "client_id": 0},
+                    ),
+                )
 
-            publish.assert_not_called()
-            artifact_lock.release.assert_called_once_with()
-            self.assertFalse(strategy.metrics_path.exists())
-            self.assertFalse(strategy.client_metrics_path.exists())
+                with (
+                    patch.object(
+                        server_app.FedProx,
+                        "aggregate_evaluate",
+                        return_value=aggregate,
+                    ),
+                    patch.object(server_app, "publish_completed_run") as publish,
+                    self.assertRaises(ValueError),
+                ):
+                    strategy.aggregate_evaluate(1, [result], [])
+
+                publish.assert_not_called()
+                artifact_lock.release.assert_called_once_with()
+                self.assertFalse(strategy.metrics_path.exists())
+                self.assertFalse(strategy.client_metrics_path.exists())
 
     def test_final_evaluation_rejects_invalid_values_without_publication(self) -> None:
         invalid_values = [
@@ -641,9 +736,12 @@ class MetricAggregationTests(unittest.TestCase):
             ("num_examples", np.int64(1)),
             ("loss", np.nan),
             ("loss", np.inf),
+            ("loss", -0.1),
             ("accuracy", None),
             ("accuracy", np.nan),
             ("accuracy", np.inf),
+            ("accuracy", -0.1),
+            ("accuracy", 1.1),
         ]
 
         for field, value in invalid_values:

@@ -161,14 +161,20 @@ def _validate_evaluate_results(
             not isinstance(loss, Real)
             or isinstance(loss, bool)
             or not math.isfinite(loss)
+            or float(loss) < 0.0
         ):
-            raise ValueError("evaluation result loss must be a finite real number")
+            raise ValueError(
+                "evaluation result loss must be a finite non-negative real number"
+            )
         if (
             not isinstance(accuracy, Real)
             or isinstance(accuracy, bool)
             or not math.isfinite(accuracy)
+            or not 0.0 <= float(accuracy) <= 1.0
         ):
-            raise ValueError("evaluation result accuracy must be a finite real number")
+            raise ValueError(
+                "evaluation result accuracy must be a finite real number in [0, 1]"
+            )
     return ordered_results
 
 
@@ -187,19 +193,29 @@ def _validate_aggregated_evaluation(
     Raises
     ------
     ValueError
-        If aggregate loss or accuracy is missing or non-finite.
+        If aggregate loss or accuracy is missing or outside its permitted range.
     """
     if not isinstance(metrics, dict):
         raise ValueError("aggregate evaluation metrics must be a dictionary")
     accuracy = metrics.get("accuracy")
-    if not isinstance(loss, Real) or isinstance(loss, bool) or not math.isfinite(loss):
-        raise ValueError("aggregate evaluation loss must be a finite real number")
+    if (
+        not isinstance(loss, Real)
+        or isinstance(loss, bool)
+        or not math.isfinite(loss)
+        or float(loss) < 0.0
+    ):
+        raise ValueError(
+            "aggregate evaluation loss must be a finite non-negative real number"
+        )
     if (
         not isinstance(accuracy, Real)
         or isinstance(accuracy, bool)
         or not math.isfinite(accuracy)
+        or not 0.0 <= float(accuracy) <= 1.0
     ):
-        raise ValueError("aggregate evaluation accuracy must be a finite real number")
+        raise ValueError(
+            "aggregate evaluation accuracy must be a finite real number in [0, 1]"
+        )
 
 
 def _validate_fit_results(
@@ -368,7 +384,7 @@ class SentimentServer(FedProx):
         None
             The lock is released when present and then detached.
         """
-        artifact_lock = self._artifact_lock
+        artifact_lock = getattr(self, "_artifact_lock", None)
         self._artifact_lock = None
         if artifact_lock is not None:
             artifact_lock.release()
@@ -398,45 +414,49 @@ class SentimentServer(FedProx):
             If the result set, an input, or the aggregate violates the runtime
             aggregation contract.
         """
-        parameters: Parameters | None
-        if failures:
-            raise RuntimeError(
-                f"fit round {server_round} failed for {len(failures)} client(s)"
-            )
-
-        ordered_results, client_weights = _validate_fit_results(
-            results, self.expected_client_ids, self.expected_weight_shapes
-        )
-        if self.use_huber:
-            # Robust Huber aggregation instead of plain FedProx averaging
-            reference = client_weights[0]
-            vectors = [_flatten(weights) for weights in client_weights]
-            counts = [result.num_examples for _, result in ordered_results]
-            aggregated = huber_aggregate(vectors, counts, self.huber_threshold)
-            parameters = ndarrays_to_parameters(_unflatten(aggregated, reference))
-            metrics = {}
-            if self.fit_metrics_aggregation_fn:
-                metrics = self.fit_metrics_aggregation_fn(
-                    [
-                        (result.num_examples, result.metrics)
-                        for _, result in ordered_results
-                    ]
+        try:
+            parameters: Parameters | None
+            if failures:
+                raise RuntimeError(
+                    f"fit round {server_round} failed for {len(failures)} client(s)"
                 )
-        else:
-            # Standard FedProx averaging
-            parameters, metrics = super().aggregate_fit(
-                server_round, ordered_results, failures
+
+            ordered_results, client_weights = _validate_fit_results(
+                results, self.expected_client_ids, self.expected_weight_shapes
             )
+            if self.use_huber:
+                # Robust Huber aggregation instead of plain FedProx averaging
+                reference = client_weights[0]
+                vectors = [_flatten(weights) for weights in client_weights]
+                counts = [result.num_examples for _, result in ordered_results]
+                aggregated = huber_aggregate(vectors, counts, self.huber_threshold)
+                parameters = ndarrays_to_parameters(_unflatten(aggregated, reference))
+                metrics = {}
+                if self.fit_metrics_aggregation_fn:
+                    metrics = self.fit_metrics_aggregation_fn(
+                        [
+                            (result.num_examples, result.metrics)
+                            for _, result in ordered_results
+                        ]
+                    )
+            else:
+                # Standard FedProx averaging
+                parameters, metrics = super().aggregate_fit(
+                    server_round, ordered_results, failures
+                )
 
-        if parameters is None:
-            raise RuntimeError(f"fit round {server_round} produced no aggregate")
-        _validate_aggregated_parameters(parameters, self.expected_weight_shapes)
+            if parameters is None:
+                raise RuntimeError(f"fit round {server_round} produced no aggregate")
+            _validate_aggregated_parameters(parameters, self.expected_weight_shapes)
 
-        # Artifact saving
-        self.artifact_dir.mkdir(parents=True, exist_ok=True)
-        model = build_model_from_manifest(self.app_manifest)
-        model.set_weights(parameters_to_ndarrays(parameters))
-        model.save(str(self.model_path))
+            # Artifact saving
+            self.artifact_dir.mkdir(parents=True, exist_ok=True)
+            model = build_model_from_manifest(self.app_manifest)
+            model.set_weights(parameters_to_ndarrays(parameters))
+            model.save(str(self.model_path))
+        except BaseException:
+            self._release_artifact_lock()
+            raise
 
         return parameters, metrics
 
