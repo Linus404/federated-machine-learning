@@ -21,6 +21,7 @@ from src.artifact_compatibility import (
     require_secure_artifact_platform,
     strict_json_loads,
     validate_artifact_schema,
+    write_bytes_atomically,
     write_server_artifact_manifest,
 )
 from tests.artifact_helpers import fake_app_manifest
@@ -551,6 +552,159 @@ class ArtifactCompatibilityTests(unittest.TestCase):
                 read_regular_file(artifact, parent=root)
 
             open_file.assert_not_called()
+
+    @unittest.skipUnless(hasattr(os, "O_TMPFILE"), "immutable writes require Linux")
+    def test_immutable_atomic_write_has_one_name_and_preserves_collision(
+        self,
+    ) -> None:
+        """Publish an unnamed inode once and leave an existing destination exact."""
+        from src import artifact_compatibility
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            target = root / "artifact.bin"
+            real_link = artifact_compatibility.link_unnamed_file_at
+            observed: list[tuple[set[str], int]] = []
+
+            def inspect_publication(
+                source_descriptor: int,
+                destination_descriptor: int,
+                destination_name: str,
+            ) -> None:
+                """Record the complete namespace immediately after publication.
+
+                Parameters
+                ----------
+                source_descriptor : int
+                    Open unnamed source descriptor.
+                destination_descriptor : int
+                    Retained destination-directory descriptor.
+                destination_name : str
+                    Direct destination child name.
+
+                Returns
+                -------
+                None
+                """
+                real_link(
+                    source_descriptor,
+                    destination_descriptor,
+                    destination_name,
+                )
+                installed = os.stat(
+                    destination_name,
+                    dir_fd=destination_descriptor,
+                    follow_symlinks=False,
+                )
+                observed.append(
+                    (set(os.listdir(destination_descriptor)), installed.st_nlink)
+                )
+
+            with patch.object(
+                artifact_compatibility,
+                "link_unnamed_file_at",
+                side_effect=inspect_publication,
+            ):
+                self.assertEqual(
+                    write_bytes_atomically(target, b"published", overwrite=False),
+                    target,
+                )
+
+            self.assertEqual(observed, [({target.name}, 1)])
+            original = target.stat(follow_symlinks=False)
+            baseline_descriptors = len(os.listdir("/proc/self/fd"))
+            with self.assertRaises(FileExistsError) as raised:
+                write_bytes_atomically(target, b"replacement", overwrite=False)
+
+            current = target.stat(follow_symlinks=False)
+            self.assertIs(type(raised.exception), FileExistsError)
+            self.assertEqual(target.read_bytes(), b"published")
+            self.assertEqual(
+                (current.st_dev, current.st_ino, current.st_mode, current.st_nlink),
+                (original.st_dev, original.st_ino, original.st_mode, 1),
+            )
+            self.assertEqual(set(root.iterdir()), {target})
+            self.assertEqual(len(os.listdir("/proc/self/fd")), baseline_descriptors)
+
+    @unittest.skipUnless(hasattr(os, "O_TMPFILE"), "immutable writes require Linux")
+    def test_immutable_atomic_write_cleans_failed_source_and_rejects_linked_parent(
+        self,
+    ) -> None:
+        """Close unnamed sources on failure and never traverse a linked parent."""
+        from src import artifact_compatibility
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            baseline_descriptors = len(os.listdir("/proc/self/fd"))
+            target = root / "artifact.bin"
+            with (
+                patch.object(
+                    artifact_compatibility,
+                    "link_unnamed_file_at",
+                    side_effect=RuntimeError("linkat unavailable"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "linkat unavailable"),
+            ):
+                write_bytes_atomically(target, b"content", overwrite=False)
+
+            self.assertEqual(list(root.iterdir()), [])
+            self.assertEqual(len(os.listdir("/proc/self/fd")), baseline_descriptors)
+
+            real_open = artifact_compatibility.os.open
+
+            def reject_unnamed_file(name, flags, *args, **kwargs):
+                """Inject an unavailable ``O_TMPFILE`` primitive.
+
+                Parameters
+                ----------
+                name : object
+                    Name passed to ``os.open``.
+                flags : int
+                    Flags passed to ``os.open``.
+                *args : object
+                    Positional arguments passed to ``os.open``.
+                **kwargs : object
+                    Keyword arguments passed to ``os.open``.
+
+                Returns
+                -------
+                int
+                    Descriptor returned by the real ``os.open``.
+                """
+                if name == "." and flags & os.O_TMPFILE:
+                    raise OSError("injected O_TMPFILE failure")
+                return real_open(name, flags, *args, **kwargs)
+
+            with (
+                patch.object(
+                    artifact_compatibility,
+                    "require_secure_artifact_platform",
+                ),
+                patch.object(
+                    artifact_compatibility.os,
+                    "open",
+                    side_effect=reject_unnamed_file,
+                ),
+                self.assertRaisesRegex(RuntimeError, "O_TMPFILE support is required"),
+            ):
+                write_bytes_atomically(target, b"content", overwrite=False)
+
+            self.assertEqual(list(root.iterdir()), [])
+            self.assertEqual(len(os.listdir("/proc/self/fd")), baseline_descriptors)
+
+            outside = root / "outside"
+            outside.mkdir()
+            linked_parent = root / "linked"
+            linked_parent.symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "artifact directory chain changed"):
+                write_bytes_atomically(
+                    linked_parent / target.name,
+                    b"content",
+                    overwrite=False,
+                )
+
+            self.assertEqual(list(outside.iterdir()), [])
+            self.assertEqual(len(os.listdir("/proc/self/fd")), baseline_descriptors)
 
     def test_compatibility_policy_records_client_schema_two_migration(self) -> None:
         policy = (

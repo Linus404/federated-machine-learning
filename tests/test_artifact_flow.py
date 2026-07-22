@@ -24,6 +24,7 @@ from src.artifact_compatibility import (
 from src.contracts import canonical_client_row_bytes, client_shard_metadata
 from src.data_prep import (
     _acquire_preparation_lock,
+    _load_migration_journal,
     _preflight_output_root,
     _publish_prepared_roots,
     _recover_prepared_migration,
@@ -2296,7 +2297,7 @@ class ArtifactFlowTests(unittest.TestCase):
                         name,
                     )
 
-    def test_prepare_retry_recovers_before_dataset_or_framework_loading(self) -> None:
+    def test_prepare_retry_recovers_single_link_journal_before_loading(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             roots = {
@@ -2317,6 +2318,7 @@ class ArtifactFlowTests(unittest.TestCase):
                 import sys
                 from pathlib import Path
 
+                import src.artifact_compatibility as artifact_compatibility
                 import src.data_prep as data_prep
 
                 root = Path(sys.argv[1])
@@ -2330,11 +2332,37 @@ class ArtifactFlowTests(unittest.TestCase):
                 protocol = json.loads((root / "protocol.json").read_text(encoding="utf-8"))
                 data_prep.load_scientific_protocol = lambda: protocol
 
-                def crash_at(value):
-                    if value == "archive:client:renamed":
+                real_link = artifact_compatibility.link_unnamed_file_at
+
+                def crash_after_journal_link(
+                    source_descriptor,
+                    destination_descriptor,
+                    destination_name,
+                ):
+                    '''Terminate after publishing the migration journal.
+
+                    Parameters
+                    ----------
+                    source_descriptor : int
+                        Open unnamed source descriptor.
+                    destination_descriptor : int
+                        Retained destination-directory descriptor.
+                    destination_name : str
+                        Direct destination child name.
+
+                    Returns
+                    -------
+                    None
+                    '''
+                    real_link(
+                        source_descriptor,
+                        destination_descriptor,
+                        destination_name,
+                    )
+                    if destination_name == ".prepared-migration.json":
                         os._exit(92)
 
-                data_prep._publication_checkpoint = crash_at
+                artifact_compatibility.link_unnamed_file_at = crash_after_journal_link
                 data_prep._publish_prepared_roots(roots, stages, {"partitions": 1})
                 """
             )
@@ -2346,6 +2374,16 @@ class ArtifactFlowTests(unittest.TestCase):
                 env=os.environ.copy(),
             )
             self.assertEqual(completed.returncode, 92, completed.stderr)
+            journal = root / ".prepared-migration.json"
+            self.assertEqual(journal.stat(follow_symlinks=False).st_nlink, 1)
+            self.assertIsNotNone(_load_migration_journal(roots))
+            self.assertFalse(
+                any(
+                    path.name.startswith("..prepared-migration.json.")
+                    and path.name.endswith(".tmp")
+                    for path in root.iterdir()
+                )
+            )
 
             with (
                 patch(
@@ -2359,6 +2397,8 @@ class ArtifactFlowTests(unittest.TestCase):
 
             frameworks.assert_not_called()
             load_dataset.assert_not_called()
+            self.assertFalse(journal.exists())
+            self.assertFalse(any(path.name.endswith(".tmp") for path in root.iterdir()))
             self.assertEqual(
                 {
                     path.name

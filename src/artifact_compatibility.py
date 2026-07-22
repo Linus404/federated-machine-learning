@@ -1968,8 +1968,8 @@ def write_json_atomically(
     payload : mapping of str to Any
         JSON-compatible object to persist.
     overwrite : bool, optional
-        Replace an existing destination when ``True``. When ``False``, publish by
-        an atomic hard link so an existing immutable file cannot be replaced.
+        Replace an existing destination when ``True``. When ``False``, publish an
+        unnamed file so an existing immutable file cannot be replaced.
 
     Returns
     -------
@@ -1980,8 +1980,13 @@ def write_json_atomically(
     ------
     FileExistsError
         If ``overwrite`` is ``False`` and the destination already exists.
+    RuntimeError
+        If immutable publication requires an unavailable Linux primitive.
     ValueError
-        If the payload contains values outside the JSON data model.
+        If the payload is outside the JSON data model or the immutable destination
+        parent is not a retained regular directory.
+    OSError
+        If writing or synchronizing the file fails.
     """
     return write_bytes_atomically(
         path, canonical_json_bytes(payload), overwrite=overwrite
@@ -2000,8 +2005,8 @@ def write_bytes_atomically(
     content : bytes
         Exact bytes to persist.
     overwrite : bool, optional
-        Replace an existing destination when ``True``. When ``False``, publish by
-        atomic hard link so an existing immutable file cannot be replaced.
+        Replace an existing destination when ``True``. When ``False``, publish an
+        unnamed file so an existing immutable file cannot be replaced.
 
     Returns
     -------
@@ -2012,27 +2017,60 @@ def write_bytes_atomically(
     ------
     FileExistsError
         If ``overwrite`` is ``False`` and the destination already exists.
+    RuntimeError
+        If immutable publication requires an unavailable Linux primitive.
+    ValueError
+        If the immutable destination parent is not a retained regular directory.
+    OSError
+        If writing or synchronizing the file fails.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
-    )
-    temporary_path = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "wb") as file:
-            file.write(content)
-            os.fchmod(file.fileno(), 0o644)
-            file.flush()
-            os.fsync(file.fileno())
-        if overwrite:
+    if overwrite:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as file:
+                file.write(content)
+                os.fchmod(file.fileno(), 0o644)
+                file.flush()
+                os.fsync(file.fileno())
             os.replace(temporary_path, path)
-        else:
-            os.link(temporary_path, path)
-            temporary_path.unlink()
-        sync_directory(path.parent)
-    except BaseException:
-        temporary_path.unlink(missing_ok=True)
-        raise
+            sync_directory(path.parent)
+        except BaseException:
+            temporary_path.unlink(missing_ok=True)
+            raise
+        return path
+
+    with RetainedDirectoryChain.open(
+        path.parent,
+        create=True,
+        mode=0o777,
+        error_message="artifact directory chain changed",
+    ) as chain:
+        chain.commit()
+        parent_descriptor = chain.directory.descriptor
+        try:
+            descriptor = os.open(
+                ".",
+                os.O_RDWR | os.O_TMPFILE | os.O_CLOEXEC,
+                0o600,
+                dir_fd=parent_descriptor,
+            )
+        except OSError as error:
+            raise RuntimeError("Linux O_TMPFILE support is required") from error
+        try:
+            with os.fdopen(descriptor, "wb", closefd=False) as file:
+                file.write(content)
+                os.fchmod(descriptor, 0o644)
+                file.flush()
+                os.fsync(descriptor)
+            chain.verify()
+            link_unnamed_file_at(descriptor, parent_descriptor, path.name)
+            chain.fsync()
+        finally:
+            os.close(descriptor)
     return path
 
 
