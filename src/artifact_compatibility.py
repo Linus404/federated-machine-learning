@@ -15,6 +15,7 @@ from typing import Any, Mapping
 
 ARTIFACT_SCHEMA_VERSION = 1
 PUBLIC_ARTIFACT_SCHEMA_VERSION = 2
+CLIENT_SHARD_SCHEMA_VERSION = 2
 SERVER_ARTIFACT_MANIFEST_FILENAME = "artifact_manifest.json"
 SERVER_ARTIFACTS: dict[str, dict[str, Any]] = {
     "model": {"filename": "global_model.keras", "format": "keras-v3"},
@@ -67,6 +68,65 @@ def sha256_bytes(content: bytes) -> str:
         Algorithm-prefixed hexadecimal digest.
     """
     return f"sha256:{hashlib.sha256(content).hexdigest()}"
+
+
+def deep_freeze(value: Any) -> Any:
+    """Recursively convert JSON containers into immutable equivalents.
+
+    Parameters
+    ----------
+    value : Any
+        Validated JSON-compatible value.
+
+    Returns
+    -------
+    Any
+        Mappings wrapped in read-only proxies, sequences converted to tuples,
+        and scalar values unchanged.
+    """
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: deep_freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(deep_freeze(item) for item in value)
+    return value
+
+
+def _mutable_json(value: Any) -> Any:
+    """Convert immutable JSON containers back to encoder-native containers.
+
+    Parameters
+    ----------
+    value : Any
+        Recursively frozen JSON-compatible value.
+
+    Returns
+    -------
+    Any
+        Dictionaries, lists, and unchanged scalar values.
+    """
+    if isinstance(value, Mapping):
+        return {key: _mutable_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_mutable_json(item) for item in value]
+    return value
+
+
+def canonical_json_bytes(payload: Mapping[str, Any]) -> bytes:
+    """Serialize a JSON object in the repository artifact format.
+
+    Parameters
+    ----------
+    payload : mapping of str to Any
+        JSON-compatible object.
+
+    Returns
+    -------
+    bytes
+        Indented UTF-8 JSON with one trailing LF byte.
+    """
+    return (
+        json.dumps(_mutable_json(payload), indent=2, allow_nan=False) + "\n"
+    ).encode("utf-8")
 
 
 def read_regular_file(path: Path, *, parent: Path) -> bytes:
@@ -171,7 +231,7 @@ def write_json_atomically(
         If the payload contains values outside the JSON data model.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    content = json.dumps(payload, indent=2, allow_nan=False) + "\n"
+    content = canonical_json_bytes(payload).decode("utf-8")
     descriptor, temporary_name = tempfile.mkstemp(
         dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
     )

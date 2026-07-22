@@ -3,42 +3,47 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.metadata
-import json
 import os
+import shutil
+import stat
+import tempfile
+import uuid
 from collections import Counter
 from pathlib import Path
 from typing import Any, Mapping
 
-# TensorFlow/Keras read these before import; set them before Keras loads.
-os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-os.environ.setdefault("KERAS_BACKEND", "tensorflow")
+from src.protocol_runtime import validate_protocol_runtime
 
 import numpy as np
 
-from src.artifact_compatibility import PUBLIC_ARTIFACT_SCHEMA_VERSION, sha256_file
+from src.app_manifest import load_app_manifest, protocol_model_dimensions
+from src.artifact_compatibility import (
+    PUBLIC_ARTIFACT_SCHEMA_VERSION,
+    canonical_json_bytes,
+    read_regular_file,
+    sha256_file,
+    write_json_atomically,
+)
 from src.contracts import (
     DEFAULT_DIRICHLET_ALPHA,
     DEFAULT_SPLIT_SEED,
+    canonical_client_row_bytes,
     client_shard_metadata,
     dirichlet_split,
-    label_histogram,
 )
 from src.evaluation_artifact import (
     canonical_source_row_bytes,
     load_scientific_protocol,
+    load_evaluation_artifact_snapshot,
     publish_evaluation_artifact,
 )
 from src.paths import (
+    RunArtifactLock,
     default_evaluation_artifact_dir,
     default_public_artifact_dir,
     resolve_dir,
 )
 from src.text_preprocessing import create_text_vectorizer
-
-DEFAULT_MAX_TOKENS = 20_000
-DEFAULT_SEQUENCE_LENGTH = 500
-DEFAULT_EMBEDDING_DIM = 100
 
 
 def _preflight_output_root(
@@ -83,6 +88,362 @@ def _preflight_output_root(
     if parent.is_symlink() or (parent.exists() and not parent.is_dir()):
         raise ValueError(f"{artifact_name} artifact parent must be a regular directory")
     return output_path
+
+
+def _validate_output_child(path: Path, parent: Path, *, directory: bool) -> None:
+    """Reject unsafe existing publication children before replacement.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Direct child output path.
+    parent : pathlib.Path
+        Validated canonical parent directory.
+    directory : bool
+        Require a real directory instead of a single-link regular file.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If the child escapes, is a link, or has an unsafe file type.
+    """
+    if path.parent.resolve(strict=True) != parent.resolve(strict=True):
+        raise ValueError(f"artifact output escapes its root: {path.name}")
+    if not path.exists() and not path.is_symlink():
+        return
+    try:
+        child_stat = path.lstat()
+    except OSError as error:
+        raise ValueError(f"artifact output is unsafe: {path.name}") from error
+    valid = (
+        stat.S_ISDIR(child_stat.st_mode)
+        if directory
+        else stat.S_ISREG(child_stat.st_mode) and child_stat.st_nlink == 1
+    )
+    if path.is_symlink() or not valid:
+        raise ValueError(f"artifact output is unsafe: {path.name}")
+
+
+def _write_bytes_atomically(path: Path, content: bytes) -> None:
+    """Write bytes atomically without following or sharing an existing child.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Destination beneath an existing validated directory.
+    content : bytes
+        Exact bytes to publish.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If an existing destination is not a single-link regular file.
+    """
+    _validate_output_child(path, path.parent, directory=False)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as file:
+            file.write(content)
+            file.flush()
+            os.fsync(file.fileno())
+        temporary_path.chmod(0o644)
+        os.replace(temporary_path, path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def _validate_client_directory(path: Path, parent: Path) -> None:
+    """Validate an existing generated client directory and all direct children.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Existing ``client-N`` directory.
+    parent : pathlib.Path
+        Canonical client artifact root.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If the directory or any child is linked or non-regular.
+    """
+    _validate_output_child(path, parent, directory=True)
+    canonical_path = path.resolve(strict=True)
+    for child in path.iterdir():
+        _validate_output_child(child, canonical_path, directory=False)
+
+
+def _acquire_preparation_lock(roots: Mapping[str, Path]) -> RunArtifactLock:
+    """Acquire a nonblocking exclusive lock for one preparation destination set.
+
+    Parameters
+    ----------
+    roots : mapping of str to pathlib.Path
+        Validated final artifact roots.
+
+    Returns
+    -------
+    RunArtifactLock
+        Held lock that the caller must release.
+
+    Raises
+    ------
+    RuntimeError
+        If another process is preparing the same roots.
+    ValueError
+        If the lock path is not a single-link regular file.
+    """
+    material = "\0".join(str(roots[name]) for name in sorted(roots)).encode()
+    lock_name = f".fml-prepare-{hashlib.sha256(material).hexdigest()[:16]}.lock"
+    lock_path = roots["client"].parent / lock_name
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as error:
+        raise ValueError("preparation lock path is unsafe") from error
+    file_stat = os.fstat(descriptor)
+    if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
+        os.close(descriptor)
+        raise ValueError("preparation lock path is unsafe")
+    file = os.fdopen(descriptor, "a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            if file.seek(0, os.SEEK_END) == 0:
+                file.write(b"\0")
+                file.flush()
+            file.seek(0)
+            msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+        else:
+            import fcntl
+
+            fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        file.close()
+        raise RuntimeError(
+            "Another artifact preparation is already in progress"
+        ) from error
+    return RunArtifactLock(lock_path, file)
+
+
+def _copy_preserved_children(source: Path, staging: Path, owned: set[str]) -> None:
+    """Copy allowed non-owned regular files into an owned staging root.
+
+    Parameters
+    ----------
+    source : pathlib.Path
+        Existing reusable output root.
+    staging : pathlib.Path
+        New owned staging directory.
+    owned : set of str
+        Generated filenames or prefixes, with prefixes ending in ``*``.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If an existing child is linked, non-regular, or otherwise unsafe.
+    """
+    if not source.exists():
+        return
+    canonical_source = source.resolve(strict=True)
+    for child in source.iterdir():
+        is_owned = any(
+            child.name.startswith(name[:-1])
+            if name.endswith("*")
+            else child.name == name
+            for name in owned
+        )
+        if is_owned and child.is_dir():
+            _validate_client_directory(child, canonical_source)
+        else:
+            _validate_output_child(child, canonical_source, directory=False)
+        if is_owned:
+            continue
+        if not child.is_file():
+            raise ValueError(
+                f"non-owned artifact child must be a regular file: {child.name}"
+            )
+        _write_bytes_atomically(
+            staging / child.name,
+            read_regular_file(child, parent=canonical_source),
+        )
+
+
+def _cleanup_owned_preparation_staging(root: Path) -> None:
+    """Remove only incomplete staging directories owned by this preparation root.
+
+    Parameters
+    ----------
+    root : pathlib.Path
+        Final artifact root whose sibling staging names are reserved.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If a reserved residue name is linked or not a real directory.
+    """
+    for residue in root.parent.glob(f".{root.name}.prepare-*.staging"):
+        residue_stat = residue.lstat()
+        if residue.is_symlink() or not stat.S_ISDIR(residue_stat.st_mode):
+            raise ValueError(f"owned preparation residue is unsafe: {residue.name}")
+        shutil.rmtree(residue)
+
+
+def _recover_owned_preparation_backup(root: Path) -> None:
+    """Restore or discard one owned backup left by an interrupted publication.
+
+    Parameters
+    ----------
+    root : pathlib.Path
+        Final reusable artifact root.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If backup state is ambiguous, linked, or not a real directory.
+    """
+    backups = list(root.parent.glob(f".{root.name}.*.backup"))
+    if len(backups) > 1:
+        raise ValueError(f"multiple owned preparation backups exist for {root.name}")
+    if not backups:
+        return
+    backup = backups[0]
+    backup_stat = backup.lstat()
+    if backup.is_symlink() or not stat.S_ISDIR(backup_stat.st_mode):
+        raise ValueError(f"owned preparation backup is unsafe: {backup.name}")
+    if root.exists() or root.is_symlink():
+        if root.is_symlink() or not root.is_dir():
+            raise ValueError(f"artifact root is unsafe during recovery: {root.name}")
+        shutil.rmtree(backup)
+    else:
+        os.rename(backup, root)
+
+
+def _fsync_directory(path: Path) -> None:
+    """Flush one directory entry set on platforms that support it.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Existing directory to flush.
+
+    Returns
+    -------
+    None
+    """
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory_tree(root: Path) -> None:
+    """Flush a completed owned artifact tree before final renames.
+
+    Parameters
+    ----------
+    root : pathlib.Path
+        Validated staging root containing only regular files and directories.
+
+    Returns
+    -------
+    None
+    """
+    directories = sorted(
+        (path for path in root.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    )
+    for directory in [*directories, root]:
+        _fsync_directory(directory)
+
+
+def _publish_prepared_roots(
+    roots: Mapping[str, Path], stages: Mapping[str, Path]
+) -> None:
+    """Publish validated staged roots and roll back any ordinary failure.
+
+    Parameters
+    ----------
+    roots : mapping of str to pathlib.Path
+        Final client, public, and immutable evaluation roots.
+    stages : mapping of str to pathlib.Path
+        Complete owned staging directories.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    OSError
+        If a final rename cannot be completed; reusable roots are restored.
+    """
+    transaction_id = uuid.uuid4().hex
+    backups: dict[str, Path] = {}
+    published: list[str] = []
+    try:
+        for name in ("public", "client"):
+            root = roots[name]
+            if root.exists():
+                backup = root.parent / f".{root.name}.{transaction_id}.backup"
+                os.rename(root, backup)
+                backups[name] = backup
+            os.rename(stages[name], root)
+            published.append(name)
+        os.rename(stages["evaluation"], roots["evaluation"])
+        published.append("evaluation")
+        for parent in {root.parent for root in roots.values()}:
+            _fsync_directory(parent)
+    except BaseException:
+        if "evaluation" in published:
+            shutil.rmtree(roots["evaluation"], ignore_errors=True)
+        for name in reversed(published):
+            if name == "evaluation":
+                continue
+            shutil.rmtree(roots[name], ignore_errors=True)
+        for name, backup in backups.items():
+            if backup.exists() and not roots[name].exists():
+                os.rename(backup, roots[name])
+        for parent in {root.parent for root in roots.values()}:
+            _fsync_directory(parent)
+        raise
+    for backup in backups.values():
+        shutil.rmtree(backup)
+    for parent in {root.parent for root in roots.values()}:
+        _fsync_directory(parent)
 
 
 def _raw_split_path(
@@ -280,28 +641,7 @@ def _validated_frameworks() -> tuple[Any, Any, Mapping[str, Any]]:
     import keras
     import tensorflow as tf
 
-    protocol = load_scientific_protocol()
-    framework = protocol["framework"]
-    installed_versions = {
-        "tensorflow": tf.__version__,
-        "keras": keras.__version__,
-        "numpy": np.__version__,
-    }
-    expected_versions = {
-        "tensorflow": framework["tensorflow_version"],
-        "keras": framework["keras_version"],
-        "numpy": framework["numpy_version"],
-    }
-    mismatches = [
-        f"{name}: expected {expected_versions[name]}, got {installed_versions[name]}"
-        for name in expected_versions
-        if installed_versions[name] != expected_versions[name]
-    ]
-    if mismatches:
-        raise ValueError(
-            "framework versions differ from the frozen protocol: "
-            + "; ".join(mismatches)
-        )
+    protocol = validate_protocol_runtime()
     return keras, tf, protocol
 
 
@@ -319,14 +659,15 @@ def build_vectorizer(texts: Any) -> Any:
         Adapted vectorizer matching the frozen vocabulary contract.
     """
     _, tf, protocol = _validated_frameworks()
+    preprocessing = protocol["preprocessing"]
+    dimensions = protocol_model_dimensions(protocol)
     vectorizer = create_text_vectorizer(
-        sequence_length=DEFAULT_SEQUENCE_LENGTH,
-        max_tokens=DEFAULT_MAX_TOKENS,
+        sequence_length=dimensions["sequence_length"],
+        max_tokens=preprocessing["max_tokens"],
     )
     vectorizer.adapt(
         tf.data.Dataset.from_tensor_slices(list(texts)).batch(256, drop_remainder=False)
     )
-    preprocessing = protocol["preprocessing"]
     vocabulary = vectorizer.get_vocabulary()
     vocabulary_bytes = b"".join(item.encode("utf-8") + b"\n" for item in vocabulary)
     if len(vocabulary) != preprocessing["vocabulary_size"]:
@@ -339,11 +680,6 @@ def build_vectorizer(texts: Any) -> Any:
     return vectorizer
 
 
-def _checksum(payload: Mapping[str, Any]) -> str:
-    content = json.dumps(payload, sort_keys=True).encode()
-    return "sha256:" + hashlib.sha256(content).hexdigest()
-
-
 def package_raw_client_shards(
     texts: Any,
     labels: Any,
@@ -352,9 +688,8 @@ def package_raw_client_shards(
     *,
     alpha: float = DEFAULT_DIRICHLET_ALPHA,
     seed: int = DEFAULT_SPLIT_SEED,
-    manifest: Mapping[str, Any] | None = None,
-    manifest_checksum: str | None = None,
-    metadata: Mapping[str, Any] | None = None,
+    manifest: Mapping[str, Any],
+    dataset: Mapping[str, Any],
     source_split: str = "train",
 ) -> list[Path]:
     """Write raw review text and labels into one directory per client.
@@ -373,12 +708,10 @@ def package_raw_client_shards(
         Dirichlet concentration parameter.
     seed : int, optional
         Random seed for deterministic partitioning.
-    manifest : mapping, optional
-        Public manifest used to derive the shard checksum.
-    manifest_checksum : str, optional
-        Precomputed public manifest checksum.
-    metadata : mapping, optional
-        Additional metadata copied into every shard.
+    manifest : mapping
+        Canonical public manifest bound into every shard.
+    dataset : mapping
+        Frozen official train-dataset identity bound into every shard.
     source_split : str, optional
         Official split name used to qualify stable row identities.
 
@@ -394,19 +727,21 @@ def package_raw_client_shards(
             "text/label sample count mismatch: "
             f"len(texts)={len(text_array)} len(labels)={len(label_array)}"
         )
+    if source_split != "train" or any(
+        type(label) is not int or label not in (0, 1) for label in label_array.tolist()
+    ):
+        raise ValueError("client shards require binary labels from the train split")
 
     output_path = _preflight_output_root(output_dir, "client", reusable=True)
     output_path.mkdir(parents=True, exist_ok=True)
-    for legacy_archive in output_path.glob("client-*.tar.gz"):
-        legacy_archive.unlink()
-    checksum = manifest_checksum or _checksum(
-        manifest
-        or {
-            "labels": label_histogram(label_array),
-            "clients": num_clients,
-            "seed": seed,
-        }
-    )
+    canonical_output = output_path.resolve(strict=True)
+    for child in output_path.iterdir():
+        if child.name.startswith("client-"):
+            if child.is_dir():
+                _validate_client_directory(child, canonical_output)
+            else:
+                _validate_output_child(child, canonical_output, directory=False)
+    manifest_bytes = canonical_json_bytes(manifest)
 
     split = dirichlet_split(
         label_array,
@@ -415,41 +750,50 @@ def package_raw_client_shards(
         seed=seed,
     )
 
-    shard_paths: list[Path] = []
-    for client_id in range(num_clients):
-        indices = split[client_id]
-        client_texts = text_array[indices]
-        client_labels = label_array[indices]
-        shard_dir = output_path / f"client-{client_id}"
-        shard_dir.mkdir(exist_ok=True)
-        with (shard_dir / "reviews.jsonl").open("w", encoding="utf-8") as file:
-            for source_index, text, label in zip(indices, client_texts, client_labels):
-                file.write(
-                    json.dumps(
-                        {
-                            "label": int(label),
-                            "row_id": f"{source_split}:{source_index}",
-                            "text": str(text),
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
+    staging_root = Path(
+        tempfile.mkdtemp(dir=output_path, prefix=".shards.", suffix=".tmp")
+    )
+    try:
+        for client_id in range(num_clients):
+            indices = split[client_id]
+            client_labels = label_array[indices]
+            records_bytes = b"".join(
+                canonical_client_row_bytes(
+                    f"{source_split}:{source_index}",
+                    str(text_array[source_index]),
+                    int(label),
                 )
+                for source_index, label in zip(indices, client_labels, strict=True)
+            )
+            shard_dir = staging_root / f"client-{client_id}"
+            shard_dir.mkdir()
+            _write_bytes_atomically(shard_dir / "reviews.jsonl", records_bytes)
+            shard_metadata = client_shard_metadata(
+                client_id,
+                client_labels,
+                records_bytes=records_bytes,
+                public_manifest_bytes=manifest_bytes,
+                dataset=dataset,
+                source_split=source_split,
+                split_seed=seed,
+                alpha=alpha,
+            )
+            write_json_atomically(shard_dir / "client_metadata.json", shard_metadata)
 
-        shard_metadata = client_shard_metadata(
-            client_id,
-            client_labels,
-            split_seed=seed,
-            alpha=alpha,
-            manifest_checksum=checksum,
-            extra_metadata=metadata,
-        )
-        (shard_dir / "client_metadata.json").write_text(
-            json.dumps(shard_metadata, indent=2), encoding="utf-8"
-        )
-        shard_paths.append(shard_dir)
-
-    return shard_paths
+        for child in list(output_path.iterdir()):
+            if child.name.startswith("client-"):
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+        shard_paths = []
+        for client_id in range(num_clients):
+            shard_dir = output_path / f"client-{client_id}"
+            os.rename(staging_root / shard_dir.name, shard_dir)
+            shard_paths.append(shard_dir)
+        return shard_paths
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
 
 
 def publish_public_artifacts(
@@ -480,19 +824,23 @@ def publish_public_artifacts(
     vocabulary_bytes = b"".join(item.encode("utf-8") + b"\n" for item in vocabulary)
     frozen = protocol or load_scientific_protocol()
     preprocessing = frozen["preprocessing"]
+    dimensions = protocol_model_dimensions(frozen)
     vocabulary_sha256 = hashlib.sha256(vocabulary_bytes).hexdigest()
     if len(vocabulary) != preprocessing["vocabulary_size"]:
         raise ValueError("vocabulary size differs from the frozen protocol")
     if vocabulary_sha256 != preprocessing["vocabulary_sha256"]:
         raise ValueError("vocabulary SHA-256 differs from the frozen protocol")
-    (output_path / "vocab.txt").write_bytes(vocabulary_bytes)
+    canonical_output = output_path.resolve(strict=True)
+    for filename in ("vocab.txt", "manifest.json"):
+        _validate_output_child(
+            output_path / filename, canonical_output, directory=False
+        )
+    _write_bytes_atomically(output_path / "vocab.txt", vocabulary_bytes)
     dataset = frozen["dataset"]
     train = dataset["splits"]["train"]
     manifest = {
         "schema_version": PUBLIC_ARTIFACT_SCHEMA_VERSION,
-        "embedding_dim": DEFAULT_EMBEDDING_DIM,
-        "sequence_length": DEFAULT_SEQUENCE_LENGTH,
-        "vocabulary_size": len(vocabulary),
+        **dimensions,
         "vocabulary": {
             "filename": "vocab.txt",
             "sha256": vocabulary_sha256,
@@ -509,9 +857,7 @@ def publish_public_artifacts(
             "content_sha256": train["content_sha256"],
         },
     }
-    (output_path / "manifest.json").write_text(
-        json.dumps(manifest, indent=2), encoding="utf-8"
-    )
+    write_json_atomically(output_path / "manifest.json", manifest)
     return manifest
 
 
@@ -540,9 +886,7 @@ def prepare_all(
     """
     client_dir = _preflight_output_root(client_shard_dir, "client", reusable=True)
     public_dir = _preflight_output_root(public_artifact_dir, "public", reusable=True)
-    evaluation_dir = _preflight_output_root(
-        evaluation_artifact_dir, "evaluation", reusable=False
-    )
+    evaluation_dir = resolve_dir(evaluation_artifact_dir)
     roots = {
         "client": client_dir.resolve(strict=False),
         "public": public_dir.resolve(strict=False),
@@ -560,36 +904,86 @@ def prepare_all(
                 raise ValueError(
                     f"{first_name} and {second_name} artifact roots must be separate"
                 )
-    _validated_frameworks()
-    dataset = load_verified_imdb_dataset()
-    train = dataset["train"]
-    texts = np.asarray(train["text"])
-    labels = np.asarray(train["label"], dtype="int32")
-    vectorizer = build_vectorizer(texts)
-    protocol = load_scientific_protocol()
-    manifest = publish_public_artifacts(vectorizer, public_dir, protocol=protocol)
-    dataset_spec = protocol["dataset"]
-    train_spec = dataset_spec["splits"]["train"]
-    package_raw_client_shards(
-        texts,
-        labels,
-        client_dir,
-        num_clients=partitions,
-        manifest=manifest,
-        metadata={
-            "dataset": {
-                "id": dataset_spec["id"],
-                "config": dataset_spec["config"],
-                "revision": dataset_spec["revision"],
-                "datasets_version": dataset_spec["datasets_version"],
-                "split": "train",
-                "content_sha256": train_spec["content_sha256"],
-            },
-            "source_split": "train",
-            "row_identity": "train:{zero_based_official_split_row_index}",
-        },
-    )
-    publish_evaluation_artifact(dataset["test"], evaluation_dir, protocol=protocol)
+    for root in roots.values():
+        root.parent.mkdir(parents=True, exist_ok=True)
+    lock = _acquire_preparation_lock(roots)
+    stages: dict[str, Path] = {}
+    try:
+        for root in (public_dir, client_dir):
+            _recover_owned_preparation_backup(root)
+        for root in roots.values():
+            _cleanup_owned_preparation_staging(root)
+        _preflight_output_root(evaluation_dir, "evaluation", reusable=False)
+        stages = {
+            name: Path(
+                tempfile.mkdtemp(
+                    dir=root.parent,
+                    prefix=f".{root.name}.prepare-",
+                    suffix=".staging",
+                )
+            )
+            for name, root in roots.items()
+            if name != "evaluation"
+        }
+        stages["evaluation"] = evaluation_dir.parent / (
+            f".{evaluation_dir.name}.prepare-{uuid.uuid4().hex}.staging"
+        )
+        _copy_preserved_children(
+            public_dir, stages["public"], {"manifest.json", "vocab.txt"}
+        )
+        _copy_preserved_children(client_dir, stages["client"], {"client-*"})
+
+        _validated_frameworks()
+        dataset = load_verified_imdb_dataset()
+        train = dataset["train"]
+        texts = np.asarray(train["text"])
+        labels = np.asarray(train["label"], dtype="int32")
+        vectorizer = build_vectorizer(texts)
+        protocol = load_scientific_protocol()
+        manifest = publish_public_artifacts(
+            vectorizer, stages["public"], protocol=protocol
+        )
+        package_raw_client_shards(
+            texts,
+            labels,
+            stages["client"],
+            num_clients=partitions,
+            manifest=manifest,
+            dataset=manifest["dataset"],
+        )
+        publish_evaluation_artifact(
+            dataset["test"], stages["evaluation"], protocol=protocol
+        )
+
+        app_manifest = load_app_manifest(
+            public_artifact_dir=stages["public"], protocol=protocol
+        )
+        identities: set[str] = set()
+        for client_id in range(partitions):
+            from src.local_training import load_client_shard_snapshot
+
+            snapshot = load_client_shard_snapshot(
+                stages["client"] / f"client-{client_id}",
+                app_manifest,
+                client_id,
+            )
+            shard_identities = {row[0] for row in snapshot.rows}
+            if identities & shard_identities:
+                raise ValueError("client shard row identities overlap")
+            identities.update(shard_identities)
+        if identities != {
+            f"train:{index}" for index in range(manifest["dataset"]["rows"])
+        }:
+            raise ValueError("client shards do not exactly partition the train split")
+        load_evaluation_artifact_snapshot(stages["evaluation"], protocol=protocol)
+        for stage in stages.values():
+            _fsync_directory_tree(stage)
+        _publish_prepared_roots(roots, stages)
+        stages = {}
+    finally:
+        for stage in stages.values():
+            shutil.rmtree(stage, ignore_errors=True)
+        lock.release()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

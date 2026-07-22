@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
 from typing import Any, Mapping
 
 from src.artifact_compatibility import (
     PUBLIC_ARTIFACT_SCHEMA_VERSION,
+    canonical_json_bytes,
+    deep_freeze,
     read_regular_file,
     sha256_bytes,
     validate_artifact_schema,
@@ -84,6 +85,43 @@ def _expected_train_dataset(protocol: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def protocol_model_dimensions(protocol: Mapping[str, Any]) -> dict[str, int]:
+    """Return internally consistent positive dimensions from the frozen protocol.
+
+    Parameters
+    ----------
+    protocol : mapping of str to Any
+        Parsed frozen scientific protocol.
+
+    Returns
+    -------
+    dict of str to int
+        Public manifest field names mapped to registered model dimensions.
+
+    Raises
+    ------
+    ValueError
+        If dimensions are not built-in positive integers or model and
+        preprocessing values disagree.
+    """
+    model = protocol["model"]
+    preprocessing = protocol["preprocessing"]
+    dimensions = {
+        "vocabulary_size": model["vocabulary_size"],
+        "sequence_length": model["sequence_length"],
+        "embedding_dim": model["embedding_dimension"],
+    }
+    if any(type(value) is not int or value <= 0 for value in dimensions.values()):
+        raise ValueError("frozen protocol model dimensions must be positive integers")
+    if (
+        dimensions["vocabulary_size"] != preprocessing["vocabulary_size"]
+        or dimensions["vocabulary_size"] != preprocessing["max_tokens"]
+        or dimensions["sequence_length"] != preprocessing["output_sequence_length"]
+    ):
+        raise ValueError("frozen model and preprocessing dimensions differ")
+    return dimensions
+
+
 def load_app_manifest(
     *, public_artifact_dir=None, protocol: Mapping[str, Any] | None = None
 ) -> AppManifest:
@@ -120,6 +158,9 @@ def load_app_manifest(
                 supported_version=PUBLIC_ARTIFACT_SCHEMA_VERSION,
             )
         )
+        canonical_manifest = canonical_json_bytes(payload)
+        if manifest_bytes != canonical_manifest:
+            raise ValueError("public manifest bytes are not canonical")
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("invalid public manifest") from error
 
@@ -140,8 +181,13 @@ def load_app_manifest(
         raise ValueError("public dataset identity differs from the frozen protocol")
 
     preprocessing = frozen["preprocessing"]
-    if payload["vocabulary_size"] != preprocessing["vocabulary_size"]:
-        raise ValueError("public vocabulary size differs from the frozen protocol")
+    dimensions = protocol_model_dimensions(frozen)
+    for field, expected in dimensions.items():
+        value = payload[field]
+        if type(value) is not int or value <= 0 or value != expected:
+            raise ValueError(
+                f"public {field} differs from the frozen protocol dimensions"
+            )
     vocabulary = payload["vocabulary"]
     if not isinstance(vocabulary, Mapping) or set(vocabulary) != {
         "filename",
@@ -180,7 +226,7 @@ def load_app_manifest(
     if vocabulary_terms[:2] != ("", "[UNK]"):
         raise ValueError("public vocabulary reserved tokens are invalid")
     return AppManifest(
-        MappingProxyType(payload),
+        deep_freeze(payload),
         vocabulary_path,
         manifest_bytes,
         vocabulary_bytes,

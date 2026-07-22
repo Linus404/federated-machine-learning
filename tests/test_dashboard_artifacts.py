@@ -1,10 +1,13 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import dashboard
+import numpy as np
 from src.artifact_compatibility import ARTIFACT_SCHEMA_VERSION, SERVER_ARTIFACTS
 
 
@@ -132,6 +135,41 @@ class DashboardArtifactTests(unittest.TestCase):
                 dashboard.keras.models, "load_model", side_effect=inspect_snapshot
             ):
                 dashboard.load_model(model_path)
+
+    def test_model_loader_rejects_runtime_mismatch_before_artifact_consumption(
+        self,
+    ) -> None:
+        with (
+            patch.object(np, "__version__", "99.0.0"),
+            patch.object(dashboard, "load_server_artifact_snapshot") as load_snapshot,
+            patch.object(dashboard.keras.models, "load_model") as load_model,
+            self.assertRaisesRegex(ValueError, "framework versions differ"),
+        ):
+            dashboard.load_model(Path("unused/global_model.keras"))
+
+        load_snapshot.assert_not_called()
+        load_model.assert_not_called()
+
+    def test_vectorizer_rejects_conflicting_preimport_environment(self) -> None:
+        with (
+            patch.dict(os.environ, {"KERAS_BACKEND": "jax"}),
+            patch.object(
+                dashboard,
+                "load_app_manifest",
+                return_value=SimpleNamespace(
+                    payload={"sequence_length": 500}, vocabulary_terms=("", "[UNK]")
+                ),
+            ),
+            patch(
+                "src.text_preprocessing.keras.layers.TextVectorization"
+            ) as vectorizer,
+            self.assertRaisesRegex(ValueError, "runtime environment differs"),
+        ):
+            dashboard.load_vectorizer.clear()
+            dashboard.load_vectorizer()
+
+        dashboard.load_vectorizer.clear()
+        vectorizer.assert_not_called()
 
 
 if __name__ == "__main__":

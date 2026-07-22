@@ -5,20 +5,22 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
+import stat
 import tempfile
 import tomllib
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 
 from src.artifact_compatibility import (
+    deep_freeze,
     read_regular_file,
     sha256_bytes,
     write_json_atomically,
 )
-from src.paths import resolve_dir
+from src.paths import acquire_run_artifact_lock, resolve_dir
 
 EVALUATION_ARTIFACT_SCHEMA_VERSION = 1
 EVALUATION_MANIFEST_FILENAME = "manifest.json"
@@ -215,6 +217,29 @@ def _validate_new_artifact_path(output_dir: str | Path) -> Path:
 def _validate_row(
     text: object, label: object, *, split: str, index: int
 ) -> tuple[str, int]:
+    """Validate one dataset row at a frozen split position.
+
+    Parameters
+    ----------
+    text : object
+        Candidate review text.
+    label : object
+        Candidate binary sentiment label.
+    split : str
+        Official split name used in validation errors.
+    index : int
+        Zero-based official split row index.
+
+    Returns
+    -------
+    tuple of str and int
+        Validated text and binary label.
+
+    Raises
+    ------
+    ValueError
+        If text is not a string or label is not a built-in binary integer.
+    """
     if not isinstance(text, str):
         raise ValueError(f"{split} row {index} has a non-string text value")
     if type(label) is not int or label not in (0, 1):
@@ -222,7 +247,7 @@ def _validate_row(
     return text, label
 
 
-def publish_evaluation_artifact(
+def _publish_evaluation_artifact_unlocked(
     rows: Iterable[Mapping[str, Any]],
     output_dir: str | Path,
     *,
@@ -254,19 +279,20 @@ def publish_evaluation_artifact(
     frozen = protocol or load_scientific_protocol()
     dataset_manifest = _evaluation_dataset_manifest(frozen)
     output_path = _validate_new_artifact_path(output_dir)
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=output_path.parent,
-        prefix=f".{output_path.name}.",
-        suffix=".jsonl.tmp",
+    staging_path = Path(
+        tempfile.mkdtemp(
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".staging",
+        )
     )
-    temporary_path = Path(temporary_name)
+    records_path = staging_path / EVALUATION_RECORDS_FILENAME
     record_hash = hashlib.sha256()
     content_hash = hashlib.sha256()
     label_counts: Counter[int] = Counter()
     row_count = 0
-    created_directory = False
     try:
-        with os.fdopen(descriptor, "wb") as file:
+        with records_path.open("xb") as file:
             for index, row in enumerate(rows):
                 text, label = _validate_row(
                     row.get("text"), row.get("label"), split="test", index=index
@@ -279,7 +305,7 @@ def publish_evaluation_artifact(
                 row_count += 1
             file.flush()
             os.fsync(file.fileno())
-        temporary_path.chmod(0o644)
+        records_path.chmod(0o644)
 
         expected_counts = dataset_manifest["label_counts"]
         if row_count != dataset_manifest["rows"]:
@@ -293,11 +319,6 @@ def publish_evaluation_artifact(
                 "test canonical content SHA-256 differs from the frozen protocol"
             )
 
-        # The manifest is the atomic completion marker; consumers reject the
-        # directory until the already-fsynced records and this manifest both exist.
-        output_path.mkdir(mode=0o755)
-        created_directory = True
-        os.replace(temporary_path, output_path / EVALUATION_RECORDS_FILENAME)
         manifest = {
             "schema_version": EVALUATION_ARTIFACT_SCHEMA_VERSION,
             "artifact_type": "untouched_global_test_set",
@@ -319,18 +340,62 @@ def publish_evaluation_artifact(
             },
         }
         write_json_atomically(
-            output_path / EVALUATION_MANIFEST_FILENAME,
+            staging_path / EVALUATION_MANIFEST_FILENAME,
             manifest,
             overwrite=False,
         )
+        os.rename(staging_path, output_path)
         return output_path
     except BaseException:
-        temporary_path.unlink(missing_ok=True)
-        if created_directory:
-            for filename in (EVALUATION_MANIFEST_FILENAME, EVALUATION_RECORDS_FILENAME):
-                (output_path / filename).unlink(missing_ok=True)
-            output_path.rmdir()
+        shutil.rmtree(staging_path, ignore_errors=True)
         raise
+
+
+def publish_evaluation_artifact(
+    rows: Iterable[Mapping[str, Any]],
+    output_dir: str | Path,
+    *,
+    protocol: Mapping[str, Any] | None = None,
+) -> Path:
+    """Publish one immutable evaluation artifact under an exclusive lock.
+
+    Parameters
+    ----------
+    rows : iterable of mappings
+        Official test rows in ascending source order.
+    output_dir : str or pathlib.Path
+        New dedicated artifact directory.
+    protocol : mapping or None, optional
+        Parsed frozen protocol, primarily for deterministic tests.
+
+    Returns
+    -------
+    pathlib.Path
+        Published evaluation artifact directory.
+
+    Raises
+    ------
+    FileExistsError
+        If the immutable destination already exists.
+    RuntimeError
+        If another writer owns the same destination.
+    ValueError
+        If owned residue, rows, or paths are invalid.
+    """
+    output_path = resolve_dir(output_dir)
+    lock = acquire_run_artifact_lock(output_path)
+    try:
+        prefix = f".{output_path.name}."
+        for residue in output_path.parent.glob(f"{prefix}*.staging"):
+            residue_stat = residue.lstat()
+            if residue.is_symlink() or not stat.S_ISDIR(residue_stat.st_mode):
+                raise ValueError("evaluation staging residue is unsafe")
+            shutil.rmtree(residue)
+        return _publish_evaluation_artifact_unlocked(
+            rows, output_path, protocol=protocol
+        )
+    finally:
+        lock.release()
 
 
 def _require_exact_fields(
@@ -363,6 +428,25 @@ def _require_exact_fields(
 def _validate_manifest(
     payload: object, protocol: Mapping[str, Any]
 ) -> Mapping[str, Any]:
+    """Validate the exact untouched-evaluation manifest contract.
+
+    Parameters
+    ----------
+    payload : object
+        Decoded candidate manifest.
+    protocol : mapping of str to Any
+        Frozen protocol providing the authoritative test identity.
+
+    Returns
+    -------
+    mapping of str to Any
+        Validated manifest mapping.
+
+    Raises
+    ------
+    ValueError
+        If schema, fields, lifecycle, dataset, records, or checksums differ.
+    """
     if not isinstance(payload, Mapping):
         raise ValueError("evaluation manifest must be a JSON object")
     _require_exact_fields(payload, _MANIFEST_FIELDS, "manifest")
@@ -497,6 +581,6 @@ def load_evaluation_artifact_snapshot(
         raise ValueError("evaluation content SHA-256 differs from the manifest")
     return EvaluationArtifactSnapshot(
         canonical_dir,
-        MappingProxyType(dict(payload)),
+        deep_freeze(payload),
         records,
     )

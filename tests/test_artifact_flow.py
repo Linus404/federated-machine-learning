@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import tempfile
 import unittest
 from collections import Counter
@@ -10,11 +11,16 @@ import numpy as np
 
 from src.app_manifest import AppManifest, load_app_manifest
 from src.artifact_compatibility import (
-    ARTIFACT_SCHEMA_VERSION,
+    CLIENT_SHARD_SCHEMA_VERSION,
     PUBLIC_ARTIFACT_SCHEMA_VERSION,
+    canonical_json_bytes,
+    sha256_bytes,
 )
-from src.contracts import client_shard_metadata
+from src.contracts import canonical_client_row_bytes, client_shard_metadata
 from src.data_prep import (
+    _acquire_preparation_lock,
+    _publish_prepared_roots,
+    _recover_owned_preparation_backup,
     build_vectorizer,
     main,
     package_raw_client_shards,
@@ -25,6 +31,7 @@ from src.evaluation_artifact import canonical_source_row_bytes
 from src.local_training import (
     build_model_from_manifest,
     load_client_shard,
+    load_client_shard_snapshot,
 )
 from src.text_preprocessing import create_text_vectorizer, protocol_standardize
 
@@ -55,11 +62,8 @@ def write_public_artifacts(path: Path, sequence_length: int = 4) -> AppManifest:
         },
     }
     manifest_path = path / "manifest.json"
-    manifest_bytes = json.dumps(payload).encode("utf-8")
+    manifest_bytes = canonical_json_bytes(payload)
     manifest_path.write_bytes(manifest_bytes)
-    (path / "client_metadata.json").write_text(
-        json.dumps({"schema_version": ARTIFACT_SCHEMA_VERSION}), encoding="utf-8"
-    )
     return AppManifest(
         payload,
         path / "vocab.txt",
@@ -69,7 +73,7 @@ def write_public_artifacts(path: Path, sequence_length: int = 4) -> AppManifest:
     )
 
 
-def public_protocol() -> dict[str, object]:
+def public_protocol(sequence_length: int = 4) -> dict[str, object]:
     """Return the small frozen public-artifact protocol used by flow tests.
 
     Returns
@@ -94,16 +98,67 @@ def public_protocol() -> dict[str, object]:
         },
         "preprocessing": {
             "vocabulary_size": 5,
+            "max_tokens": 5,
+            "output_sequence_length": sequence_length,
             "vocabulary_sha256": hashlib.sha256(vocabulary).hexdigest(),
         },
+        "model": {
+            "vocabulary_size": 5,
+            "sequence_length": sequence_length,
+            "embedding_dimension": 100,
+        },
     }
+
+
+def write_client_artifacts(
+    path: Path,
+    manifest: AppManifest,
+    records: list[dict[str, object]],
+    *,
+    client_id: int = 0,
+) -> Path:
+    """Write one canonical client shard bound to a public manifest snapshot.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        New shard directory.
+    manifest : AppManifest
+        Public artifact snapshot to bind.
+    records : list of dict
+        Review text and binary labels in official-index order.
+    client_id : int, optional
+        Expected client identity.
+
+    Returns
+    -------
+    pathlib.Path
+        Written client shard directory.
+    """
+    path.mkdir()
+    records_bytes = b"".join(
+        canonical_client_row_bytes(
+            f"train:{index}", str(record["text"]), int(record["label"])
+        )
+        for index, record in enumerate(records)
+    )
+    (path / "reviews.jsonl").write_bytes(records_bytes)
+    metadata = client_shard_metadata(
+        client_id,
+        [int(record["label"]) for record in records],
+        records_bytes=records_bytes,
+        public_manifest_bytes=manifest.manifest_bytes,
+        dataset=manifest.payload["dataset"],
+    )
+    (path / "client_metadata.json").write_bytes(canonical_json_bytes(metadata))
+    return path
 
 
 def check_public_manifest_loads_the_model_shape(tmp_path: Path) -> None:
     write_public_artifacts(tmp_path, sequence_length=500)
 
     manifest = load_app_manifest(
-        public_artifact_dir=tmp_path, protocol=public_protocol()
+        public_artifact_dir=tmp_path, protocol=public_protocol(500)
     )
 
     assert manifest.vocabulary_path == tmp_path.resolve() / "vocab.txt"
@@ -114,7 +169,17 @@ def check_raw_client_packaging_keeps_every_sample_private(tmp_path: Path) -> Non
     texts = np.asarray([f"review {index}\nline" for index in range(12)])
     labels = np.asarray([0, 1] * 6)
 
-    shards = package_raw_client_shards(texts, labels, tmp_path, num_clients=4)
+    public_dir = tmp_path / "public"
+    public_dir.mkdir()
+    manifest = write_public_artifacts(public_dir)
+    shards = package_raw_client_shards(
+        texts,
+        labels,
+        tmp_path,
+        num_clients=4,
+        manifest=manifest.payload,
+        dataset=manifest.payload["dataset"],
+    )
 
     packaged = []
     sample_count = 0
@@ -129,7 +194,7 @@ def check_raw_client_packaging_keeps_every_sample_private(tmp_path: Path) -> Non
             .splitlines()
         ]
         assert metadata["client_id"] == client_id
-        assert metadata["schema_version"] == ARTIFACT_SCHEMA_VERSION
+        assert metadata["schema_version"] == CLIENT_SHARD_SCHEMA_VERSION
         assert metadata["sample_count"] == len(records)
         assert metadata["split_seed"] == 67
         assert metadata["alpha"] == 0.5
@@ -143,19 +208,19 @@ def check_raw_client_packaging_keeps_every_sample_private(tmp_path: Path) -> Non
 def check_client_tokenizes_its_raw_reviews_with_public_vocabulary(
     tmp_path: Path,
 ) -> None:
-    manifest = write_public_artifacts(tmp_path)
+    public_dir = tmp_path / "public"
+    public_dir.mkdir()
+    manifest = write_public_artifacts(public_dir)
     records = [
         {"text": "good movie", "label": 1},
         {"text": "bad movie", "label": 0},
         {"text": "unknown movie", "label": 0},
         {"text": "good", "label": 1},
     ]
-    (tmp_path / "reviews.jsonl").write_text(
-        "\n".join(json.dumps(record) for record in records), encoding="utf-8"
-    )
+    client_dir = write_client_artifacts(tmp_path / "client-0", manifest, records)
 
     (train_x, train_y), (val_x, val_y) = load_client_shard(
-        tmp_path, manifest, validation_split=0.25
+        client_dir, manifest, 0, validation_split=0.25
     )
 
     assert train_x.dtype == np.int32
@@ -176,18 +241,17 @@ def check_client_tokenizes_its_raw_reviews_with_public_vocabulary(
 def check_client_loader_preserves_unicode_line_separator_in_review(
     tmp_path: Path,
 ) -> None:
-    manifest = write_public_artifacts(tmp_path)
+    public_dir = tmp_path / "public"
+    public_dir.mkdir()
+    manifest = write_public_artifacts(public_dir)
     records = [
         {"text": "good\u2028movie", "label": 1},
         {"text": "bad movie", "label": 0},
     ]
-    (tmp_path / "reviews.jsonl").write_text(
-        "\n".join(json.dumps(record, ensure_ascii=False) for record in records),
-        encoding="utf-8",
-    )
+    client_dir = write_client_artifacts(tmp_path / "client-0", manifest, records)
 
     (train_x, train_y), (val_x, val_y) = load_client_shard(
-        tmp_path, manifest, validation_split=0.5
+        client_dir, manifest, 0, validation_split=0.5
     )
 
     assert train_x.shape == (1, 4)
@@ -198,20 +262,20 @@ def check_client_loader_preserves_unicode_line_separator_in_review(
 def check_client_loader_preserves_control_character_in_vocabulary(
     tmp_path: Path,
 ) -> None:
-    manifest = write_public_artifacts(tmp_path)
-    (tmp_path / "vocab.txt").write_text(
+    public_dir = tmp_path / "public"
+    public_dir.mkdir()
+    manifest = write_public_artifacts(public_dir)
+    (public_dir / "vocab.txt").write_text(
         "\n[UNK]\ngood\nbad\nmovie\n\x85\nrare", encoding="utf-8"
     )
     records = [
         {"text": "good movie", "label": 1},
         {"text": "bad movie", "label": 0},
     ]
-    (tmp_path / "reviews.jsonl").write_text(
-        "\n".join(json.dumps(record) for record in records), encoding="utf-8"
-    )
+    client_dir = write_client_artifacts(tmp_path / "client-0", manifest, records)
 
     (train_x, train_y), (val_x, val_y) = load_client_shard(
-        tmp_path, manifest, validation_split=0.5
+        client_dir, manifest, 0, validation_split=0.5
     )
 
     assert train_x.shape == (1, 4)
@@ -274,9 +338,16 @@ def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> No
         },
         "preprocessing": {
             "vocabulary_size": 5,
+            "max_tokens": 5,
+            "output_sequence_length": 500,
             "vocabulary_sha256": hashlib.sha256(
                 b"\n[UNK]\nreview\ngood\nmovie\n"
             ).hexdigest(),
+        },
+        "model": {
+            "vocabulary_size": 5,
+            "sequence_length": 500,
+            "embedding_dimension": 100,
         },
         "framework": {
             "tensorflow_version": "2.20.0",
@@ -382,7 +453,7 @@ class ArtifactFlowTests(unittest.TestCase):
                 "datasets_version": "1.0.0",
                 "splits": {
                     "train": {
-                        "rows": 2,
+                        "rows": 4,
                         "raw_parquet_sha256": "1" * 64,
                         "content_sha256": "2" * 64,
                     }
@@ -390,7 +461,14 @@ class ArtifactFlowTests(unittest.TestCase):
             },
             "preprocessing": {
                 "vocabulary_size": len(vocabulary),
+                "max_tokens": len(vocabulary),
+                "output_sequence_length": 500,
                 "vocabulary_sha256": hashlib.sha256(vocabulary_bytes).hexdigest(),
+            },
+            "model": {
+                "vocabulary_size": len(vocabulary),
+                "sequence_length": 500,
+                "embedding_dimension": 100,
             },
         }
 
@@ -408,17 +486,12 @@ class ArtifactFlowTests(unittest.TestCase):
             records = [
                 {"text": text, "label": label} for label in (0, 1) for text in cases
             ]
-            (root / "reviews.jsonl").write_text(
-                "\n".join(json.dumps(record, ensure_ascii=False) for record in records),
-                encoding="utf-8",
-            )
-            (root / "client_metadata.json").write_text(
-                json.dumps({"schema_version": ARTIFACT_SCHEMA_VERSION}),
-                encoding="utf-8",
-            )
+            client_dir = write_client_artifacts(root / "client-0", manifest, records)
 
             expected_ids = np.asarray(producer([record["text"] for record in records]))
-            train, validation = load_client_shard(root, manifest, validation_split=0.5)
+            train, validation = load_client_shard(
+                client_dir, manifest, 0, validation_split=0.5
+            )
             consumed_ids = np.concatenate([train[0], validation[0]])
             self.assertEqual(
                 Counter(map(tuple, consumed_ids)),
@@ -461,12 +534,11 @@ class ArtifactFlowTests(unittest.TestCase):
                 {"text": "bad movie", "label": 0},
                 {"text": "movie", "label": 0},
             ]
-            (root / "reviews.jsonl").write_text(
-                "\n".join(json.dumps(record) for record in records),
-                encoding="utf-8",
-            )
+            client_dir = write_client_artifacts(root / "client-0", manifest, records)
 
-            train, validation = load_client_shard(root, manifest, validation_split=0.5)
+            train, validation = load_client_shard(
+                client_dir, manifest, 0, validation_split=0.5
+            )
 
         consumed = np.concatenate([train[0], validation[0]])
         self.assertTrue(any(np.array_equal(row[:2], [2, 4]) for row in consumed))
@@ -548,10 +620,25 @@ class ArtifactFlowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             evaluation_dir = root / "evaluation"
+            test_rows = [
+                {"text": "untouched negative", "label": 0},
+                {"text": "untouched positive", "label": 1},
+            ]
             dataset = {
-                "train": {"text": ["negative", "positive"], "label": [0, 1]},
-                "test": [{"text": "untouched", "label": 0}],
+                "train": {
+                    "text": ["negative", "positive", "bad", "good"],
+                    "label": [0, 1, 0, 1],
+                },
+                "test": test_rows,
             }
+            vocabulary = ["", "[UNK]", "negative", "positive", "good"]
+            vocabulary_bytes = b"".join(
+                term.encode("utf-8") + b"\n" for term in vocabulary
+            )
+            test_content = b"".join(
+                canonical_source_row_bytes(row["text"], row["label"])
+                for row in test_rows
+            )
             protocol = {
                 "dataset": {
                     "id": "example/imdb",
@@ -560,11 +647,28 @@ class ArtifactFlowTests(unittest.TestCase):
                     "datasets_version": "1.0.0",
                     "splits": {
                         "train": {
-                            "rows": 2,
+                            "rows": 4,
                             "raw_parquet_sha256": "1" * 64,
                             "content_sha256": "2" * 64,
-                        }
+                        },
+                        "test": {
+                            "rows": 2,
+                            "label_counts": [1, 1],
+                            "raw_parquet_sha256": "3" * 64,
+                            "content_sha256": hashlib.sha256(test_content).hexdigest(),
+                        },
                     },
+                },
+                "preprocessing": {
+                    "vocabulary_size": len(vocabulary),
+                    "max_tokens": len(vocabulary),
+                    "output_sequence_length": 4,
+                    "vocabulary_sha256": hashlib.sha256(vocabulary_bytes).hexdigest(),
+                },
+                "model": {
+                    "vocabulary_size": len(vocabulary),
+                    "sequence_length": 4,
+                    "embedding_dimension": 8,
                 },
                 "framework": {
                     "tensorflow_version": "2.20.0",
@@ -573,28 +677,29 @@ class ArtifactFlowTests(unittest.TestCase):
                 },
             }
 
-            def publish_evaluation(rows, output_dir, *, protocol):
-                del rows, protocol
-                Path(output_dir).mkdir()
+            class Vectorizer:
+                def get_vocabulary(self):
+                    return vocabulary
+
+            publication_attempts = 0
+
+            def publish_once_then_succeed(roots, stages):
+                nonlocal publication_attempts
+                publication_attempts += 1
+                if publication_attempts == 1:
+                    raise RuntimeError("injected final publication failure")
+                return _publish_prepared_roots(roots, stages)
 
             with (
                 patch("src.data_prep.load_verified_imdb_dataset", return_value=dataset),
-                patch("src.data_prep.build_vectorizer", return_value=object()),
+                patch("src.data_prep.build_vectorizer", return_value=Vectorizer()),
                 patch("src.data_prep.load_scientific_protocol", return_value=protocol),
-                patch("src.data_prep.publish_public_artifacts", return_value={}),
                 patch(
-                    "src.data_prep.package_raw_client_shards",
-                    side_effect=[
-                        RuntimeError("injected client publication failure"),
-                        [],
-                    ],
+                    "src.data_prep._publish_prepared_roots",
+                    side_effect=publish_once_then_succeed,
                 ),
-                patch(
-                    "src.data_prep.publish_evaluation_artifact",
-                    side_effect=publish_evaluation,
-                ) as publish_test,
             ):
-                with self.assertRaisesRegex(RuntimeError, "injected"):
+                with self.assertRaisesRegex(RuntimeError, "final publication"):
                     prepare_all(
                         2,
                         root / "clients",
@@ -611,7 +716,7 @@ class ArtifactFlowTests(unittest.TestCase):
                 )
 
             self.assertTrue(evaluation_dir.is_dir())
-            publish_test.assert_called_once()
+            self.assertEqual(publication_attempts, 2)
 
     def test_preparation_rejects_overlapping_artifact_boundaries_before_loading(
         self,
@@ -654,13 +759,21 @@ class ArtifactFlowTests(unittest.TestCase):
             {"text": "good", "label": 1},
             {"text": "bad", "label": 0},
         ]
-        for version, error in ((None, "no valid"), (0, "older"), (2, "newer")):
+        for version, error in (
+            (None, "no valid"),
+            (1, "older"),
+            (CLIENT_SHARD_SCHEMA_VERSION + 1, "newer"),
+        ):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as tmpdir:
-                path = Path(tmpdir)
-                manifest = write_public_artifacts(path)
+                root = Path(tmpdir)
+                public_dir = root / "public"
+                public_dir.mkdir()
+                manifest = write_public_artifacts(public_dir)
+                path = root / "client-0"
+                path.mkdir()
                 metadata = {} if version is None else {"schema_version": version}
-                (path / "client_metadata.json").write_text(
-                    json.dumps(metadata), encoding="utf-8"
+                (path / "client_metadata.json").write_bytes(
+                    canonical_json_bytes(metadata)
                 )
                 (path / "reviews.jsonl").write_text(
                     "\n".join(json.dumps(record) for record in records),
@@ -668,32 +781,247 @@ class ArtifactFlowTests(unittest.TestCase):
                 )
 
                 with self.assertRaisesRegex(ValueError, error):
-                    load_client_shard(path, manifest)
+                    load_client_shard(path, manifest, 0)
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir)
-            manifest = write_public_artifacts(path)
-            (path / "reviews.jsonl").write_text(
-                "\n".join(json.dumps(record) for record in records), encoding="utf-8"
-            )
-            train, validation = load_client_shard(path, manifest)
+            root = Path(tmpdir)
+            public_dir = root / "public"
+            public_dir.mkdir()
+            manifest = write_public_artifacts(public_dir)
+            path = write_client_artifacts(root / "client-0", manifest, records)
+            train, validation = load_client_shard(path, manifest, 0)
             self.assertEqual(len(train[1]) + len(validation[1]), len(records))
 
-    def test_client_shard_metadata_preserves_additive_fields(self) -> None:
+    def test_client_shard_metadata_binds_records_and_public_manifest(self) -> None:
+        manifest_bytes = b"canonical public manifest\n"
+        records_bytes = b"canonical records\n"
         metadata = client_shard_metadata(
-            3, [0, 1], extra_metadata={"source": "research cohort"}
+            3,
+            [0, 1],
+            records_bytes=records_bytes,
+            public_manifest_bytes=manifest_bytes,
+            dataset={"split": "train"},
         )
 
         self.assertEqual(metadata["client_id"], 3)
-        self.assertEqual(metadata["source"], "research cohort")
+        self.assertEqual(metadata["schema_version"], CLIENT_SHARD_SCHEMA_VERSION)
+        self.assertEqual(
+            metadata["records"]["checksum"],
+            "sha256:" + hashlib.sha256(records_bytes).hexdigest(),
+        )
+        self.assertEqual(
+            metadata["public_manifest"]["checksum"],
+            "sha256:" + hashlib.sha256(manifest_bytes).hexdigest(),
+        )
 
-    def test_client_shard_metadata_rejects_reserved_field_collisions(self) -> None:
-        with self.assertRaisesRegex(ValueError, "schema_version"):
-            client_shard_metadata(
-                3,
-                [0, 1],
-                extra_metadata={"schema_version": ARTIFACT_SCHEMA_VERSION + 1},
+    def test_client_shard_rejects_identity_content_and_binding_corruption(self) -> None:
+        cases = (
+            "wrong client",
+            "stale dataset",
+            "test identity",
+            "duplicate identity",
+            "non-binary label",
+            "noncanonical record",
+            "sample count",
+            "label histogram",
+            "record checksum",
+            "public manifest",
+        )
+        records = [
+            {"text": "good movie", "label": 1},
+            {"text": "bad movie", "label": 0},
+            {"text": "good", "label": 1},
+            {"text": "bad", "label": 0},
+        ]
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                public_dir = root / "public"
+                public_dir.mkdir()
+                manifest = write_public_artifacts(public_dir)
+                shard = write_client_artifacts(root / "client-0", manifest, records)
+                metadata_path = shard / "client_metadata.json"
+                records_path = shard / "reviews.jsonl"
+                metadata = json.loads(metadata_path.read_bytes())
+                decoded_records = [
+                    json.loads(line) for line in records_path.read_bytes().splitlines()
+                ]
+
+                if case == "wrong client":
+                    metadata["client_id"] = 9
+                elif case == "stale dataset":
+                    metadata["dataset"]["revision"] = "stale"
+                elif case == "test identity":
+                    decoded_records[0]["row_id"] = "test:0"
+                elif case == "duplicate identity":
+                    decoded_records[1]["row_id"] = "train:0"
+                elif case == "non-binary label":
+                    decoded_records[0]["label"] = 2
+                elif case == "noncanonical record":
+                    content = b"".join(
+                        (json.dumps(record, ensure_ascii=False) + "\n").encode()
+                        for record in decoded_records
+                    )
+                    records_path.write_bytes(content)
+                    metadata["records"]["checksum"] = sha256_bytes(content)
+                elif case == "sample count":
+                    metadata["sample_count"] += 1
+                elif case == "label histogram":
+                    metadata["label_histogram"]["0"] += 1
+                elif case == "record checksum":
+                    metadata["records"]["checksum"] = "sha256:" + "0" * 64
+                elif case == "public manifest":
+                    metadata["public_manifest"]["checksum"] = "sha256:" + "0" * 64
+
+                if case in {"test identity", "duplicate identity", "non-binary label"}:
+                    content = b"".join(
+                        canonical_client_row_bytes(
+                            str(record["row_id"]),
+                            str(record["text"]),
+                            int(record["label"]),
+                        )
+                        for record in decoded_records
+                    )
+                    records_path.write_bytes(content)
+                    metadata["records"]["checksum"] = sha256_bytes(content)
+                metadata_path.write_bytes(canonical_json_bytes(metadata))
+
+                with self.assertRaises(ValueError):
+                    load_client_shard_snapshot(shard, manifest, 0)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            public_dir = root / "public"
+            public_dir.mkdir()
+            manifest = write_public_artifacts(public_dir)
+            shard = write_client_artifacts(root / "client-0", manifest, records)
+            with self.assertRaisesRegex(ValueError, "expected client ID"):
+                load_client_shard_snapshot(shard, manifest, 1)
+
+    def test_publishers_reject_unsafe_existing_child_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            external = root / "external.txt"
+            external.write_text("outside", encoding="utf-8")
+            public = root / "public"
+            public.mkdir()
+            (public / "vocab.txt").symlink_to(external)
+            protocol = public_protocol()
+
+            class Vectorizer:
+                def get_vocabulary(self):
+                    return ["", "[UNK]", "good", "bad", "movie"]
+
+            with self.assertRaisesRegex(ValueError, "unsafe"):
+                publish_public_artifacts(Vectorizer(), public, protocol=protocol)
+            self.assertEqual(external.read_text(encoding="utf-8"), "outside")
+
+        if os.name != "nt":
+            with tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                external = root / "external.txt"
+                external.write_text("outside", encoding="utf-8")
+                public = root / "public"
+                public.mkdir()
+                os.link(external, public / "vocab.txt")
+
+                class Vectorizer:
+                    def get_vocabulary(self):
+                        return ["", "[UNK]", "good", "bad", "movie"]
+
+                with self.assertRaisesRegex(ValueError, "unsafe"):
+                    publish_public_artifacts(
+                        Vectorizer(), public, protocol=public_protocol()
+                    )
+                self.assertEqual(external.read_text(encoding="utf-8"), "outside")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            clients = root / "clients"
+            client = clients / "client-0"
+            client.mkdir(parents=True)
+            external = root / "outside.jsonl"
+            external.write_text("outside", encoding="utf-8")
+            (client / "reviews.jsonl").symlink_to(external)
+            with self.assertRaisesRegex(ValueError, "unsafe"):
+                package_raw_client_shards(
+                    ["good", "bad"],
+                    [1, 0],
+                    clients,
+                    1,
+                    manifest={"dataset": {"split": "train"}},
+                    dataset={"split": "train"},
+                )
+            self.assertEqual(external.read_text(encoding="utf-8"), "outside")
+
+    def test_client_packaging_removes_stale_partition_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            public_dir = root / "public"
+            public_dir.mkdir()
+            manifest = write_public_artifacts(public_dir)
+            clients = root / "clients"
+            texts = ["bad", "good", "negative", "positive"]
+            labels = [0, 1, 0, 1]
+            package_raw_client_shards(
+                texts,
+                labels,
+                clients,
+                4,
+                manifest=manifest.payload,
+                dataset=manifest.payload["dataset"],
             )
+            package_raw_client_shards(
+                texts,
+                labels,
+                clients,
+                2,
+                manifest=manifest.payload,
+                dataset=manifest.payload["dataset"],
+            )
+
+            self.assertEqual(
+                {path.name for path in clients.glob("client-*")},
+                {"client-0", "client-1"},
+            )
+
+    def test_preparation_lock_rejects_concurrent_writer_before_loading(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            roots = {
+                "client": root / "clients",
+                "public": root / "public",
+                "evaluation": root / "evaluation",
+            }
+            lock = _acquire_preparation_lock(roots)
+            try:
+                with (
+                    patch("src.data_prep.load_verified_imdb_dataset") as load_dataset,
+                    self.assertRaisesRegex(RuntimeError, "already in progress"),
+                ):
+                    prepare_all(
+                        2,
+                        roots["client"],
+                        roots["public"],
+                        roots["evaluation"],
+                    )
+                load_dataset.assert_not_called()
+            finally:
+                lock.release()
+
+    def test_preparation_recovers_only_owned_interrupted_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            public = root / "public"
+            public.mkdir()
+            (public / "keep.txt").write_text("keep", encoding="utf-8")
+            backup = root / ".public.deadbeef.backup"
+            public.rename(backup)
+
+            _recover_owned_preparation_backup(public)
+
+            self.assertEqual((public / "keep.txt").read_text(encoding="utf-8"), "keep")
+            self.assertFalse(backup.exists())
 
 
 if __name__ == "__main__":

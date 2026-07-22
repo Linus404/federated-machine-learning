@@ -9,6 +9,7 @@ from unittest.mock import patch
 from src.artifact_compatibility import (
     ARTIFACT_SCHEMA_VERSION,
     PUBLIC_ARTIFACT_SCHEMA_VERSION,
+    canonical_json_bytes,
 )
 from src.run_provenance import (
     _code_revision,
@@ -45,8 +46,8 @@ def write_public_dataset_contract(path: Path) -> dict[str, object]:
         "raw_parquet_sha256": "db47d16b" + "0" * 56,
         "content_sha256": "4639bf10" + "0" * 56,
     }
-    (path / "manifest.json").write_text(
-        json.dumps(
+    (path / "manifest.json").write_bytes(
+        canonical_json_bytes(
             {
                 "schema_version": PUBLIC_ARTIFACT_SCHEMA_VERSION,
                 "embedding_dim": 100,
@@ -59,8 +60,7 @@ def write_public_dataset_contract(path: Path) -> dict[str, object]:
                 },
                 "dataset": dataset,
             }
-        ),
-        encoding="utf-8",
+        )
     )
     return {
         "dataset": {
@@ -86,7 +86,14 @@ def write_public_dataset_contract(path: Path) -> dict[str, object]:
         },
         "preprocessing": {
             "vocabulary_size": 4,
+            "max_tokens": 4,
+            "output_sequence_length": 500,
             "vocabulary_sha256": vocabulary_sha256,
+        },
+        "model": {
+            "vocabulary_size": 4,
+            "sequence_length": 500,
+            "embedding_dimension": 100,
         },
     }
 
@@ -303,7 +310,7 @@ class RunProvenanceTests(unittest.TestCase):
                 manifest_path = public_dir / "manifest.json"
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
                 manifest["dataset"][field] = value
-                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                manifest_path.write_bytes(canonical_json_bytes(manifest))
 
                 with (
                     patch(
@@ -346,7 +353,7 @@ class RunProvenanceTests(unittest.TestCase):
                 vocabulary_path = public_dir / "vocab.txt"
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
                 mutate(manifest, vocabulary_path)
-                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                manifest_path.write_bytes(canonical_json_bytes(manifest))
 
                 with (
                     patch(

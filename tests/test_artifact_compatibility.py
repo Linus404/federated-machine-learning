@@ -10,6 +10,7 @@ from src.artifact_compatibility import (
     ARTIFACT_SCHEMA_VERSION,
     PUBLIC_ARTIFACT_SCHEMA_VERSION,
     SERVER_ARTIFACTS,
+    canonical_json_bytes,
     load_server_artifact_manifest,
     validate_artifact_schema,
     write_server_artifact_manifest,
@@ -82,7 +83,14 @@ class ArtifactCompatibilityTests(unittest.TestCase):
             },
             "preprocessing": {
                 "vocabulary_size": 3,
+                "max_tokens": 3,
+                "output_sequence_length": 500,
                 "vocabulary_sha256": vocabulary_sha256,
+            },
+            "model": {
+                "vocabulary_size": 3,
+                "sequence_length": 500,
+                "embedding_dimension": 100,
             },
         }
         valid_payload = {
@@ -119,11 +127,43 @@ class ArtifactCompatibilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir)
             (path / "vocab.txt").write_bytes(vocabulary)
-            (path / "manifest.json").write_text(
-                json.dumps(valid_payload), encoding="utf-8"
-            )
+            (path / "manifest.json").write_bytes(canonical_json_bytes(valid_payload))
             manifest = load_app_manifest(public_artifact_dir=path, protocol=protocol)
             self.assertEqual(manifest.payload, valid_payload)
+            with self.assertRaises(TypeError):
+                manifest.payload["dataset"]["id"] = "mutated"
+            with self.assertRaises(TypeError):
+                manifest.payload["vocabulary"]["sha256"] = "0" * 64
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            (path / "vocab.txt").write_bytes(vocabulary)
+            nested_payload = {
+                **valid_payload,
+                "producer": {"history": [{"revision": "frozen"}]},
+            }
+            (path / "manifest.json").write_bytes(canonical_json_bytes(nested_payload))
+            manifest = load_app_manifest(public_artifact_dir=path, protocol=protocol)
+            with self.assertRaises(TypeError):
+                manifest.payload["producer"]["history"][0]["revision"] = "mutated"
+
+        invalid_dimensions = (
+            ("embedding_dim", -3),
+            ("sequence_length", 4.75),
+            ("sequence_length", True),
+            ("vocabulary_size", 4),
+        )
+        for field, value in invalid_dimensions:
+            with (
+                self.subTest(field=field, value=value),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                path = Path(tmpdir)
+                (path / "vocab.txt").write_bytes(vocabulary)
+                payload = {**valid_payload, field: value}
+                (path / "manifest.json").write_bytes(canonical_json_bytes(payload))
+                with self.assertRaisesRegex(ValueError, "protocol dimensions"):
+                    load_app_manifest(public_artifact_dir=path, protocol=protocol)
 
     def test_server_artifact_manifest_declares_supported_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import tempfile
 import time
 from io import BytesIO
@@ -10,9 +9,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-os.environ.setdefault("KERAS_BACKEND", "tensorflow")
+from src.protocol_runtime import validate_protocol_runtime
 
 import keras
 import tensorflow as tf
@@ -79,6 +76,7 @@ def load_model(path: Path | None = None) -> Any:
     FileNotFoundError
         If no trained model artifact exists.
     """
+    validate_protocol_runtime()
     snapshot = (
         load_current_run_snapshot(ARTIFACT_ROOT)
         if path is None
@@ -113,7 +111,7 @@ def load_vectorizer() -> keras.layers.TextVectorization:
     """
     app_manifest = load_app_manifest(public_artifact_dir=PUBLIC_ARTIFACT_DIR)
     return create_text_vectorizer(
-        sequence_length=int(app_manifest.payload["sequence_length"]),
+        sequence_length=app_manifest.payload["sequence_length"],
         vocabulary=app_manifest.vocabulary_terms[2:],
     )
 

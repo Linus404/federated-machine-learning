@@ -21,6 +21,7 @@ from src.evaluation_artifact import (
     load_evaluation_artifact_snapshot,
     publish_evaluation_artifact,
 )
+from src.local_training import build_model
 
 
 def test_protocol(rows: list[dict[str, object]]) -> dict[str, object]:
@@ -101,6 +102,10 @@ class EvaluationArtifactTests(unittest.TestCase):
                 [row["text"] for row in self.rows],
             )
             self.assertTrue(first_snapshot.records.endswith(b"\n"))
+            with self.assertRaises(TypeError):
+                first_snapshot.manifest["dataset"]["id"] = "mutated"
+            with self.assertRaises(TypeError):
+                first_snapshot.manifest["records"]["fields"][0] = "mutated"
 
     def test_publication_rejects_existing_and_symlink_destinations(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -116,6 +121,20 @@ class EvaluationArtifactTests(unittest.TestCase):
             symlink.symlink_to(target, target_is_directory=True)
             with self.assertRaisesRegex(FileExistsError, "refusing replacement"):
                 publish_evaluation_artifact(self.rows, symlink, protocol=self.protocol)
+
+    def test_publication_cleans_owned_crash_residue_and_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            residue = root / ".evaluation.crashed.staging"
+            residue.mkdir()
+            (residue / "partial.jsonl").write_bytes(b"partial")
+
+            artifact = publish_evaluation_artifact(
+                self.rows, root / "evaluation", protocol=self.protocol
+            )
+
+            self.assertTrue(artifact.is_dir())
+            self.assertFalse(residue.exists())
 
     def test_loader_rejects_tampering_noncanonical_rows_and_unsafe_files(self) -> None:
         mutations = {
@@ -337,6 +356,18 @@ class EvaluationArtifactTests(unittest.TestCase):
             build_vectorizer(["must not be preprocessed"])
 
         vectorizer.assert_not_called()
+
+    def test_model_rejects_hostile_runtime_before_construction(self) -> None:
+        import keras
+
+        with (
+            patch.object(np, "__version__", "99.0.0"),
+            patch.object(keras, "Input") as model_input,
+            self.assertRaisesRegex(ValueError, "framework versions differ"),
+        ):
+            build_model(20_000, 500, 100)
+
+        model_input.assert_not_called()
 
     def test_preparation_rejects_hostile_frameworks_before_dataset_loading(
         self,

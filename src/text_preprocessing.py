@@ -7,6 +7,8 @@ import string
 from collections.abc import Sequence
 from typing import Any
 
+from src.protocol_runtime import validate_protocol_runtime
+
 import keras
 import tensorflow as tf
 
@@ -54,6 +56,7 @@ def create_text_vectorizer(
     keras.layers.TextVectorization
         Unadapted producer vectorizer or vocabulary-bound consumer vectorizer.
     """
+    validate_protocol_runtime()
     return keras.layers.TextVectorization(
         max_tokens=max_tokens,
         standardize=protocol_standardize,

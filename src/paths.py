@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 from typing import BinaryIO
 
@@ -102,7 +103,18 @@ def acquire_run_artifact_lock(artifact_dir: str | Path) -> RunArtifactLock:
     artifact_path = resolve_dir(artifact_dir)
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = artifact_path.parent / f".{artifact_path.name}.run.lock"
-    lock_file = lock_path.open("a+b")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as error:
+        raise ValueError(
+            "artifact lock path must be a single-link regular file"
+        ) from error
+    lock_stat = os.fstat(descriptor)
+    if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_nlink != 1:
+        os.close(descriptor)
+        raise ValueError("artifact lock path must be a single-link regular file")
+    lock_file = os.fdopen(descriptor, "a+b")
 
     try:
         if os.name == "nt":
