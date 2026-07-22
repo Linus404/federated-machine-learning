@@ -494,22 +494,195 @@ class MetricAggregationTests(unittest.TestCase):
             strategy.artifact_root = root
             strategy.artifact_retention_runs = 3
             strategy.final_round = 2
-            strategy._artifact_lock = Mock()
+            artifact_lock = Mock()
+            strategy._artifact_lock = artifact_lock
+            strategy.expected_client_ids = frozenset({0, 1})
+            strategy.accept_failures = False
+            strategy.evaluate_metrics_aggregation_fn = server_app.weighted_average
+            results = [
+                (
+                    Mock(),
+                    SimpleNamespace(
+                        loss=loss,
+                        num_examples=count,
+                        metrics={"accuracy": accuracy, "client_id": client_id},
+                    ),
+                )
+                for client_id, loss, accuracy, count in [
+                    (1, 0.7, 0.5, 3),
+                    (0, 0.2, 1.0, 1),
+                ]
+            ]
+
+            with (
+                patch.object(server_app, "publish_completed_run") as publish,
+                patch.object(server_app, "prune_run_history") as prune,
+            ):
+                loss, metrics = strategy.aggregate_evaluate(2, results, [])
+
+            self.assertAlmostEqual(loss, 0.575)
+            self.assertEqual(metrics, {"accuracy": 0.625})
+            publish.assert_called_once_with(root, run_dir)
+            prune.assert_called_once_with(root, 3, active_run_dir=run_dir)
+            artifact_lock.release.assert_called_once_with()
+
+    def test_final_evaluation_rejects_hostile_results_without_publication(
+        self,
+    ) -> None:
+        def valid(client_id: int) -> tuple[Mock, SimpleNamespace]:
+            """Build one valid evaluation result.
+
+            Parameters
+            ----------
+            client_id : int
+                Zero-based client identifier.
+
+            Returns
+            -------
+            tuple[unittest.mock.Mock, types.SimpleNamespace]
+                Flower-like client proxy and evaluation result.
+            """
+            return (
+                Mock(),
+                SimpleNamespace(
+                    loss=0.4,
+                    num_examples=2,
+                    metrics={"accuracy": 0.75, "client_id": client_id},
+                ),
+            )
+
+        hostile_cases = {
+            "failure": ([valid(0), valid(1)], [RuntimeError("client failed")]),
+            "empty": ([], []),
+            "partial": ([valid(0)], []),
+            "duplicate": ([valid(0), valid(0)], []),
+            "unexpected": ([valid(0), valid(2)], []),
+            "malformed": ([(Mock(), SimpleNamespace(metrics=None))], []),
+            "missing_values": (
+                [
+                    (
+                        Mock(),
+                        SimpleNamespace(metrics={"accuracy": 0.75, "client_id": 0}),
+                    ),
+                    valid(1),
+                ],
+                [],
+            ),
+        }
+
+        for name, (results, failures) in hostile_cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmpdir:
+                strategy = server_app.SentimentServer.__new__(
+                    server_app.SentimentServer
+                )
+                strategy.artifact_dir = Path(tmpdir)
+                strategy.artifact_root = Path(tmpdir)
+                strategy.artifact_retention_runs = 3
+                strategy.final_round = 2
+                artifact_lock = Mock()
+                strategy._artifact_lock = artifact_lock
+                strategy.expected_client_ids = frozenset({0, 1})
+
+                with (
+                    patch.object(server_app, "publish_completed_run") as publish,
+                    patch.object(server_app, "prune_run_history") as prune,
+                ):
+                    with self.assertRaises((RuntimeError, ValueError)):
+                        strategy.aggregate_evaluate(2, results, failures)
+
+                publish.assert_not_called()
+                prune.assert_not_called()
+                artifact_lock.release.assert_called_once_with()
+                self.assertFalse(strategy.metrics_path.exists())
+                self.assertFalse(strategy.client_metrics_path.exists())
+
+    def test_final_evaluation_rejects_invalid_aggregate_without_publication(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            strategy = server_app.SentimentServer.__new__(server_app.SentimentServer)
+            strategy.artifact_dir = Path(tmpdir)
+            strategy.artifact_root = Path(tmpdir)
+            strategy.artifact_retention_runs = 3
+            strategy.final_round = 1
+            artifact_lock = Mock()
+            strategy._artifact_lock = artifact_lock
+            strategy.expected_client_ids = frozenset({0})
+            result = (
+                Mock(),
+                SimpleNamespace(
+                    loss=0.4,
+                    num_examples=2,
+                    metrics={"accuracy": 0.75, "client_id": 0},
+                ),
+            )
 
             with (
                 patch.object(
                     server_app.FedProx,
                     "aggregate_evaluate",
-                    return_value=(0.5, {"accuracy": 0.75}),
+                    return_value=(np.nan, {"accuracy": 0.75}),
                 ),
                 patch.object(server_app, "publish_completed_run") as publish,
-                patch.object(server_app, "prune_run_history") as prune,
+                self.assertRaisesRegex(ValueError, "aggregate evaluation loss"),
             ):
-                strategy.aggregate_evaluate(2, [], [])
+                strategy.aggregate_evaluate(1, [result], [])
 
-            publish.assert_called_once_with(root, run_dir)
-            prune.assert_called_once_with(root, 3, active_run_dir=run_dir)
-            strategy._artifact_lock.release.assert_called_once_with()
+            publish.assert_not_called()
+            artifact_lock.release.assert_called_once_with()
+            self.assertFalse(strategy.metrics_path.exists())
+            self.assertFalse(strategy.client_metrics_path.exists())
+
+    def test_final_evaluation_rejects_invalid_values_without_publication(self) -> None:
+        invalid_values = [
+            ("num_examples", 0),
+            ("num_examples", -1),
+            ("num_examples", True),
+            ("num_examples", np.int64(1)),
+            ("loss", np.nan),
+            ("loss", np.inf),
+            ("accuracy", None),
+            ("accuracy", np.nan),
+            ("accuracy", np.inf),
+        ]
+
+        for field, value in invalid_values:
+            with (
+                self.subTest(field=field, value=value),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                evaluation = {
+                    "loss": 0.4,
+                    "num_examples": 2,
+                    "metrics": {"accuracy": 0.75, "client_id": 0},
+                }
+                if field == "accuracy":
+                    evaluation["metrics"]["accuracy"] = value
+                else:
+                    evaluation[field] = value
+                strategy = server_app.SentimentServer.__new__(
+                    server_app.SentimentServer
+                )
+                strategy.artifact_dir = Path(tmpdir)
+                strategy.artifact_root = Path(tmpdir)
+                strategy.artifact_retention_runs = 3
+                strategy.final_round = 1
+                artifact_lock = Mock()
+                strategy._artifact_lock = artifact_lock
+                strategy.expected_client_ids = frozenset({0})
+
+                with (
+                    patch.object(server_app, "publish_completed_run") as publish,
+                    self.assertRaises(ValueError),
+                ):
+                    strategy.aggregate_evaluate(
+                        1, [(Mock(), SimpleNamespace(**evaluation))], []
+                    )
+
+                publish.assert_not_called()
+                artifact_lock.release.assert_called_once_with()
+                self.assertFalse(strategy.metrics_path.exists())
+                self.assertFalse(strategy.client_metrics_path.exists())
 
 
 if __name__ == "__main__":

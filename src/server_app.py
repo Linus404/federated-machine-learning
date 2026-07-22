@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import csv
+import math
 import warnings
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
@@ -61,7 +63,9 @@ def weighted_average(metrics: list[tuple[int, dict[str, float]]]) -> dict[str, f
 
 
 def _sorted_fit_results(
-    results: list[Any], expected_client_ids: frozenset[int]
+    results: list[Any],
+    expected_client_ids: frozenset[int],
+    result_kind: str = "fit",
 ) -> list[Any]:
     """Validate and order fit results by numeric client identifier.
 
@@ -71,6 +75,8 @@ def _sorted_fit_results(
         Flower ``(ClientProxy, FitRes)`` pairs for one round.
     expected_client_ids : frozenset[int]
         Exact client-ID set required for the round.
+    result_kind : str, optional
+        Result label used in validation errors.
 
     Returns
     -------
@@ -91,25 +97,109 @@ def _sorted_fit_results(
         raise ValueError("expected client IDs must be contiguous from zero")
     identified_results: list[tuple[int, Any]] = []
     for result in results:
-        client_id = result[1].metrics.get("client_id")
+        if not isinstance(result, tuple) or len(result) != 2:
+            raise ValueError(f"every {result_kind} result must be a pair")
+        metrics = getattr(result[1], "metrics", None)
+        if not isinstance(metrics, dict):
+            raise ValueError(f"every {result_kind} result must contain metrics")
+        client_id = metrics.get("client_id")
         if type(client_id) is not int:
             raise ValueError(
-                "every fit result must contain a built-in integer client_id"
+                f"every {result_kind} result must contain a built-in integer client_id"
             )
         identified_results.append((client_id, result))
 
     client_ids = [client_id for client_id, _ in identified_results]
     if len(set(client_ids)) != len(client_ids):
-        raise ValueError("fit result client_id values must be unique")
+        raise ValueError(f"{result_kind} result client_id values must be unique")
     actual_client_ids = frozenset(client_ids)
     if actual_client_ids != expected_client_ids:
         missing = sorted(expected_client_ids - actual_client_ids)
         unexpected = sorted(actual_client_ids - expected_client_ids)
         raise ValueError(
-            "fit result client IDs must equal the expected set; "
+            f"{result_kind} result client IDs must equal the expected set; "
             f"missing={missing}, unexpected={unexpected}"
         )
     return [result for _, result in sorted(identified_results)]
+
+
+def _validate_evaluate_results(
+    results: list[Any], expected_client_ids: frozenset[int]
+) -> list[Any]:
+    """Validate and order one complete client-evaluation result set.
+
+    Parameters
+    ----------
+    results : list[Any]
+        Flower ``(ClientProxy, EvaluateRes)`` pairs for one round.
+    expected_client_ids : frozenset[int]
+        Exact client-ID set required for the round.
+
+    Returns
+    -------
+    list[Any]
+        Validated results sorted by ascending client ID.
+
+    Raises
+    ------
+    ValueError
+        If any result is missing, malformed, duplicated, unexpected, or
+        contains an invalid sample count, loss, or accuracy.
+    """
+    ordered_results = _sorted_fit_results(
+        results, expected_client_ids, result_kind="evaluation"
+    )
+    for _, evaluate_result in ordered_results:
+        num_examples = getattr(evaluate_result, "num_examples", None)
+        if type(num_examples) is not int or num_examples <= 0:
+            raise ValueError(
+                "evaluation result num_examples must be a positive built-in integer"
+            )
+        loss = getattr(evaluate_result, "loss", None)
+        accuracy = evaluate_result.metrics.get("accuracy")
+        if (
+            not isinstance(loss, Real)
+            or isinstance(loss, bool)
+            or not math.isfinite(loss)
+        ):
+            raise ValueError("evaluation result loss must be a finite real number")
+        if (
+            not isinstance(accuracy, Real)
+            or isinstance(accuracy, bool)
+            or not math.isfinite(accuracy)
+        ):
+            raise ValueError("evaluation result accuracy must be a finite real number")
+    return ordered_results
+
+
+def _validate_aggregated_evaluation(
+    loss: float | None, metrics: dict[str, Any]
+) -> None:
+    """Validate aggregate evaluation values before artifact publication.
+
+    Parameters
+    ----------
+    loss : float or None
+        Sample-weighted aggregate loss.
+    metrics : dict[str, Any]
+        Aggregate evaluation metrics.
+
+    Raises
+    ------
+    ValueError
+        If aggregate loss or accuracy is missing or non-finite.
+    """
+    if not isinstance(metrics, dict):
+        raise ValueError("aggregate evaluation metrics must be a dictionary")
+    accuracy = metrics.get("accuracy")
+    if not isinstance(loss, Real) or isinstance(loss, bool) or not math.isfinite(loss):
+        raise ValueError("aggregate evaluation loss must be a finite real number")
+    if (
+        not isinstance(accuracy, Real)
+        or isinstance(accuracy, bool)
+        or not math.isfinite(accuracy)
+    ):
+        raise ValueError("aggregate evaluation accuracy must be a finite real number")
 
 
 def _validate_fit_results(
@@ -270,6 +360,19 @@ class SentimentServer(FedProx):
                     }
                 )
 
+    def _release_artifact_lock(self) -> None:
+        """Release this run's writer lock at most once.
+
+        Returns
+        -------
+        None
+            The lock is released when present and then detached.
+        """
+        artifact_lock = self._artifact_lock
+        self._artifact_lock = None
+        if artifact_lock is not None:
+            artifact_lock.release()
+
     def aggregate_fit(self, server_round, results, failures):
         """Aggregate one complete, validated fit round or hard-fail.
 
@@ -340,36 +443,72 @@ class SentimentServer(FedProx):
     def aggregate_evaluate(
         self, server_round: int, results: list[Any], failures: list[Any]
     ) -> tuple[float | None, dict[str, Any]]:
-        loss, metrics = super().aggregate_evaluate(server_round, results, failures)
+        """Aggregate one complete evaluation round or hard-fail safely.
 
-        self.artifact_dir.mkdir(parents=True, exist_ok=True)
-        self._write_client_metrics(server_round, results)
-        if server_round == 1 and self.metrics_path.exists():
-            self.metrics_path.unlink()
-        file_exists = self.metrics_path.exists()
+        Parameters
+        ----------
+        server_round : int
+            One-based Flower server round.
+        results : list[Any]
+            Successful Flower evaluation results.
+        failures : list[Any]
+            Flower evaluation failures for the round.
 
-        with self.metrics_path.open("a", newline="") as file:
-            writer = csv.DictWriter(file, fieldnames=["round", "loss", "accuracy"])
-            if not file_exists:
-                writer.writeheader()
-            writer.writerow(
-                {
-                    "round": server_round,
-                    "loss": loss,
-                    "accuracy": metrics.get("accuracy"),
-                }
+        Returns
+        -------
+        tuple[float, dict[str, Any]]
+            Finite aggregate loss and metrics.
+
+        Raises
+        ------
+        RuntimeError
+            If Flower reports any evaluation failure.
+        ValueError
+            If the complete result set or aggregate metrics are invalid.
+        """
+        try:
+            if failures:
+                raise RuntimeError(
+                    f"evaluation round {server_round} failed for "
+                    f"{len(failures)} client(s)"
+                )
+            ordered_results = _validate_evaluate_results(
+                results, self.expected_client_ids
             )
-        if server_round == self.final_round:
-            try:
+            loss, metrics = super().aggregate_evaluate(
+                server_round, ordered_results, []
+            )
+            _validate_aggregated_evaluation(loss, metrics)
+
+            self.artifact_dir.mkdir(parents=True, exist_ok=True)
+            self._write_client_metrics(server_round, ordered_results)
+            if server_round == 1 and self.metrics_path.exists():
+                self.metrics_path.unlink()
+            file_exists = self.metrics_path.exists()
+
+            with self.metrics_path.open("a", newline="") as file:
+                writer = csv.DictWriter(file, fieldnames=["round", "loss", "accuracy"])
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow(
+                    {
+                        "round": server_round,
+                        "loss": loss,
+                        "accuracy": metrics["accuracy"],
+                    }
+                )
+            if server_round == self.final_round:
                 publish_completed_run(self.artifact_root, self.artifact_dir)
                 prune_run_history(
                     self.artifact_root,
                     self.artifact_retention_runs,
                     active_run_dir=self.artifact_dir,
                 )
-            finally:
-                if self._artifact_lock is not None:
-                    self._artifact_lock.release()
+        except Exception:
+            self._release_artifact_lock()
+            raise
+        if server_round == self.final_round:
+            self._release_artifact_lock()
         return loss, metrics
 
 

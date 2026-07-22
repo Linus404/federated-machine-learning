@@ -538,10 +538,132 @@ losses = [0.10536051565782628, 0.22314355131420976, 16.11809565095832, 16.118095
 
 [metrics.classification]
 raw_predictions = true
+prediction_source = "The only classification score is the model's registered sigmoid output returned by model(vectorized_batch, training=False); never use logits, rounded values, detached training-loss tensors, or client-reported metrics."
+prediction_dtype = "float32"
+prediction_shape = "After each inference call require shape (batch_rows,1), concatenate batch outputs on axis 0, then remove only axis 1 to obtain one contiguous float32 probability per evaluated row. Hard-fail on any other rank or shape."
+prediction_order = "Feed examples in ascending zero-based official dataset row index and preserve that order through batching, concatenation, raw-prediction storage, labels, and metric construction. No framework shuffle, sorting by score, or regrouping by label is permitted."
+inference_batch_size = 256
+inference_drop_remainder = false
+inference_execution = "Create consecutive slices [0:256], [256:512], and so on in prediction_order, including the final smaller batch; invoke the model once per slice with training=False."
+label_dtype = "int64"
+input_validation = "Require nonempty same-length rank-one NumPy arrays; labels must have dtype exactly numpy.int64 and values only 0 or 1; probabilities must have dtype exactly numpy.float32, be finite, and lie in the closed interval [0.0,1.0]; require both labels to be present for ROC construction. Never repair, clip, cast, flatten, broadcast, or drop an input."
+decision_threshold = 0.5
+threshold_comparison = "probability_greater_than_or_equal"
+threshold_applies_to = ["every_server_validation_union_evaluation", "every_final_untouched_test_evaluation", "every_centralized_validation_evaluation", "every_local_only_validation_evaluation"]
+threshold_applies_to_every_registered_model = true
+threshold_tuning = false
+predicted_label_dtype = "bool"
+count_dtype = "python_int"
 confusion_matrix_order = [["TN", "FP"], ["FN", "TP"]]
-reported = ["accuracy", "precision", "recall", "f1", "roc_auc"]
+confusion_matrix = "With predicted_positive=(probability>=numpy.float32(0.5)), compute TN=count((label==0)&~predicted_positive), FP=count((label==0)&predicted_positive), FN=count((label==1)&~predicted_positive), and TP=count((label==1)&predicted_positive) using numpy.count_nonzero, convert each count to Python int, and report [[TN,FP],[FN,TP]] explicitly."
+accuracy = "Compute Python-float (TN+TP)/(TN+FP+FN+TP) from the Python integer counts."
+precision = "If TP+FP is zero report Python float 0.0; otherwise report Python-float TP/(TP+FP)."
+recall = "If TP+FN is zero report Python float 0.0; otherwise report Python-float TP/(TP+FN)."
+f1 = "If 2*TP+FP+FN is zero report Python float 0.0; otherwise report Python-float (2*TP)/(2*TP+FP+FN), computed directly from the integer counts rather than from rounded precision and recall."
+roc_thresholds = "Construct numpy.concatenate(([numpy.inf],numpy.unique(probabilities)[::-1])). The initial point predicts no positives; each following threshold is one distinct finite float32 probability in strictly descending order. At threshold t predict positive exactly when probability>=t, so all equal-score rows enter atomically and ties are never split or reordered."
+roc_points = "For every threshold in roc_thresholds compute TPR=TP/number_of_positive_labels and FPR=FP/number_of_negative_labels as float64 ratios of integer counts. Retain every point in threshold order, including repeated FPR or TPR values."
+roc_auc = "Report float(numpy.trapezoid(tpr,fpr)) over the complete threshold-ordered float64 arrays with NumPy 2.4.4 defaults; do not deduplicate points, interpolate thresholds, reorder points, or substitute a ranking formula."
+reported = ["accuracy", "confusion_matrix", "precision", "recall", "f1", "roc_auc"]
 positive_label = 1
 zero_division = 0
+
+[[metrics.classification.golden_vectors]]
+name = "fixed_threshold_and_mixed_roc_tie"
+labels = [0, 0, 1, 1, 1, 0]
+probabilities = [0.1, 0.5, 0.5, 0.9, 0.2, 0.8]
+predicted_positive = [false, true, true, true, false, true]
+confusion_matrix = [[1, 2], [1, 2]]
+accuracy = 0.5
+precision = 0.5
+recall = 0.6666666666666666
+f1 = 0.5714285714285714
+roc_thresholds = ["inf", 0.9, 0.8, 0.5, 0.2, 0.1]
+fpr = [0.0, 0.0, 0.3333333333333333, 0.6666666666666666, 0.6666666666666666, 1.0]
+tpr = [0.0, 0.3333333333333333, 0.3333333333333333, 0.6666666666666666, 1.0, 1.0]
+roc_auc = 0.6111111111111112
+
+[[metrics.classification.golden_vectors]]
+name = "zero_division_and_all_scores_tied"
+labels = [0, 1, 0, 1]
+probabilities = [0.4, 0.4, 0.4, 0.4]
+predicted_positive = [false, false, false, false]
+confusion_matrix = [[2, 0], [2, 0]]
+accuracy = 0.5
+precision = 0.0
+recall = 0.0
+f1 = 0.0
+roc_thresholds = ["inf", 0.4]
+fpr = [0.0, 1.0]
+tpr = [0.0, 1.0]
+roc_auc = 0.5
+
+[provenance]
+implementation_status = "Preregistered contract for the future experiment runner. src/server_app.py and src/run_provenance.py do not implement this schema, must not claim conformance, and must not be interpreted as having produced protocol experiment provenance."
+schema_name = "federated-imdb-experiment-provenance"
+schema_version = 1
+manifest_filename = "provenance.json"
+checksum_filename = "provenance.json.sha256"
+additional_fields = "forbidden_without_a_schema_version_change"
+write_policy = "Write a manifest for every started cell, including terminal failed cells. Finalize it only after the terminal status, every attempt and failure, results available at that status, and artifact checksums are known; write both files atomically before considering the cell recorded."
+required_top_level_fields = ["schema", "run_id", "cell", "config", "code", "environment", "hardware", "data", "seeds", "execution", "results", "artifacts"]
+
+[provenance.canonical_serialization]
+format = "json"
+encoding = "utf-8"
+ensure_ascii = true
+sort_keys = true
+separators = [",", ":"]
+allow_nan = false
+trailing_newline = true
+number_policy = "Only JSON integers and finite JSON binary64 numbers are permitted; booleans are not numbers. Preserve integer type and serialize finite floats with Python 3.11 json.dumps under the registered options."
+hash_algorithm = "sha256"
+manifest_hash_scope = "SHA-256 over the exact canonical UTF-8 provenance.json bytes including the single trailing LF byte."
+checksum_encoding = "lowercase_hex"
+checksum_sidecar = "Exactly 64 lowercase hexadecimal manifest hash characters, two ASCII spaces, provenance.json, and one LF byte."
+subobject_hash_scope = "Every registered SHA-256 of a JSON object or array uses the same canonical serialization, including the single trailing LF byte. Raw artifact and source-file hashes instead cover their exact file bytes."
+
+[provenance.required_fields]
+schema = ["name", "version"]
+cell = ["cell_id", "matrix_kind", "strategy", "partition", "alpha", "client_scale", "seed", "threat"]
+config = ["protocol_path", "protocol_sha256", "protocol_version", "effective", "effective_sha256"]
+code = ["commit", "dirty", "tracked_diff_sha256", "untracked_files"]
+untracked_file = ["path", "size_bytes", "sha256"]
+environment = ["os", "architecture", "python", "packages", "variables"]
+hardware = ["cpu_model", "logical_cpu_count", "memory_bytes", "accelerators"]
+accelerator = ["vendor", "model", "count", "driver", "runtime"]
+data = ["dataset", "vocabulary", "partition"]
+dataset = ["id", "revision", "splits"]
+dataset_split = ["name", "rows", "raw_sha256", "content_sha256"]
+vocabulary = ["size", "sha256"]
+partition = ["name", "alpha", "client_scale", "accepted_attempt", "fitted_indices_sha256", "validation_indices_sha256"]
+seeds = ["master_seed", "derived"]
+derived_seed = ["namespace", "attempt", "uint64", "tensorflow_seed"]
+execution = ["status", "started_at_utc", "finished_at_utc", "attempts"]
+attempt = ["attempt", "retry_of", "status", "started_at_utc", "finished_at_utc", "duration_ns", "failure"]
+failure = ["category", "type", "message", "traceback_sha256"]
+results = ["metrics", "raw_results"]
+artifact = ["path", "size_bytes", "sha256"]
+
+[provenance.identities]
+run_id = "A unique canonical lowercase UUID string for one cell execution, stable across its retries and never reused."
+cell = "The seven seeding.cell_id fields must equal the registered cell exactly; cell_id must equal seeding.cell_id canonical serialization of those seven fields with no extra field."
+effective_config = "config.effective contains every resolved runner setting affecting execution or reporting, including registered defaults and explicit overrides, not merely user-supplied overrides. effective_sha256 is the canonical subobject hash of config.effective. protocol_sha256 hashes the exact checked-in protocol TOML bytes."
+clean_code = "code.commit is the 40-character lowercase git rev-parse HEAD object ID, dirty=false, tracked_diff_sha256 is SHA-256 of zero bytes, and untracked_files is empty."
+dirty_code = "Run git -c core.autocrlf=false diff --binary --full-index --no-ext-diff --no-textconv --no-renames HEAD -- . from the repository root and hash its exact stdout bytes as tracked_diff_sha256. Enumerate every non-ignored untracked regular file from git ls-files --others --exclude-standard -z, sort paths by their UTF-8 byte strings, and record relative POSIX path, exact byte size, and raw-file SHA-256. dirty is true exactly when the diff bytes are nonempty or untracked_files is nonempty. Symlinks, devices, undecodable paths, or a git command failure hard-fail the cell before training."
+environment = "Record the exact OS release string, machine architecture, Python version, every installed package name and version sorted by normalized package name, and every framework.execution_environment_before_import key/value. Missing or additional execution-affecting environment variables must be represented in config.effective."
+hardware = "Record CPU model, positive logical CPU count, total physical memory bytes, and zero or more accelerators sorted by vendor/model/driver/runtime. Each accelerator records vendor, model, positive count, driver version, and compute-runtime version; use an empty list only when no accelerator is visible."
+dataset = "Record dataset id and immutable revision plus every consumed split sorted by split name, with registered row count and both exact raw and canonical content SHA-256 identities."
+vocabulary = "Record the exact preprocessing vocabulary size and preprocessing.vocabulary_sha256."
+partition = "Record partition name, nullable registered alpha, client scale, accepted retry attempt, and hashes of fitted and validation assignments. For each assignment serialize a JSON array in ascending client_id order whose item is that client's ascending integer official row-index array, then apply canonical subobject hashing. Centralized cells use name='centralized', alpha/client_scale/accepted_attempt JSON null, and both hashes over an empty JSON array."
+seeds = "Record the master seed and one derived record for every expanded stochastic namespace actually used by every initial attempt or retry, sorted by namespace UTF-8 bytes then attempt. uint64 and tensorflow_seed must equal seeding derivation; duplicate namespace/attempt pairs or an omitted stochastic operation hard-fail provenance finalization."
+attempts = "Use zero-based contiguous attempt values. The first has retry_of=null; every retry points to the immediately preceding failed attempt. Record status as succeeded or failed, UTC timestamps in RFC 3339 second-or-finer precision ending Z, non-negative measured duration_ns, and failure=null exactly for success. A failed attempt requires the exact failure object with category in infrastructure, timeout, oom, nonfinite, validation, or execution; fully qualified exception type, stable human-readable message, and SHA-256 of the UTF-8 normalized traceback text."
+results = "Always record results. For succeeded cells, metrics and raw_results contain every registered per-run scalar, curve, confusion matrix, privacy result, timing, communication count, and raw-result artifact reference applicable to the cell. For failed cells retain any values observed before failure and use empty objects only when none exist; never fabricate or impute a successful metric."
+artifacts = "List every regular output artifact except provenance.json and provenance.json.sha256, sorted by relative POSIX path, with exact byte size and raw-file SHA-256. Paths must be unique, remain beneath the run directory after resolution, and may not be symlinks. Missing, extra, mutable, duplicate, or checksum-mismatched artifacts hard-fail provenance finalization."
+
+[provenance.golden_probe]
+effective_config_sha256 = "44c94a87af9330f808178ddb866daa6180001aaf3a3bc42dd6883672e49c29f9"
+manifest_sha256 = "cb92a4f27ad815de9d6cb18ef0b22b898023cf27df19ded0e83250969f39afba"
+canonical_json = '''{"artifacts":[{"path":"metrics.json","sha256":"5555555555555555555555555555555555555555555555555555555555555555","size_bytes":128},{"path":"predictions.npy","sha256":"6666666666666666666666666666666666666666666666666666666666666666","size_bytes":256}],"cell":{"alpha":null,"cell_id":"{\"alpha\":null,\"client_scale\":4,\"matrix_kind\":\"primary_federated\",\"partition\":\"iid_stratified\",\"seed\":67,\"strategy\":\"fedavg\",\"threat\":null}","client_scale":4,"matrix_kind":"primary_federated","partition":"iid_stratified","seed":67,"strategy":"fedavg","threat":null},"code":{"commit":"0000000000000000000000000000000000000000","dirty":false,"tracked_diff_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","untracked_files":[]},"config":{"effective":{"batch_size":64,"strategy":"fedavg"},"effective_sha256":"44c94a87af9330f808178ddb866daa6180001aaf3a3bc42dd6883672e49c29f9","protocol_path":"docs/scientific-protocol-v1.toml","protocol_sha256":"1111111111111111111111111111111111111111111111111111111111111111","protocol_version":1},"data":{"dataset":{"id":"stanfordnlp/imdb","revision":"e6281661ce1c48d982bc483cf8a173c1bbeb5d31","splits":[{"content_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","name":"test","raw_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","rows":25000},{"content_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","name":"train","raw_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","rows":25000}]},"partition":{"accepted_attempt":0,"alpha":null,"client_scale":4,"fitted_indices_sha256":"2222222222222222222222222222222222222222222222222222222222222222","name":"iid_stratified","validation_indices_sha256":"3333333333333333333333333333333333333333333333333333333333333333"},"vocabulary":{"sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","size":20000}},"environment":{"architecture":"x86_64","os":"Linux-6.0","packages":{"keras":"3.14.0","numpy":"2.4.4","tensorflow":"2.20.0"},"python":"3.11.9","variables":{"KERAS_BACKEND":"tensorflow","TF_DETERMINISTIC_OPS":"1","TF_ENABLE_ONEDNN_OPTS":"0"}},"execution":{"attempts":[{"attempt":0,"duration_ns":10000000000,"failure":{"category":"infrastructure","message":"deadline exceeded","traceback_sha256":"4444444444444444444444444444444444444444444444444444444444444444","type":"TimeoutError"},"finished_at_utc":"2026-01-01T00:00:10Z","retry_of":null,"started_at_utc":"2026-01-01T00:00:00Z","status":"failed"},{"attempt":1,"duration_ns":40000000000,"failure":null,"finished_at_utc":"2026-01-01T00:01:00Z","retry_of":0,"started_at_utc":"2026-01-01T00:00:20Z","status":"succeeded"}],"finished_at_utc":"2026-01-01T00:01:00Z","started_at_utc":"2026-01-01T00:00:00Z","status":"succeeded"},"hardware":{"accelerators":[],"cpu_model":"Example CPU","logical_cpu_count":8,"memory_bytes":17179869184},"results":{"metrics":{"accuracy":0.5,"confusion_matrix":[[1,1],[1,1]],"f1":0.5,"precision":0.5,"recall":0.5,"roc_auc":0.5},"raw_results":{"prediction_artifact":"predictions.npy"}},"run_id":"00000000-0000-4000-8000-000000000001","schema":{"name":"federated-imdb-experiment-provenance","version":1},"seeds":{"derived":[{"attempt":0,"namespace":"model/example","tensorflow_seed":123,"uint64":123}],"master_seed":67}}'''
 
 [metrics.system]
 convergence_scope = "federated matrices only: primary_federated, scale, and robustness"

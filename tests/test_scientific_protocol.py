@@ -1735,7 +1735,14 @@ print(json.dumps({
         )
         self.assertEqual(
             metrics["classification"]["reported"],
-            ["accuracy", "precision", "recall", "f1", "roc_auc"],
+            [
+                "accuracy",
+                "confusion_matrix",
+                "precision",
+                "recall",
+                "f1",
+                "roc_auc",
+            ],
         )
         self.assertEqual(metrics["classification"]["zero_division"], 0)
         self.assertTrue(metrics["classification"]["raw_predictions"])

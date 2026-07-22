@@ -124,14 +124,20 @@ class ScientificContractTests(unittest.TestCase):
         client = SentimentClient.__new__(SentimentClient)
         client.update_noise_l2_norm_clip = 2.0
         client.update_noise_multiplier = 0.5
-        before = [np.asarray([1.0, 1.0])]
-        after = [np.asarray([4.0, 5.0])]
+        before = [np.asarray([1.0, 1.0], dtype=np.float32)]
+        after = [np.asarray([4.0, 5.0], dtype=np.float32)]
 
-        with patch("src.client_app.np.random.normal", return_value=np.zeros(2)):
+        with patch(
+            "src.client_app.np.random.standard_normal",
+            return_value=np.zeros(2, dtype=np.float32),
+        ):
             result = client._add_update_noise(before, after)
 
+        self.assertEqual(result[0].dtype, np.dtype(np.float32))
         np.testing.assert_allclose(result[0], [2.2, 2.6])
-        self.assertAlmostEqual(float(np.linalg.norm(result[0] - before[0])), 2.0)
+        self.assertAlmostEqual(
+            float(np.linalg.norm(result[0] - before[0])), 2.0, places=6
+        )
 
 
 if __name__ == "__main__":

@@ -69,20 +69,92 @@ class SentimentClient(NumPyClient):
         )
         self.model = build_model_from_manifest(manifest)
 
-    def _add_update_noise(self, weights_before: list, weights_after: list) -> list:
-        """Apply illustrative update-noise ablation, not formal differential privacy."""
-        noisy_weights = []
+    def _add_update_noise(
+        self,
+        weights_before: list[np.ndarray],
+        weights_after: list[np.ndarray],
+    ) -> list[np.ndarray]:
+        """Apply illustrative float32 update noise, not differential privacy.
 
-        for w_before, w_after in zip(weights_before, weights_after):
-            update = w_after - w_before
-            norm = np.linalg.norm(update)
-            update = update / max(1.0, norm / self.update_noise_l2_norm_clip)
-            noise = np.random.normal(
-                0,
-                self.update_noise_multiplier * self.update_noise_l2_norm_clip,
-                update.shape,
+        Parameters
+        ----------
+        weights_before : list[numpy.ndarray]
+            Complete round-start model weights.
+        weights_after : list[numpy.ndarray]
+            Complete post-training model weights in the same order.
+
+        Returns
+        -------
+        list[numpy.ndarray]
+            Noisy model weights with exact ``float32`` dtype.
+
+        Raises
+        ------
+        ValueError
+            If the configuration or any input tensor is incompatible with the
+            server's strict model-weight contract.
+        """
+        if len(weights_before) != len(weights_after) or not weights_before:
+            raise ValueError("update-noise weight lists must be nonempty and equal")
+        if (
+            not np.isfinite(self.update_noise_l2_norm_clip)
+            or self.update_noise_l2_norm_clip <= 0
+        ):
+            raise ValueError("update-noise L2 norm clip must be positive and finite")
+        if (
+            not np.isfinite(self.update_noise_multiplier)
+            or self.update_noise_multiplier < 0
+        ):
+            raise ValueError("update-noise multiplier must be non-negative and finite")
+
+        noisy_weights: list[np.ndarray] = []
+        noise_scale = np.float32(
+            self.update_noise_multiplier * self.update_noise_l2_norm_clip
+        )
+        if not np.isfinite(noise_scale):
+            raise ValueError("update-noise scale must be finite in float32")
+
+        for weight_before, weight_after in zip(
+            weights_before, weights_after, strict=True
+        ):
+            if (
+                not isinstance(weight_before, np.ndarray)
+                or not isinstance(weight_after, np.ndarray)
+                or weight_before.dtype != np.dtype(np.float32)
+                or weight_after.dtype != np.dtype(np.float32)
+            ):
+                raise ValueError("update-noise weights must use exactly float32")
+            if (
+                weight_before.shape != weight_after.shape
+                or weight_before.ndim == 0
+                or weight_before.size == 0
+            ):
+                raise ValueError(
+                    "update-noise weights must have matching non-scalar shapes"
+                )
+            if not np.all(np.isfinite(weight_before)) or not np.all(
+                np.isfinite(weight_after)
+            ):
+                raise ValueError("update-noise weights must contain finite values")
+
+            update = np.subtract(weight_after, weight_before)
+            if not np.all(np.isfinite(update)):
+                raise ValueError("update-noise update must contain finite values")
+            norm = float(np.linalg.norm(update.astype(np.float64)))
+            clipped_update = (
+                np.multiply(
+                    update,
+                    np.float32(self.update_noise_l2_norm_clip / norm),
+                )
+                if norm > self.update_noise_l2_norm_clip
+                else update
             )
-            noisy_weights.append(w_before + update + noise)
+            noise = np.random.standard_normal(update.shape).astype(np.float32)
+            noise *= noise_scale
+            noisy_weight = np.add(np.add(weight_before, clipped_update), noise)
+            if not np.all(np.isfinite(noisy_weight)):
+                raise ValueError("update-noise output must contain finite values")
+            noisy_weights.append(noisy_weight)
 
         return noisy_weights
 
