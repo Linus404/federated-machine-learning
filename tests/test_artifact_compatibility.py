@@ -36,12 +36,19 @@ class ArtifactCompatibilityTests(unittest.TestCase):
             Path(__file__).resolve().parent.parent / "COMPATIBILITY.md"
         ).read_text(encoding="utf-8")
 
-        self.assertIn(
-            "Exact field sets are required for client metadata, records, and binding\n"
-            "subobjects; public vocabulary metadata; server binding and model-dimension\n"
-            "subobjects; evaluation manifests and records; and prepared-generation indexes.",
-            policy,
-        )
+        policy_lines = set(policy.splitlines())
+        exact_contracts = {
+            "them. Exact field sets are required for:",
+            "- client metadata, records contracts, and public-manifest binding objects;",
+            "- public-manifest dataset and vocabulary metadata objects;",
+            "- server binding and model-dimension objects;",
+            "- evaluation manifests and records;",
+            "- prepared-generation indexes; and",
+            "- run-provenance private-client-shard status, identity, and public-manifest",
+            "  objects.",
+        }
+
+        self.assertLessEqual(exact_contracts, policy_lines)
 
     def test_current_schema_is_supported(self) -> None:
         payload = {"schema_version": ARTIFACT_SCHEMA_VERSION}
