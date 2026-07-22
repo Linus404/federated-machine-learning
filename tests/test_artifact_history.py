@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import socket
 import stat
 import subprocess
@@ -24,6 +25,7 @@ from src.artifact_history import (
     resolve_current_run_dir,
 )
 from src.artifact_compatibility import (
+    RetainedDirectoryChain,
     canonical_json_bytes,
     load_server_artifact_snapshot,
     server_artifact_binding,
@@ -204,6 +206,191 @@ def rewrite_current_artifact_manifest(root: Path, run_dir: Path) -> None:
 
 
 class ArtifactHistoryTests(unittest.TestCase):
+    def test_completed_loaders_retain_every_selected_directory_edge(self) -> None:
+        """Reject exact replacements across reads, public checks, provenance, and return."""
+        from src import app_manifest as app_manifest_module
+        from src import artifact_compatibility
+
+        for loader_name in ("current", "historical"):
+            for boundary in (
+                "artifact read",
+                "public validation",
+                "provenance",
+                "return",
+            ):
+                with (
+                    self.subTest(loader=loader_name, boundary=boundary),
+                    tempfile.TemporaryDirectory() as tmpdir,
+                ):
+                    root = Path(tmpdir) / "outer" / "root"
+                    root.mkdir(parents=True)
+                    run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+                    publish_completed_run(root, run)
+                    replacement = Path(tmpdir) / "replacement"
+                    shutil.copytree(run, replacement)
+                    parked = Path(tmpdir) / "parked"
+                    replaced = False
+                    real_read = artifact_compatibility.read_regular_file_snapshot_at
+                    real_public = app_manifest_module.validate_app_manifest_bytes
+                    real_provenance = (
+                        artifact_compatibility._validate_completed_run_provenance
+                    )
+                    real_freeze = artifact_compatibility.deep_freeze
+                    descriptor_baseline = len(os.listdir("/proc/self/fd"))
+
+                    def replace() -> None:
+                        nonlocal replaced
+                        if replaced:
+                            return
+                        replaced = True
+                        run.rename(parked)
+                        replacement.rename(run)
+
+                    def replace_after_read(*args, **kwargs):
+                        result = real_read(*args, **kwargs)
+                        if boundary == "artifact read":
+                            replace()
+                        return result
+
+                    def replace_after_public(*args, **kwargs):
+                        result = real_public(*args, **kwargs)
+                        if boundary == "public validation":
+                            replace()
+                        return result
+
+                    def replace_after_provenance(*args, **kwargs):
+                        result = real_provenance(*args, **kwargs)
+                        if boundary == "provenance":
+                            replace()
+                        return result
+
+                    def replace_before_return(value):
+                        result = real_freeze(value)
+                        if boundary == "return":
+                            replace()
+                        return result
+
+                    loader = (
+                        load_current_run_snapshot
+                        if loader_name == "current"
+                        else load_server_artifact_snapshot
+                    )
+                    with (
+                        patch.object(
+                            artifact_compatibility,
+                            "read_regular_file_snapshot_at",
+                            side_effect=replace_after_read,
+                        ),
+                        patch.object(
+                            app_manifest_module,
+                            "validate_app_manifest_bytes",
+                            side_effect=replace_after_public,
+                        ),
+                        patch.object(
+                            artifact_compatibility,
+                            "_validate_completed_run_provenance",
+                            side_effect=replace_after_provenance,
+                        ),
+                        patch.object(
+                            artifact_compatibility,
+                            "deep_freeze",
+                            side_effect=replace_before_return,
+                        ),
+                        self.assertRaisesRegex(ValueError, "chain changed"),
+                    ):
+                        loader(root if loader_name == "current" else run)
+
+                    self.assertTrue(replaced)
+                    self.assertEqual(
+                        len(os.listdir("/proc/self/fd")),
+                        descriptor_baseline,
+                    )
+
+        for loader_name in ("current", "historical"):
+            for component in ("outer", "root", "runs", "run"):
+                with (
+                    self.subTest(loader=loader_name, component=component),
+                    tempfile.TemporaryDirectory() as tmpdir,
+                ):
+                    base = Path(tmpdir)
+                    root = base / "outer" / "root"
+                    root.mkdir(parents=True)
+                    run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+                    publish_completed_run(root, run)
+                    selected = {
+                        "outer": base / "outer",
+                        "root": root,
+                        "runs": root / "runs",
+                        "run": run,
+                    }[component]
+                    replacement = base / f"replacement-{component}"
+                    shutil.copytree(selected, replacement)
+                    parked = base / f"parked-{component}"
+                    real_freeze = artifact_compatibility.deep_freeze
+                    replaced = False
+
+                    def replace_component(value):
+                        nonlocal replaced
+                        result = real_freeze(value)
+                        if not replaced:
+                            replaced = True
+                            selected.rename(parked)
+                            replacement.rename(selected)
+                        return result
+
+                    loader = (
+                        load_current_run_snapshot
+                        if loader_name == "current"
+                        else load_server_artifact_snapshot
+                    )
+                    with (
+                        patch.object(
+                            artifact_compatibility,
+                            "deep_freeze",
+                            side_effect=replace_component,
+                        ),
+                        self.assertRaisesRegex(ValueError, "chain changed"),
+                    ):
+                        loader(root if loader_name == "current" else run)
+
+        for loader_name in ("current", "historical"):
+            with (
+                self.subTest(loader=loader_name),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir) / "root"
+                root.mkdir()
+                run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+                publish_completed_run(root, run)
+                replacement = Path(tmpdir) / "partial"
+                replacement.mkdir()
+                (replacement / "unrelated").write_bytes(b"partial")
+                parked = Path(tmpdir) / "parked"
+                real_provenance = (
+                    artifact_compatibility._validate_completed_run_provenance
+                )
+
+                def replace_with_partial(*args, **kwargs):
+                    result = real_provenance(*args, **kwargs)
+                    run.rename(parked)
+                    replacement.rename(run)
+                    return result
+
+                loader = (
+                    load_current_run_snapshot
+                    if loader_name == "current"
+                    else load_server_artifact_snapshot
+                )
+                with (
+                    patch.object(
+                        artifact_compatibility,
+                        "_validate_completed_run_provenance",
+                        side_effect=replace_with_partial,
+                    ),
+                    self.assertRaisesRegex(ValueError, "chain changed"),
+                ):
+                    loader(root if loader_name == "current" else run)
+
     def test_run_creation_durably_installs_each_missing_directory_edge(self) -> None:
         """Flush every new artifact-root and runs edge before descending."""
         from src import artifact_compatibility, artifact_history
@@ -2123,8 +2310,6 @@ with patch("src.app_manifest.load_scientific_protocol", return_value=_TEST_PROTO
         self,
     ) -> None:
         """Never remove malformed state or state for a run whose deletion failed."""
-        from src import artifact_history
-
         for failure in ("unsafe state", "delete failure"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmpdir:
                 root = Path(tmpdir)
@@ -2137,18 +2322,18 @@ with patch("src.app_manifest.load_scientific_protocol", return_value=_TEST_PROTO
                     state_path.write_bytes(b"not-json")
                     self.assertEqual(prune_run_history(root, 1), [])
                 else:
-                    real_rmtree = artifact_history.shutil.rmtree
+                    real_remove = RetainedDirectoryChain.remove_child_tree
 
-                    def fail_oldest(path, *args, **kwargs):
-                        if str(path) == RUN_IDS[0]:
+                    def fail_oldest(chain, name, descriptor, **kwargs):
+                        if name == RUN_IDS[0]:
                             raise OSError("injected prune failure")
-                        return real_rmtree(path, *args, **kwargs)
+                        return real_remove(chain, name, descriptor, **kwargs)
 
                     with (
                         patch.object(
-                            artifact_history.shutil,
-                            "rmtree",
-                            side_effect=fail_oldest,
+                            RetainedDirectoryChain,
+                            "remove_child_tree",
+                            fail_oldest,
                         ),
                         self.assertRaisesRegex(OSError, "prune failure"),
                     ):
@@ -2177,6 +2362,7 @@ with patch("src.app_manifest.load_scientific_protocol", return_value=_TEST_PROTO
                 )
                 root_identity = (root.stat().st_dev, root.stat().st_ino)
                 real_sync = artifact_history._sync_retained_directory
+                real_fsync = os.fsync
                 failed = False
 
                 def fail_sync(directory):
@@ -2198,19 +2384,36 @@ with patch("src.app_manifest.load_scientific_protocol", return_value=_TEST_PROTO
                         raise OSError("injected state-cleanup failure")
                     return real_sync(directory)
 
+                def fail_fsync(descriptor):
+                    nonlocal failed
+                    current = os.fstat(descriptor)
+                    if (
+                        failure == "runs fsync"
+                        and (current.st_dev, current.st_ino) == runs_identity
+                        and not failed
+                    ):
+                        failed = True
+                        raise OSError("injected runs-directory fsync failure")
+                    return real_fsync(descriptor)
+
                 with (
                     patch.object(
                         artifact_history,
                         "_sync_retained_directory",
                         side_effect=fail_sync,
                     ),
+                    patch(
+                        "src.artifact_compatibility.os.fsync",
+                        side_effect=fail_fsync,
+                    ),
                     self.assertRaisesRegex(OSError, "injected"),
                 ):
                     prune_run_history(root, 1)
 
-                self.assertFalse(oldest.exists())
+                self.assertEqual(oldest.exists(), failure == "runs fsync")
                 self.assertTrue(state_path.is_file())
-                self.assertEqual(prune_run_history(root, 1), [])
+                expected = [oldest.resolve()] if failure == "runs fsync" else []
+                self.assertEqual(prune_run_history(root, 1), expected)
                 self.assertFalse(state_path.exists())
 
     def test_pruning_rejects_every_detached_artifact_root_ancestor(self) -> None:
@@ -2292,7 +2495,7 @@ with patch("src.app_manifest.load_scientific_protocol", return_value=_TEST_PROTO
                     publish_completed_run(root, replacement)
                 elif state_kind == "unsafe":
                     state_path.write_bytes(b"not-json")
-                artifact_history.shutil.rmtree(candidate)
+                shutil.rmtree(candidate)
 
                 self.assertEqual(prune_run_history(root, 3), [])
                 self.assertEqual(state_path.exists(), state_kind != "obsolete pending")
@@ -2319,7 +2522,7 @@ with patch("src.app_manifest.load_scientific_protocol", return_value=_TEST_PROTO
             ):
                 publish_completed_run(root, orphan)
             publish_completed_run(root, replacement)
-            artifact_history.shutil.rmtree(orphan)
+            shutil.rmtree(orphan)
             orphan_state = root / f".{RUN_IDS[1]}.finalize.state"
             real_recover = artifact_history._recover_absent_run_states
             recovering = threading.Event()

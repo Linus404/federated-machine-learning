@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -745,6 +746,155 @@ os._exit(72)
 
             with self.assertRaisesRegex(ValueError, "unexpected files"):
                 load_evaluation_artifact_snapshot(artifact, protocol=self.protocol)
+
+    def test_loader_retains_the_complete_chain_through_every_boundary(self) -> None:
+        """Reject exact and partial replacements during reads, validation, and return."""
+        from src import evaluation_artifact
+
+        for boundary in (
+            "manifest read",
+            "manifest validation",
+            "records read",
+            "row validation",
+            "return",
+        ):
+            for replacement_kind in ("exact", "partial"):
+                with (
+                    self.subTest(
+                        boundary=boundary,
+                        replacement_kind=replacement_kind,
+                    ),
+                    tempfile.TemporaryDirectory() as tmpdir,
+                ):
+                    root = Path(tmpdir)
+                    artifact = publish_evaluation_artifact(
+                        self.rows,
+                        root / "outer" / "evaluation",
+                        protocol=self.protocol,
+                    )
+                    replacement = root / "replacement"
+                    if replacement_kind == "exact":
+                        shutil.copytree(artifact, replacement)
+                    else:
+                        replacement.mkdir()
+                        shutil.copy2(
+                            artifact / EVALUATION_MANIFEST_FILENAME,
+                            replacement / EVALUATION_MANIFEST_FILENAME,
+                        )
+                    parked = root / "parked"
+                    replaced = False
+                    reads = 0
+                    real_read = evaluation_artifact.read_regular_file_snapshot_at
+                    real_manifest = evaluation_artifact._validate_manifest
+                    real_row = evaluation_artifact._validate_row
+                    real_freeze = evaluation_artifact.deep_freeze
+                    descriptor_baseline = len(os.listdir("/proc/self/fd"))
+
+                    def replace() -> None:
+                        nonlocal replaced
+                        if replaced:
+                            return
+                        replaced = True
+                        artifact.rename(parked)
+                        replacement.rename(artifact)
+
+                    def replace_after_read(*args, **kwargs):
+                        nonlocal reads
+                        result = real_read(*args, **kwargs)
+                        reads += 1
+                        if boundary == "manifest read" and reads == 1:
+                            replace()
+                        if boundary == "records read" and reads == 2:
+                            replace()
+                        return result
+
+                    def replace_after_manifest(*args, **kwargs):
+                        result = real_manifest(*args, **kwargs)
+                        if boundary == "manifest validation":
+                            replace()
+                        return result
+
+                    def replace_after_row(*args, **kwargs):
+                        result = real_row(*args, **kwargs)
+                        if boundary == "row validation":
+                            replace()
+                        return result
+
+                    def replace_before_return(value):
+                        result = real_freeze(value)
+                        if boundary == "return":
+                            replace()
+                        return result
+
+                    with (
+                        patch.object(
+                            evaluation_artifact,
+                            "read_regular_file_snapshot_at",
+                            side_effect=replace_after_read,
+                        ),
+                        patch.object(
+                            evaluation_artifact,
+                            "_validate_manifest",
+                            side_effect=replace_after_manifest,
+                        ),
+                        patch.object(
+                            evaluation_artifact,
+                            "_validate_row",
+                            side_effect=replace_after_row,
+                        ),
+                        patch.object(
+                            evaluation_artifact,
+                            "deep_freeze",
+                            side_effect=replace_before_return,
+                        ),
+                        self.assertRaisesRegex(ValueError, "chain changed"),
+                    ):
+                        load_evaluation_artifact_snapshot(
+                            artifact,
+                            protocol=self.protocol,
+                        )
+
+                    self.assertTrue(replaced)
+                    self.assertEqual(
+                        len(os.listdir("/proc/self/fd")),
+                        descriptor_baseline,
+                    )
+
+        for component in ("outer", "evaluation"):
+            with (
+                self.subTest(component=component),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                artifact = publish_evaluation_artifact(
+                    self.rows,
+                    root / "outer" / "evaluation",
+                    protocol=self.protocol,
+                )
+                selected = root / "outer" if component == "outer" else artifact
+                replacement = root / f"replacement-{component}"
+                shutil.copytree(selected, replacement)
+                parked = root / f"parked-{component}"
+                real_freeze = evaluation_artifact.deep_freeze
+
+                def replace_component(value):
+                    result = real_freeze(value)
+                    selected.rename(parked)
+                    replacement.rename(selected)
+                    return result
+
+                with (
+                    patch.object(
+                        evaluation_artifact,
+                        "deep_freeze",
+                        side_effect=replace_component,
+                    ),
+                    self.assertRaisesRegex(ValueError, "chain changed"),
+                ):
+                    load_evaluation_artifact_snapshot(
+                        artifact,
+                        protocol=self.protocol,
+                    )
 
     def test_dataset_validation_hard_fails_each_frozen_property(self) -> None:
         class Info:

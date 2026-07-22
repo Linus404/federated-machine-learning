@@ -109,7 +109,10 @@ uv run --env-file .env.protocol python -m src.local_training --client-data-dir a
 
 The local command treats `--run-artifact-dir` as a reusable history root. Every
 training invocation writes to a new `runs/<run_id>` directory; finalization binds
-its regular files into a checksum-verified artifact snapshot.
+its regular files into a checksum-verified artifact snapshot. Current, historical,
+and evaluation snapshot loaders keep every configured directory edge open, read and
+inventory through retained descriptors, and reject even byte-identical directory-tree
+replacement before returning.
 
 ## Direct Flower simulation (Linux)
 

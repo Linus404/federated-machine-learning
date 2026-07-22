@@ -11,11 +11,12 @@ import shutil
 import stat
 import sys
 import tempfile
+import uuid
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Mapping, Never
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Never
 
 if TYPE_CHECKING:
     from src.app_manifest import AppManifest
@@ -143,6 +144,7 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
             created,
             error_message=error_message,
         )
+        pending_creation: tuple[int, str, tuple[int, int] | None] | None = None
         try:
             anchor_descriptor = os.open(anchor, flags)
             directories.append(
@@ -152,6 +154,7 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
             for component in absolute.parts[len(anchor.parts) :]:
                 parent = directories[-1]
                 made = False
+                pending_identity: tuple[int, int] | None = None
                 try:
                     entry = os.stat(
                         component,
@@ -164,10 +167,17 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
                     chain.verify()
                     os.mkdir(component, mode=mode, dir_fd=parent.descriptor)
                     made = True
+                    pending_creation = (parent.descriptor, component, None)
                     entry = os.stat(
                         component,
                         dir_fd=parent.descriptor,
                         follow_symlinks=False,
+                    )
+                    pending_identity = (entry.st_dev, entry.st_ino)
+                    pending_creation = (
+                        parent.descriptor,
+                        component,
+                        pending_identity,
                     )
                 if not stat.S_ISDIR(entry.st_mode):
                     raise ValueError(error_message)
@@ -176,6 +186,7 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
                 directories.append(retained)
                 names.append(component)
                 created.append(made)
+                pending_creation = None
                 chain.verify()
                 if made:
                     os.fsync(parent.descriptor)
@@ -183,6 +194,8 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
             chain.verify()
             return chain
         except BaseException:
+            if pending_creation is not None:
+                cls._cleanup_pending_creation(*pending_creation)
             chain._cleanup_created()
             chain.close()
             raise
@@ -396,16 +409,111 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
         """
         if len(self._directories) < 2 or not self._created[-1]:
             raise ValueError("retained target is not invocation-owned")
-        self.verify()
         child = self._directories[-1]
         parent = self._directories[-2]
-        shutil.rmtree(self._names[-1], dir_fd=parent.descriptor)
-        os.fsync(parent.descriptor)
+        name = self._names[-1]
+        self._remove_directory_contents(
+            child.descriptor,
+            verify=lambda: self._verify_through(len(self._directories)),
+        )
+        self._remove_retained_name(
+            parent.descriptor,
+            name,
+            child.descriptor,
+            directory=True,
+            verify_before=lambda: self._verify_through(len(self._directories)),
+            verify_after=lambda: self._verify_through(len(self._directories) - 1),
+        )
         os.close(child.descriptor)
         self._directories.pop()
         self._created.pop()
         self._names.pop()
         self.verify()
+
+    def remove_child_tree(
+        self,
+        name: str,
+        descriptor: int,
+        *,
+        require_visible_chain: bool = True,
+    ) -> None:
+        """Remove one retained direct-child tree without reopening its path.
+
+        Parameters
+        ----------
+        name : str
+            Direct child name below the retained target directory.
+        descriptor : int
+            Caller-owned no-follow descriptor for that exact child directory.
+        require_visible_chain : bool, optional
+            Require the configured parent path to remain visible. Owned rollback may
+            disable this while still retaining and proving the detached parent inode.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If the retained chain, child identity, or any descended entry changes.
+        """
+        self._require_child_name(name)
+        parent = self.directory
+
+        def verify_parent() -> None:
+            if require_visible_chain:
+                self.verify()
+            else:
+                current = os.fstat(parent.descriptor)
+                if (
+                    not stat.S_ISDIR(current.st_mode)
+                    or current.st_nlink < 1
+                    or (current.st_dev, current.st_ino) != (parent.device, parent.inode)
+                ):
+                    raise ValueError(self._error_message)
+
+        def verify() -> None:
+            verify_parent()
+            self._require_entry_identity(
+                parent.descriptor,
+                name,
+                descriptor,
+                directory=True,
+            )
+
+        temporary = self._detach_retained_name(
+            parent.descriptor,
+            name,
+            descriptor,
+            directory=True,
+            verify_before=verify,
+            verify_after=verify_parent,
+        )
+        try:
+
+            def verify_detached() -> None:
+                verify_parent()
+                self._require_entry_identity(
+                    parent.descriptor,
+                    temporary,
+                    descriptor,
+                    directory=True,
+                )
+
+            self._remove_directory_contents(descriptor, verify=verify_detached)
+            verify_detached()
+            os.rmdir(temporary, dir_fd=parent.descriptor)
+            verify_parent()
+            os.fsync(parent.descriptor)
+            verify_parent()
+        except BaseException:
+            self._restore_detached_name(
+                parent.descriptor,
+                temporary,
+                name,
+            )
+            raise
 
     def _verify_identity(
         self, entry: os.stat_result, retained: RetainedDirectory
@@ -431,6 +539,344 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
             or current.st_nlink < 1
             or (entry.st_dev, entry.st_ino) != (retained.device, retained.inode)
             or (current.st_dev, current.st_ino) != (retained.device, retained.inode)
+        ):
+            raise ValueError(self._error_message)
+
+    def _verify_through(self, count: int) -> None:
+        """Verify a retained prefix containing ``count`` directories.
+
+        Parameters
+        ----------
+        count : int
+            Number of retained directories to validate from the anchor.
+
+        Returns
+        -------
+        None
+        """
+        if self._closed or count < 1 or count > len(self._directories):
+            raise ValueError(self._error_message)
+        anchor = os.stat(self.path.anchor, follow_symlinks=False)
+        self._verify_identity(anchor, self._directories[0])
+        for index, name in enumerate(self._names[: count - 1], start=1):
+            entry = os.stat(
+                name,
+                dir_fd=self._directories[index - 1].descriptor,
+                follow_symlinks=False,
+            )
+            self._verify_identity(entry, self._directories[index])
+
+    def _remove_directory_contents(
+        self, directory_descriptor: int, *, verify: Callable[[], None]
+    ) -> None:
+        """Delete a retained directory's captured children descriptor-relatively.
+
+        Parameters
+        ----------
+        directory_descriptor : int
+            Retained directory whose direct entries may be removed.
+        verify : callable
+            Ownership check run around every traversal, mutation, and barrier.
+
+        Returns
+        -------
+        None
+        """
+        verify()
+        names = sorted(os.listdir(directory_descriptor))
+        verify()
+        for name in names:
+            self._require_child_name(name)
+            verify()
+            try:
+                entry = os.stat(
+                    name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                raise ValueError(self._error_message) from error
+            if entry.st_nlink < 1:
+                raise ValueError(self._error_message)
+            if stat.S_ISDIR(entry.st_mode):
+                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                try:
+                    child_descriptor = os.open(name, flags, dir_fd=directory_descriptor)
+                except OSError as error:
+                    raise ValueError(self._error_message) from error
+                try:
+                    opened = os.fstat(child_descriptor)
+                    if (
+                        not stat.S_ISDIR(opened.st_mode)
+                        or opened.st_nlink < 1
+                        or (opened.st_dev, opened.st_ino)
+                        != (entry.st_dev, entry.st_ino)
+                    ):
+                        raise ValueError(self._error_message)
+                    self._require_entry_identity(
+                        directory_descriptor,
+                        name,
+                        child_descriptor,
+                        directory=True,
+                    )
+                    self._remove_directory_contents(
+                        child_descriptor,
+                        verify=verify,
+                    )
+                    self._remove_retained_name(
+                        directory_descriptor,
+                        name,
+                        child_descriptor,
+                        directory=True,
+                        verify_before=verify,
+                        verify_after=verify,
+                    )
+                finally:
+                    os.close(child_descriptor)
+            else:
+                flags = os.O_PATH | os.O_NOFOLLOW
+                try:
+                    child_descriptor = os.open(name, flags, dir_fd=directory_descriptor)
+                except OSError as error:
+                    raise ValueError(self._error_message) from error
+                try:
+                    current = os.fstat(child_descriptor)
+                    if (
+                        current.st_nlink != 1
+                        or stat.S_IFMT(current.st_mode) != stat.S_IFMT(entry.st_mode)
+                        or (current.st_dev, current.st_ino)
+                        != (entry.st_dev, entry.st_ino)
+                    ):
+                        raise ValueError(self._error_message)
+                    self._remove_retained_name(
+                        directory_descriptor,
+                        name,
+                        child_descriptor,
+                        directory=False,
+                        verify_before=verify,
+                        verify_after=verify,
+                    )
+                finally:
+                    os.close(child_descriptor)
+            verify()
+            os.fsync(directory_descriptor)
+            verify()
+        if os.listdir(directory_descriptor):
+            raise ValueError(self._error_message)
+        verify()
+        os.fsync(directory_descriptor)
+        verify()
+
+    def _remove_retained_name(
+        self,
+        parent_descriptor: int,
+        name: str,
+        descriptor: int,
+        *,
+        directory: bool,
+        verify_before: Callable[[], None],
+        verify_after: Callable[[], None],
+    ) -> None:
+        """Detach and remove one entry only while it retains its opened identity.
+
+        Parameters
+        ----------
+        parent_descriptor : int
+            Retained owning directory descriptor.
+        name : str
+            Direct child name to remove.
+        descriptor : int
+            Retained descriptor for the exact entry.
+        directory : bool
+            Whether to remove the entry with ``rmdir`` instead of ``unlink``.
+        verify_before : callable
+            Ownership validation while the public name must remain visible.
+        verify_after : callable
+            Parent validation after the public name has been detached.
+
+        Returns
+        -------
+        None
+        """
+        temporary = self._detach_retained_name(
+            parent_descriptor,
+            name,
+            descriptor,
+            directory=directory,
+            verify_before=verify_before,
+            verify_after=verify_after,
+        )
+        try:
+            self._require_entry_identity(
+                parent_descriptor,
+                temporary,
+                descriptor,
+                directory=directory,
+            )
+            os.fsync(parent_descriptor)
+            verify_after()
+            if directory:
+                os.rmdir(temporary, dir_fd=parent_descriptor)
+            else:
+                os.unlink(temporary, dir_fd=parent_descriptor)
+            verify_after()
+            os.fsync(parent_descriptor)
+            verify_after()
+        except BaseException:
+            self._restore_detached_name(parent_descriptor, temporary, name)
+            raise
+
+    def _detach_retained_name(
+        self,
+        parent_descriptor: int,
+        name: str,
+        descriptor: int,
+        *,
+        directory: bool,
+        verify_before: Callable[[], None],
+        verify_after: Callable[[], None],
+    ) -> str:
+        """Detach a proven entry to an exclusive private name.
+
+        Parameters
+        ----------
+        parent_descriptor : int
+            Retained owning directory descriptor.
+        name : str
+            Direct child name to detach.
+        descriptor : int
+            Retained descriptor for the exact entry.
+        directory : bool
+            Whether the retained entry must be a directory.
+        verify_before : callable
+            Validation while the public name remains visible.
+        verify_after : callable
+            Parent validation after detachment.
+
+        Returns
+        -------
+        str
+            Private direct child name selecting the retained inode.
+        """
+        temporary = f".{name}.{uuid.uuid4().hex}.deleting"
+        try:
+            os.stat(
+                temporary,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError(self._error_message)
+        verify_before()
+        self._require_entry_identity(
+            parent_descriptor,
+            name,
+            descriptor,
+            directory=directory,
+        )
+        os.rename(
+            name,
+            temporary,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        try:
+            verify_after()
+            self._require_entry_identity(
+                parent_descriptor,
+                temporary,
+                descriptor,
+                directory=directory,
+            )
+            os.fsync(parent_descriptor)
+            verify_after()
+            self._require_entry_identity(
+                parent_descriptor,
+                temporary,
+                descriptor,
+                directory=directory,
+            )
+            return temporary
+        except BaseException:
+            self._restore_detached_name(parent_descriptor, temporary, name)
+            raise
+
+    @staticmethod
+    def _restore_detached_name(
+        parent_descriptor: int,
+        temporary: str,
+        name: str,
+    ) -> None:
+        """Best-effort restore a detached entry without overwriting a replacement.
+
+        Parameters
+        ----------
+        parent_descriptor : int
+            Retained owning directory descriptor.
+        temporary : str
+            Private direct child name holding the detached entry.
+        name : str
+            Original public direct child name.
+
+        Returns
+        -------
+        None
+        """
+        try:
+            os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            try:
+                os.rename(
+                    temporary,
+                    name,
+                    src_dir_fd=parent_descriptor,
+                    dst_dir_fd=parent_descriptor,
+                )
+                os.fsync(parent_descriptor)
+            except OSError:
+                pass
+        except OSError:
+            pass
+
+    def _require_entry_identity(
+        self,
+        parent_descriptor: int,
+        name: str,
+        descriptor: int,
+        *,
+        directory: bool,
+    ) -> None:
+        """Require a direct entry to retain its opened inode and file type.
+
+        Parameters
+        ----------
+        parent_descriptor : int
+            Retained owning directory descriptor.
+        name : str
+            Direct child name.
+        descriptor : int
+            Retained descriptor for the child entry.
+        directory : bool
+            Whether the child must be a directory.
+
+        Returns
+        -------
+        None
+        """
+        try:
+            entry = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+            current = os.fstat(descriptor)
+        except OSError as error:
+            raise ValueError(self._error_message) from error
+        expected_type = stat.S_IFDIR if directory else stat.S_IFMT(current.st_mode)
+        if (
+            stat.S_IFMT(entry.st_mode) != expected_type
+            or stat.S_IFMT(current.st_mode) != expected_type
+            or entry.st_nlink < 1
+            or current.st_nlink < 1
+            or (entry.st_dev, entry.st_ino) != (current.st_dev, current.st_ino)
         ):
             raise ValueError(self._error_message)
 
@@ -490,7 +936,12 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
             raise ValueError("descriptor-relative name must be a direct child")
 
     def _cleanup_created(self) -> None:
-        """Remove only still-visible, invocation-owned empty suffixes."""
+        """Remove only still-visible, invocation-owned empty suffixes.
+
+        Returns
+        -------
+        None
+        """
         if self._committed:
             return
         while len(self._directories) > 1 and self._created[-1]:
@@ -501,8 +952,16 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
                 self.verify()
                 if os.listdir(child.descriptor):
                     return
-                os.rmdir(name, dir_fd=parent.descriptor)
-                os.fsync(parent.descriptor)
+                self._remove_retained_name(
+                    parent.descriptor,
+                    name,
+                    child.descriptor,
+                    directory=True,
+                    verify_before=self.verify,
+                    verify_after=lambda: self._verify_through(
+                        len(self._directories) - 1
+                    ),
+                )
             except (OSError, ValueError):
                 return
             os.close(child.descriptor)
@@ -513,6 +972,99 @@ class RetainedDirectoryChain(AbstractContextManager["RetainedDirectoryChain"]):
                 self.verify()
             except ValueError:
                 return
+
+    @classmethod
+    def _cleanup_pending_creation(
+        cls,
+        parent_descriptor: int,
+        name: str,
+        identity: tuple[int, int] | None,
+    ) -> None:
+        """Remove an empty just-created entry only after proving its identity.
+
+        Parameters
+        ----------
+        parent_descriptor : int
+            Retained directory that received the new entry.
+        name : str
+            Newly created direct child name.
+        identity : tuple of int or None
+            Captured device and inode, or ``None`` when ownership was never proved.
+
+        Returns
+        -------
+        None
+        """
+        descriptor = -1
+        temporary: str | None = None
+        try:
+            entry = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(entry.st_mode)
+                or entry.st_nlink < 1
+                or (identity is not None and (entry.st_dev, entry.st_ino) != identity)
+            ):
+                return
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_descriptor,
+            )
+            current = os.fstat(descriptor)
+            expected_identity = identity or (current.st_dev, current.st_ino)
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or current.st_nlink < 1
+                or (current.st_dev, current.st_ino) != expected_identity
+                or (entry.st_dev, entry.st_ino) != expected_identity
+                or os.listdir(descriptor)
+            ):
+                return
+            if not cls.entry_matches_descriptor(parent_descriptor, name, descriptor):
+                return
+            temporary = f".{name}.{uuid.uuid4().hex}.deleting"
+            os.rename(
+                name,
+                temporary,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+            if not cls.entry_matches_descriptor(
+                parent_descriptor,
+                temporary,
+                descriptor,
+            ):
+                os.rename(
+                    temporary,
+                    name,
+                    src_dir_fd=parent_descriptor,
+                    dst_dir_fd=parent_descriptor,
+                )
+                temporary = None
+                return
+            os.fsync(parent_descriptor)
+            os.rmdir(temporary, dir_fd=parent_descriptor)
+            temporary = None
+            os.fsync(parent_descriptor)
+        except OSError:
+            if temporary is not None:
+                try:
+                    os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+                except FileNotFoundError:
+                    try:
+                        os.rename(
+                            temporary,
+                            name,
+                            src_dir_fd=parent_descriptor,
+                            dst_dir_fd=parent_descriptor,
+                        )
+                        os.fsync(parent_descriptor)
+                    except OSError:
+                        pass
+            return
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
 
     def close(self) -> None:
         """Close every owned descriptor exactly once.
@@ -855,55 +1407,95 @@ def read_regular_file_snapshot(
     canonical_parent = parent.resolve(strict=True)
     if path.parent.resolve(strict=True) != canonical_parent or path.is_symlink():
         raise ValueError(f"artifact must be a contained regular file: {path.name}")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     parent_descriptor = -1
     try:
         parent_descriptor = os.open(
             canonical_parent,
             os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
         )
-        descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
     except OSError as error:
-        if parent_descriptor >= 0:
-            os.close(parent_descriptor)
         raise ValueError(
             f"artifact must be a contained regular file: {path.name}"
         ) from error
     try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-            raise ValueError(f"artifact must be a contained regular file: {path.name}")
-        with os.fdopen(descriptor, "rb") as file:
-            descriptor = -1
-            content = file.read()
-            if sync:
-                os.fsync(file.fileno())
-            after = os.fstat(file.fileno())
-            identity = (
-                before.st_dev,
-                before.st_ino,
-                before.st_size,
-                before.st_mtime_ns,
-                before.st_ctime_ns,
-            )
-            if (
-                identity
-                != (
-                    after.st_dev,
-                    after.st_ino,
-                    after.st_size,
-                    after.st_mtime_ns,
-                    after.st_ctime_ns,
-                )
-                or len(content) != after.st_size
-            ):
-                raise ValueError(f"artifact changed while reading: {path.name}")
-            return RegularFileSnapshot(content, *identity)
+        return read_regular_file_snapshot_at(
+            parent_descriptor,
+            path.name,
+            sync=sync,
+        )
     finally:
-        if descriptor >= 0:
-            os.close(descriptor)
         if parent_descriptor >= 0:
             os.close(parent_descriptor)
+
+
+def read_regular_file_snapshot_at(
+    parent_descriptor: int,
+    name: str,
+    *,
+    sync: bool = False,
+) -> RegularFileSnapshot:
+    """Read one stable single-link regular file below a retained directory.
+
+    Parameters
+    ----------
+    parent_descriptor : int
+        Retained owning directory descriptor.
+    name : str
+        Direct child filename.
+    sync : bool, optional
+        Flush the opened regular file before returning its snapshot.
+
+    Returns
+    -------
+    RegularFileSnapshot
+        Exact bytes and stable descriptor identity from the same read.
+
+    Raises
+    ------
+    ValueError
+        If the name traverses, is unsafe, or changes during the read.
+    """
+    RetainedDirectoryChain._require_child_name(name)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    except OSError as error:
+        raise ValueError(
+            f"artifact must be a contained regular file: {name}"
+        ) from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ValueError(f"artifact must be a contained regular file: {name}")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        content = b"".join(chunks)
+        if sync:
+            os.fsync(descriptor)
+        after = os.fstat(descriptor)
+        identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        if (
+            identity
+            != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            or len(content) != after.st_size
+        ):
+            raise ValueError(f"artifact changed while reading: {name}")
+        return RegularFileSnapshot(content, *identity)
+    finally:
+        os.close(descriptor)
 
 
 def sha256_file(path: Path) -> str:
@@ -1220,7 +1812,7 @@ def write_server_artifact_manifest(
     canonical_dir = artifact_dir.resolve(strict=True)
     if artifact_dir.is_symlink() or not artifact_dir.is_dir():
         raise ValueError("server artifact directory must be a regular directory")
-    path = artifact_dir / SERVER_ARTIFACT_MANIFEST_FILENAME
+    path = canonical_dir / SERVER_ARTIFACT_MANIFEST_FILENAME
     existing: Mapping[str, Any] | None = None
     if path.exists():
         try:
@@ -1500,6 +2092,7 @@ def load_server_artifact_snapshot(
     *,
     manifest_bytes: bytes | None = None,
     app_manifest: AppManifest | None = None,
+    _retained_chain: RetainedDirectoryChain | None = None,
 ) -> ServerArtifactSnapshot:
     """Load validated artifact bytes without reopening them after verification.
 
@@ -1511,6 +2104,8 @@ def load_server_artifact_snapshot(
         Exact manifest bytes already bound by a current-run pointer.
     app_manifest : AppManifest or None, optional
         Configured public snapshot that the server artifact must exactly match.
+    _retained_chain : RetainedDirectoryChain or None, optional
+        Existing complete chain retained by a current-run selection.
 
     Returns
     -------
@@ -1522,18 +2117,68 @@ def load_server_artifact_snapshot(
     ValueError
         If any artifact is invalid, mutable through a symlink, or outside the run.
     """
-    if artifact_dir.is_symlink() or not artifact_dir.is_dir():
-        raise ValueError("server artifact directory must be a regular directory")
-    canonical_dir = artifact_dir.resolve(strict=True)
-    path = artifact_dir / SERVER_ARTIFACT_MANIFEST_FILENAME
+    candidate = Path(artifact_dir).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    canonical_dir = Path(os.path.abspath(candidate))
+    if _retained_chain is None:
+        chain = RetainedDirectoryChain.open(
+            canonical_dir,
+            error_message="server artifact directory chain changed while loading",
+        )
+        with chain:
+            return _load_server_artifact_snapshot_from_chain(
+                chain,
+                manifest_bytes=manifest_bytes,
+                app_manifest=app_manifest,
+            )
+    if _retained_chain.path != canonical_dir:
+        raise ValueError("retained server artifact chain selects another directory")
+    return _load_server_artifact_snapshot_from_chain(
+        _retained_chain,
+        manifest_bytes=manifest_bytes,
+        app_manifest=app_manifest,
+    )
+
+
+def _load_server_artifact_snapshot_from_chain(
+    chain: RetainedDirectoryChain,
+    *,
+    manifest_bytes: bytes | None,
+    app_manifest: AppManifest | None,
+) -> ServerArtifactSnapshot:
+    """Load server artifacts through one complete retained directory chain.
+
+    Parameters
+    ----------
+    chain : RetainedDirectoryChain
+        Complete visible chain through the selected artifact directory.
+    manifest_bytes : bytes or None
+        Exact manifest bytes already bound by a current-run pointer.
+    app_manifest : AppManifest or None
+        Configured public snapshot that the server artifact must exactly match.
+
+    Returns
+    -------
+    ServerArtifactSnapshot
+        Immutable validated bytes bound to the retained path identity.
+    """
+    canonical_dir = chain.path
+    directory_descriptor = chain.directory.descriptor
+    chain.verify()
+    path = canonical_dir / SERVER_ARTIFACT_MANIFEST_FILENAME
     if manifest_bytes is None:
         try:
-            manifest_bytes = read_regular_file(path, parent=canonical_dir)
+            manifest_bytes = read_regular_file_snapshot_at(
+                directory_descriptor,
+                SERVER_ARTIFACT_MANIFEST_FILENAME,
+            ).content
         except ValueError as error:
             raise ValueError(
                 "server artifact manifest has no valid schema_version; regenerate its "
                 "artifacts"
             ) from error
+        chain.verify()
     payload = validate_artifact_schema(
         strict_json_loads(
             manifest_bytes,
@@ -1561,11 +2206,19 @@ def load_server_artifact_snapshot(
     checksums = payload.get("checksums")
     sizes = payload.get("sizes")
     if lifecycle is None and checksums is None and sizes is None:
-        filenames = {
-            str(layout["filename"])
-            for layout in SERVER_ARTIFACTS.values()
-            if (artifact_dir / str(layout["filename"])).exists()
-        }
+        filenames = set()
+        for layout in SERVER_ARTIFACTS.values():
+            filename = str(layout["filename"])
+            try:
+                os.stat(
+                    filename,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            filenames.add(filename)
+        chain.verify()
     else:
         if (
             lifecycle != "complete"
@@ -1577,7 +2230,8 @@ def load_server_artifact_snapshot(
         if not REQUIRED_COMPLETED_ARTIFACTS <= checksums.keys():
             raise ValueError("server artifact manifest is missing required checksums")
         filenames = set(checksums)
-        inventory = {entry.name for entry in artifact_dir.iterdir()}
+        inventory = set(os.listdir(directory_descriptor))
+        chain.verify()
         expected_inventory = {SERVER_ARTIFACT_MANIFEST_FILENAME, *filenames}
         if inventory != expected_inventory:
             raise ValueError("completed server artifact inventory does not match")
@@ -1601,11 +2255,15 @@ def load_server_artifact_snapshot(
         ):
             raise ValueError("server artifact manifest has an invalid checksum")
         try:
-            content = read_regular_file(artifact_dir / filename, parent=canonical_dir)
+            content = read_regular_file_snapshot_at(
+                directory_descriptor,
+                filename,
+            ).content
         except ValueError as error:
             raise ValueError(
                 f"server artifact is missing or unsafe: {filename}"
             ) from error
+        chain.verify()
         if expected is not None and not hmac.compare_digest(
             sha256_bytes(content), expected
         ):
@@ -1619,24 +2277,30 @@ def load_server_artifact_snapshot(
         retained_manifest = validate_app_manifest_bytes(
             files["manifest.json"],
             files["vocab.txt"],
-            vocabulary_path=artifact_dir / "vocab.txt",
+            vocabulary_path=canonical_dir / "vocab.txt",
         )
+        chain.verify()
         _validate_server_binding(payload.get("binding"), app_manifest=retained_manifest)
-        if {entry.name for entry in artifact_dir.iterdir()} != expected_inventory:
+        chain.verify()
+        if set(os.listdir(directory_descriptor)) != expected_inventory:
             raise ValueError(
                 "completed server artifact inventory changed while loading"
             )
+        chain.verify()
         _validate_completed_run_provenance(
             canonical_dir,
             payload,
             files,
             retained_manifest,
         )
-    return ServerArtifactSnapshot(
+        chain.verify()
+    snapshot = ServerArtifactSnapshot(
         directory=canonical_dir,
         manifest=deep_freeze(payload),
         files=MappingProxyType(files),
     )
+    chain.verify()
+    return snapshot
 
 
 def load_server_artifact_manifest(artifact_dir: Path) -> Mapping[str, Any]:

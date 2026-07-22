@@ -6,7 +6,6 @@ import base64
 import binascii
 import hmac
 import os
-import shutil
 import stat
 import uuid
 from contextlib import contextmanager
@@ -32,6 +31,7 @@ from src.artifact_compatibility import (
     load_server_artifact_snapshot,
     read_regular_file,
     read_regular_file_snapshot,
+    read_regular_file_snapshot_at,
     require_secure_artifact_platform,
     sha256_bytes,
     strict_json_loads,
@@ -1640,32 +1640,65 @@ def load_current_run_snapshot(
         Exact artifact bytes validated against the selected manifest.
     """
     root, runs_root = _history_paths(artifact_root)
-    index = _load_current_index(root)
-    if index is None:
-        return load_server_artifact_snapshot(root, app_manifest=app_manifest)
-    run_dir = runs_root / str(index["run_id"])
-    if run_dir.is_symlink() or not run_dir.is_dir():
-        raise ValueError(f"current run directory is missing or unsafe: {run_dir}")
-    canonical_run_dir = run_dir.resolve(strict=True)
-    if canonical_run_dir.parent != runs_root.resolve(strict=True):
-        raise ValueError("current run directory escapes the artifact runs root")
-    manifest_path = run_dir / SERVER_ARTIFACT_MANIFEST_FILENAME
-    try:
-        manifest_bytes = read_regular_file(manifest_path, parent=canonical_run_dir)
-    except ValueError as error:
-        raise ValueError(
-            f"current run artifact manifest is missing or unsafe: {manifest_path}"
-        ) from error
-    if not hmac.compare_digest(
-        sha256_bytes(manifest_bytes), index["artifact_manifest_checksum"]
-    ):
-        raise ValueError("current-run artifact manifest checksum does not match")
-    snapshot = load_server_artifact_snapshot(
-        canonical_run_dir,
-        manifest_bytes=manifest_bytes,
-        app_manifest=app_manifest,
+    root_chain = RetainedDirectoryChain.open(
+        root,
+        error_message="current artifact directory chain changed while loading",
     )
-    return snapshot
+    with root_chain:
+        current_record = _load_current_index_at(root, root_chain.directory.descriptor)
+        root_chain.verify()
+        if current_record is None:
+            snapshot = load_server_artifact_snapshot(
+                root,
+                app_manifest=app_manifest,
+                _retained_chain=root_chain,
+            )
+            if (
+                _load_current_index_at(root, root_chain.directory.descriptor)
+                is not None
+            ):
+                raise ValueError("current-run index changed while loading")
+            root_chain.verify()
+            return snapshot
+
+        index, index_bytes = current_record
+        run_dir = runs_root / str(index["run_id"])
+        run_chain = RetainedDirectoryChain.open(
+            run_dir,
+            error_message="current artifact directory chain changed while loading",
+        )
+        with run_chain:
+            root_chain.verify()
+            manifest_path = run_dir / SERVER_ARTIFACT_MANIFEST_FILENAME
+            try:
+                manifest_bytes = read_regular_file_snapshot_at(
+                    run_chain.directory.descriptor,
+                    SERVER_ARTIFACT_MANIFEST_FILENAME,
+                ).content
+            except ValueError as error:
+                raise ValueError(
+                    f"current run artifact manifest is missing or unsafe: {manifest_path}"
+                ) from error
+            run_chain.verify()
+            if not hmac.compare_digest(
+                sha256_bytes(manifest_bytes), index["artifact_manifest_checksum"]
+            ):
+                raise ValueError(
+                    "current-run artifact manifest checksum does not match"
+                )
+            snapshot = load_server_artifact_snapshot(
+                run_dir,
+                manifest_bytes=manifest_bytes,
+                app_manifest=app_manifest,
+                _retained_chain=run_chain,
+            )
+            run_chain.verify()
+            current = _load_current_index_at(root, root_chain.directory.descriptor)
+            if current is None or current[1] != index_bytes:
+                raise ValueError("current-run index changed while loading")
+            root_chain.verify()
+            run_chain.verify()
+            return snapshot
 
 
 def publish_completed_run(
@@ -2289,9 +2322,22 @@ def prune_run_history(
                     entry.st_ino,
                 ) != (device, inode):
                     raise ValueError("run history changed during pruning")
-                _verify_history_root(descriptors)
-                shutil.rmtree(name, dir_fd=descriptors.runs.descriptor)
-                _sync_visible_directory(descriptors.runs, descriptors.chain)
+                run_descriptor = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=descriptors.runs.descriptor,
+                )
+                try:
+                    opened = os.fstat(run_descriptor)
+                    if (
+                        not stat.S_ISDIR(opened.st_mode)
+                        or opened.st_nlink < 1
+                        or (opened.st_dev, opened.st_ino) != (device, inode)
+                    ):
+                        raise ValueError("run history changed during pruning")
+                    descriptors.chain.remove_child_tree(name, run_descriptor)
+                finally:
+                    os.close(run_descriptor)
                 if remove_state:
                     _remove_finalization_state(
                         descriptors.root,

@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -12,6 +13,7 @@ from src.artifact_compatibility import (
     PUBLIC_ARTIFACT_SCHEMA_VERSION,
     SERVER_ARTIFACT_SCHEMA_VERSION,
     SERVER_ARTIFACTS,
+    RetainedDirectoryChain,
     canonical_json_bytes,
     load_server_artifact_manifest,
     load_server_artifact_snapshot,
@@ -25,6 +27,454 @@ from tests.artifact_helpers import fake_app_manifest
 
 
 class ArtifactCompatibilityTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(os, "O_PATH"), "retained deletion requires Linux")
+    def test_retained_recursive_removal_handles_entry_types_and_fsync_order(
+        self,
+    ) -> None:
+        """Remove only retained entries and flush each directory before its parent."""
+        from src import artifact_compatibility
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            parent = Path(tmpdir) / "parent"
+            target = parent / "target"
+            nested = target / "nested"
+            nested.mkdir(parents=True)
+            outside = Path(tmpdir) / "outside"
+            outside.write_bytes(b"outside")
+            (target / "file").write_bytes(b"file")
+            (nested / "child").write_bytes(b"child")
+            (target / "link").symlink_to(outside)
+            fifo = target / "fifo"
+            if hasattr(os, "mkfifo"):
+                os.mkfifo(fifo)
+
+            chain = RetainedDirectoryChain.open(parent)
+            with chain:
+                descriptor = chain.open_child(
+                    "target",
+                    os.O_RDONLY | os.O_DIRECTORY,
+                )
+                target_identity = os.fstat(descriptor).st_ino
+                nested_identity = nested.stat().st_ino
+                real_fsync = os.fsync
+                synced: list[int] = []
+
+                def record_fsync(directory_descriptor: int) -> None:
+                    synced.append(os.fstat(directory_descriptor).st_ino)
+                    real_fsync(directory_descriptor)
+
+                try:
+                    with patch.object(
+                        artifact_compatibility.os,
+                        "fsync",
+                        side_effect=record_fsync,
+                    ):
+                        chain.remove_child_tree("target", descriptor)
+                finally:
+                    os.close(descriptor)
+
+            self.assertFalse(target.exists())
+            self.assertEqual(outside.read_bytes(), b"outside")
+            self.assertIn(target_identity, synced)
+            self.assertLess(
+                max(
+                    index
+                    for index, identity in enumerate(synced)
+                    if identity == nested_identity
+                ),
+                max(
+                    index
+                    for index, identity in enumerate(synced)
+                    if identity == target_identity
+                ),
+            )
+            self.assertEqual(synced[-1], parent.stat().st_ino)
+
+    def test_retained_recursive_removal_preserves_replacements_at_boundaries(
+        self,
+    ) -> None:
+        """Fail closed when traversal, descent, or commit sees a replacement."""
+        from src import artifact_compatibility
+
+        for boundary in ("traversal", "descent", "commit"):
+            with (
+                self.subTest(boundary=boundary),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                parent = Path(tmpdir) / "parent"
+                target = parent / "target"
+                nested = target / "nested"
+                nested.mkdir(parents=True)
+                (nested / "file").write_bytes(b"owned")
+                parked = parent / "parked"
+                chain = RetainedDirectoryChain.open(parent)
+                with chain:
+                    descriptor = chain.open_child(
+                        "target",
+                        os.O_RDONLY | os.O_DIRECTORY,
+                    )
+                    real_listdir = os.listdir
+                    real_open = os.open
+                    real_rename = os.rename
+                    replaced = False
+
+                    def replace_target() -> None:
+                        nonlocal replaced
+                        if replaced:
+                            return
+                        replaced = True
+                        if target.exists():
+                            real_rename(target, parked)
+                        target.mkdir()
+                        (target / "replacement").write_bytes(b"replacement")
+
+                    def replace_during_listdir(value):
+                        if boundary == "traversal" and value == descriptor:
+                            replace_target()
+                        return real_listdir(value)
+
+                    def replace_during_open(name, flags, *args, **kwargs):
+                        if boundary == "descent" and name == "nested":
+                            replace_target()
+                        return real_open(name, flags, *args, **kwargs)
+
+                    def replace_during_rename(source, destination, *args, **kwargs):
+                        if boundary == "commit" and source == "target":
+                            replace_target()
+                        return real_rename(source, destination, *args, **kwargs)
+
+                    patches = (
+                        patch.object(
+                            artifact_compatibility.os,
+                            "listdir",
+                            side_effect=replace_during_listdir,
+                        ),
+                        patch.object(
+                            artifact_compatibility.os,
+                            "open",
+                            side_effect=replace_during_open,
+                        ),
+                        patch.object(
+                            artifact_compatibility.os,
+                            "rename",
+                            side_effect=replace_during_rename,
+                        ),
+                    )
+                    try:
+                        with patches[0], patches[1], patches[2]:
+                            if boundary == "commit":
+                                with self.assertRaises((OSError, ValueError)):
+                                    chain.remove_child_tree("target", descriptor)
+                            else:
+                                chain.remove_child_tree("target", descriptor)
+                    finally:
+                        os.close(descriptor)
+
+                self.assertEqual(
+                    (target / "replacement").read_bytes(),
+                    b"replacement",
+                )
+
+    def test_retained_recursive_removal_preserves_concurrent_replacement(
+        self,
+    ) -> None:
+        """Delete the detached retained inode while a concurrent public replacement wins."""
+        from src import artifact_compatibility
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            parent = Path(tmpdir) / "parent"
+            target = parent / "target"
+            target.mkdir(parents=True)
+            (target / "file").write_bytes(b"owned")
+            chain = RetainedDirectoryChain.open(parent)
+            with chain:
+                descriptor = chain.open_child(
+                    "target",
+                    os.O_RDONLY | os.O_DIRECTORY,
+                )
+                real_listdir = os.listdir
+                traversing = threading.Event()
+                release = threading.Event()
+                paused = False
+
+                def pause_traversal(value):
+                    nonlocal paused
+                    if value == descriptor and not paused:
+                        paused = True
+                        traversing.set()
+                        self.assertTrue(release.wait(timeout=2))
+                    return real_listdir(value)
+
+                def install_replacement() -> None:
+                    self.assertTrue(traversing.wait(timeout=2))
+                    target.mkdir()
+                    (target / "replacement").write_bytes(b"replacement")
+                    release.set()
+
+                thread = threading.Thread(target=install_replacement)
+                thread.start()
+                try:
+                    with patch.object(
+                        artifact_compatibility.os,
+                        "listdir",
+                        side_effect=pause_traversal,
+                    ):
+                        chain.remove_child_tree("target", descriptor)
+                finally:
+                    os.close(descriptor)
+                    release.set()
+                    thread.join(timeout=2)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(
+                (target / "replacement").read_bytes(),
+                b"replacement",
+            )
+
+    def test_retained_recursive_removal_restores_partial_failure_for_retry(
+        self,
+    ) -> None:
+        """Restore a detached entry after failure so the same retained tree can retry."""
+        from src import artifact_compatibility
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            parent = Path(tmpdir) / "parent"
+            target = parent / "target"
+            target.mkdir(parents=True)
+            (target / "file").write_bytes(b"owned")
+            chain = RetainedDirectoryChain.open(parent)
+            with chain:
+                descriptor = chain.open_child(
+                    "target",
+                    os.O_RDONLY | os.O_DIRECTORY,
+                )
+                real_unlink = os.unlink
+                failed = False
+
+                def fail_first_unlink(name, *args, **kwargs):
+                    nonlocal failed
+                    if not failed and str(name).endswith(".deleting"):
+                        failed = True
+                        raise OSError("injected unlink failure")
+                    return real_unlink(name, *args, **kwargs)
+
+                try:
+                    with (
+                        patch.object(
+                            artifact_compatibility.os,
+                            "unlink",
+                            side_effect=fail_first_unlink,
+                        ),
+                        self.assertRaisesRegex(OSError, "unlink failure"),
+                    ):
+                        chain.remove_child_tree("target", descriptor)
+                    self.assertEqual((target / "file").read_bytes(), b"owned")
+                    chain.remove_child_tree("target", descriptor)
+                finally:
+                    os.close(descriptor)
+
+            self.assertFalse(target.exists())
+            self.assertFalse(any(parent.glob("*.deleting")))
+
+    def test_retained_chain_creation_cleans_each_failed_suffix_and_retries(
+        self,
+    ) -> None:
+        """Clean proven empty suffixes after each creation-stage failure without leaks."""
+        from src import artifact_compatibility
+
+        for operation in ("mkdir", "stat", "open", "validation", "fsync"):
+            with (
+                self.subTest(operation=operation),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                target = Path(tmpdir) / "first" / "second" / "third"
+                real_mkdir = os.mkdir
+                real_open = os.open
+                real_stat = os.stat
+                real_fstat = os.fstat
+                real_fsync = os.fsync
+                baseline = len(os.listdir("/proc/self/fd"))
+                failed = False
+                created_third = False
+
+                def fail_mkdir(name, mode=0o777, *, dir_fd=None):
+                    nonlocal created_third
+                    if operation == "mkdir" and name == "third":
+                        raise OSError("injected mkdir failure")
+                    result = real_mkdir(name, mode=mode, dir_fd=dir_fd)
+                    if name == "third":
+                        created_third = True
+                    return result
+
+                def fail_stat(name, *args, **kwargs):
+                    nonlocal failed
+                    result = real_stat(name, *args, **kwargs)
+                    if (
+                        operation == "stat"
+                        and not failed
+                        and name == "third"
+                        and kwargs.get("dir_fd") is not None
+                    ):
+                        failed = True
+                        raise OSError("injected stat failure")
+                    return result
+
+                def fail_open(name, flags, *args, **kwargs):
+                    nonlocal failed
+                    if (
+                        operation == "open"
+                        and not failed
+                        and name == "third"
+                        and kwargs.get("dir_fd") is not None
+                    ):
+                        failed = True
+                        raise OSError("injected open failure")
+                    return real_open(name, flags, *args, **kwargs)
+
+                def fail_fstat(descriptor):
+                    nonlocal failed
+                    if operation == "validation" and not failed:
+                        try:
+                            selected = os.readlink(f"/proc/self/fd/{descriptor}")
+                        except OSError:
+                            selected = ""
+                        if selected.endswith("/third"):
+                            failed = True
+                            raise OSError("injected validation failure")
+                    return real_fstat(descriptor)
+
+                def fail_fsync(descriptor):
+                    nonlocal failed
+                    if operation == "fsync" and created_third and not failed:
+                        failed = True
+                        raise OSError("injected fsync failure")
+                    return real_fsync(descriptor)
+
+                with (
+                    patch.object(
+                        artifact_compatibility.os,
+                        "mkdir",
+                        side_effect=fail_mkdir,
+                    ),
+                    patch.object(
+                        artifact_compatibility.os,
+                        "open",
+                        side_effect=fail_open,
+                    ),
+                    patch.object(
+                        artifact_compatibility.os,
+                        "stat",
+                        side_effect=fail_stat,
+                    ),
+                    patch.object(
+                        artifact_compatibility.os,
+                        "fstat",
+                        side_effect=fail_fstat,
+                    ),
+                    patch.object(
+                        artifact_compatibility.os,
+                        "fsync",
+                        side_effect=fail_fsync,
+                    ),
+                    self.assertRaisesRegex(OSError, f"{operation} failure"),
+                ):
+                    RetainedDirectoryChain.open(
+                        target,
+                        create=True,
+                        check_platform=False,
+                    )
+
+                self.assertFalse((Path(tmpdir) / "first").exists())
+                self.assertEqual(len(os.listdir("/proc/self/fd")), baseline)
+                with RetainedDirectoryChain.open(
+                    target,
+                    create=True,
+                    check_platform=False,
+                ) as chain:
+                    chain.commit()
+                self.assertTrue(target.is_dir())
+
+    def test_retained_chain_creation_preserves_open_boundary_replacement(
+        self,
+    ) -> None:
+        """Keep suffix replacements at stat and open boundaries and allow retry."""
+        from src import artifact_compatibility
+
+        for boundary in ("stat", "open"):
+            with (
+                self.subTest(boundary=boundary),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                target = Path(tmpdir) / "first" / "second" / "third"
+                replacement = Path(tmpdir) / "replacement"
+                real_open = os.open
+                real_stat = os.stat
+                failed = False
+
+                def replace() -> None:
+                    nonlocal failed
+                    failed = True
+                    second = Path(tmpdir) / "first" / "second"
+                    second.rename(replacement)
+                    second.mkdir()
+                    (second / "replacement").write_bytes(b"replacement")
+
+                def replace_before_open(name, flags, *args, **kwargs):
+                    if (
+                        boundary == "open"
+                        and not failed
+                        and name == "second"
+                        and kwargs.get("dir_fd") is not None
+                    ):
+                        replace()
+                        raise OSError("injected replacement open failure")
+                    return real_open(name, flags, *args, **kwargs)
+
+                def replace_before_stat(name, *args, **kwargs):
+                    result = real_stat(name, *args, **kwargs)
+                    if (
+                        boundary == "stat"
+                        and not failed
+                        and name == "second"
+                        and kwargs.get("dir_fd") is not None
+                    ):
+                        replace()
+                        raise OSError("injected replacement stat failure")
+                    return result
+
+                with (
+                    patch.object(
+                        artifact_compatibility.os,
+                        "open",
+                        side_effect=replace_before_open,
+                    ),
+                    patch.object(
+                        artifact_compatibility.os,
+                        "stat",
+                        side_effect=replace_before_stat,
+                    ),
+                    self.assertRaisesRegex(
+                        OSError,
+                        f"replacement {boundary} failure",
+                    ),
+                ):
+                    RetainedDirectoryChain.open(
+                        target,
+                        create=True,
+                        check_platform=False,
+                    )
+
+                marker = Path(tmpdir) / "first" / "second" / "replacement"
+                self.assertEqual(marker.read_bytes(), b"replacement")
+                with RetainedDirectoryChain.open(
+                    target,
+                    create=True,
+                    check_platform=False,
+                ) as chain:
+                    chain.commit()
+                self.assertEqual(marker.read_bytes(), b"replacement")
+                self.assertTrue(target.is_dir())
+
     def test_strict_json_rejects_overflow_and_accepts_finite_exponents(self) -> None:
         for value in ("1e999", "-1e999"):
             with (

@@ -57,7 +57,11 @@ index use schema `1`:
 
 Both current-pointer and explicit historical consumers validate completed-run
 provenance bytes, directory/run identity, frozen public dataset and vocabulary
-bindings, checksums, and exact inventory before returning artifact bytes.
+bindings, checksums, and exact inventory before returning artifact bytes. Current,
+historical, and evaluation loaders retain the complete no-follow directory chain for
+the whole load, perform reads and inventory checks descriptor-relatively, and
+revalidate the visible chain immediately before returning; an exact byte-for-byte tree
+replacement is therefore not accepted as the selected path.
 Publication retains no-follow descriptors and exact directory-edge identities from
 the filesystem root through the artifact root, canonical `runs/` directory, and
 selected run, plus every captured file. Creation flushes each owning directory before
@@ -158,7 +162,10 @@ checksum-valid completed run.
 Complete-state pruning is serialized on the same retained root inode as publication.
 It removes a pruned run's complete or provably obsolete finalization state and flushes
 the root, but protects recoverable pending or malformed state and its run. A failed run
-deletion leaves its state untouched.
+deletion leaves its state untouched. Recursive deletion first detaches only the name
+that still selects the retained inode, traverses from retained descriptors without
+following links, flushes child removals before parent removal, and never deletes a
+replacement installed at the public name.
 
 For a schema change, update the producer, every shared loader, rejection and
 acceptance tests, this policy, and the schema constant in the same pull request.
