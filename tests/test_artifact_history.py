@@ -24,6 +24,7 @@ from src.artifact_compatibility import (
     sha256_bytes,
     write_server_artifact_manifest,
 )
+from src.contracts import DEFAULT_SPLIT_SEED, DEFAULT_VALIDATION_SEED
 from src.run_provenance import write_run_provenance_manifest
 from tests.test_run_provenance import (
     runtime_environment,
@@ -907,6 +908,63 @@ class ArtifactHistoryTests(unittest.TestCase):
                         else:
                             load_server_artifact_snapshot(run)
 
+    def test_completed_loaders_require_canonical_code_defaults(self) -> None:
+        code_default_mutations = {
+            "changed value": {
+                "client_validation_split": DEFAULT_VALIDATION_SEED + 1,
+                "data_partition": DEFAULT_SPLIT_SEED,
+            },
+            "missing key": {"data_partition": DEFAULT_SPLIT_SEED},
+            "extra key": {
+                "client_validation_split": DEFAULT_VALIDATION_SEED,
+                "data_partition": DEFAULT_SPLIT_SEED,
+                "unexpected": 1,
+            },
+            "boolean substitution": {
+                "client_validation_split": True,
+                "data_partition": DEFAULT_SPLIT_SEED,
+            },
+            "type substitution": {
+                "client_validation_split": str(DEFAULT_VALIDATION_SEED),
+                "data_partition": DEFAULT_SPLIT_SEED,
+            },
+        }
+        for loader_name in ("current", "historical"):
+            for mutation, code_defaults in code_default_mutations.items():
+                with (
+                    self.subTest(loader=loader_name, mutation=mutation),
+                    tempfile.TemporaryDirectory() as tmpdir,
+                ):
+                    root = Path(tmpdir)
+                    run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+                    publish_completed_run(root, run)
+                    loader = (
+                        load_current_run_snapshot
+                        if loader_name == "current"
+                        else load_server_artifact_snapshot
+                    )
+                    self.assertEqual(
+                        loader(root if loader_name == "current" else run).directory,
+                        run.resolve(),
+                    )
+
+                    provenance_path = run / "run_manifest.json"
+                    provenance = json.loads(provenance_path.read_bytes())
+                    provenance["seeds"]["code_defaults"] = code_defaults
+                    provenance_bytes = canonical_json_bytes(provenance)
+                    provenance_path.write_bytes(provenance_bytes)
+                    artifact_path = run / "artifact_manifest.json"
+                    artifact = json.loads(artifact_path.read_bytes())
+                    artifact["sizes"]["run_manifest.json"] = len(provenance_bytes)
+                    artifact["checksums"]["run_manifest.json"] = sha256_bytes(
+                        provenance_bytes
+                    )
+                    artifact_path.write_bytes(canonical_json_bytes(artifact))
+                    rewrite_current_artifact_manifest(root, run)
+
+                    with self.assertRaisesRegex(ValueError, "seeds.code_defaults"):
+                        loader(root if loader_name == "current" else run)
+
     @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "Unix sockets require POSIX")
     def test_completed_loaders_reject_every_extra_entry_type(self) -> None:
         for loader_name in ("current", "historical"):
@@ -1230,7 +1288,7 @@ class ArtifactHistoryTests(unittest.TestCase):
                 return real_sync_directory(path)
 
             def sync_completed_run(path):
-                events.append("completed-run:sync")
+                events.append(f"history-directory:{Path(path).resolve()}")
                 return real_run_sync(path)
 
             def write_current(path, payload, *, overwrite=True):
@@ -1267,7 +1325,10 @@ class ArtifactHistoryTests(unittest.TestCase):
             completed_manifest_sync = events.index(
                 f"atomic-directory:{run.resolve()}", files_sync
             )
-            completed_run_sync = events.index("completed-run:sync")
+            completed_run_sync = events.index(f"history-directory:{run.resolve()}")
+            runs_root_sync = events.index(
+                f"history-directory:{(root / 'runs').resolve()}"
+            )
             current_start = events.index("current:start")
             root_sync = events.index(
                 f"atomic-directory:{root.resolve()}", current_start
@@ -1275,7 +1336,8 @@ class ArtifactHistoryTests(unittest.TestCase):
             current_return = events.index("current:return")
             self.assertLess(files_sync, completed_manifest_sync)
             self.assertLess(completed_manifest_sync, completed_run_sync)
-            self.assertLess(completed_run_sync, current_start)
+            self.assertLess(completed_run_sync, runs_root_sync)
+            self.assertLess(runs_root_sync, current_start)
             self.assertLess(current_start, root_sync)
             self.assertLess(root_sync, current_return)
             self.assertEqual(resolve_current_run_dir(root), run.resolve())
@@ -1285,7 +1347,11 @@ class ArtifactHistoryTests(unittest.TestCase):
     ) -> None:
         from src import artifact_compatibility, artifact_history
 
-        for checkpoint in ("captured files", "completed manifest directory"):
+        for checkpoint in (
+            "captured files",
+            "completed manifest directory",
+            "runs directory",
+        ):
             with (
                 self.subTest(checkpoint=checkpoint),
                 tempfile.TemporaryDirectory() as tmpdir,
@@ -1298,7 +1364,7 @@ class ArtifactHistoryTests(unittest.TestCase):
                         "sync_server_artifact_files",
                         side_effect=OSError("captured-file fsync failure"),
                     )
-                else:
+                elif checkpoint == "completed manifest directory":
                     real_sync = artifact_compatibility.sync_directory
                     run_sync_count = 0
 
@@ -1315,6 +1381,20 @@ class ArtifactHistoryTests(unittest.TestCase):
                         "sync_directory",
                         side_effect=fail_completed_manifest_sync,
                     )
+                else:
+                    real_sync = artifact_history.sync_directory
+                    canonical_runs_root = (root / "runs").resolve()
+
+                    def fail_runs_root_sync(path):
+                        if Path(path) == canonical_runs_root:
+                            raise OSError("runs-directory fsync failure")
+                        return real_sync(path)
+
+                    durability_patch = patch.object(
+                        artifact_history,
+                        "sync_directory",
+                        side_effect=fail_runs_root_sync,
+                    )
 
                 with durability_patch, self.assertRaisesRegex(OSError, "fsync"):
                     publish_completed_run(root, run)
@@ -1322,6 +1402,56 @@ class ArtifactHistoryTests(unittest.TestCase):
                 self.assertFalse((root / "current.json").exists())
                 publish_completed_run(root, run)
                 self.assertEqual(resolve_current_run_dir(root), run.resolve())
+
+    def test_runs_root_durability_barrier_cannot_be_redirected(self) -> None:
+        from src import artifact_compatibility, artifact_history
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "root"
+            outside = Path(tmpdir) / "outside"
+            root.mkdir()
+            outside.mkdir()
+            run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            canonical_runs_root = (root / "runs").resolve()
+            parked_runs_root = root / "parked-runs"
+            targets: list[Path] = []
+            real_sync = artifact_history.sync_directory
+
+            def redirect_runs_root(path):
+                target = Path(path)
+                targets.append(target)
+                if target != canonical_runs_root:
+                    return real_sync(target)
+                canonical_runs_root.rename(parked_runs_root)
+                canonical_runs_root.symlink_to(outside, target_is_directory=True)
+                try:
+                    with patch.object(
+                        artifact_compatibility.os,
+                        "fsync",
+                        wraps=os.fsync,
+                    ) as redirected_fsync:
+                        try:
+                            return real_sync(target)
+                        finally:
+                            redirected_fsync.assert_not_called()
+                finally:
+                    canonical_runs_root.unlink()
+                    parked_runs_root.rename(canonical_runs_root)
+
+            with (
+                patch.object(
+                    artifact_history,
+                    "sync_directory",
+                    side_effect=redirect_runs_root,
+                ),
+                self.assertRaisesRegex(ValueError, "artifact directory is unsafe"),
+            ):
+                publish_completed_run(root, run)
+
+            self.assertEqual(targets, [run.resolve(), canonical_runs_root])
+            self.assertFalse((root / "current.json").exists())
+            publish_completed_run(root, run)
+            self.assertEqual(resolve_current_run_dir(root), run.resolve())
 
     def test_concurrent_finalization_has_exactly_one_publisher(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -427,6 +427,7 @@ def publish_completed_run(
         )
         verify_server_artifact_files(resolved_run_dir, artifact_snapshot)
         sync_directory(resolved_run_dir)
+        sync_directory(expected_parent)
         index = {
             "schema_version": ARTIFACT_SCHEMA_VERSION,
             "run_id": resolved_run_dir.name,

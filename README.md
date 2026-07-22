@@ -179,10 +179,11 @@ In this demo the operator still created all shards centrally; the boundary only
 describes what ServerApp reads at runtime.
 
 Completed-run publication flushes every captured regular artifact before publishing
-the completed manifest, flushes the run directory after that replacement, and
-flushes the artifact root after atomically replacing `current.json`. A failed
-pre-pointer durability barrier leaves the run unselected and can be retried safely;
-no publication call reports success unless every barrier completes.
+the completed manifest, flushes the run directory after that replacement, flushes
+the canonical `runs/` directory before writing `current.json`, and flushes the
+artifact root after atomically replacing that pointer. A failed pre-pointer
+durability barrier leaves the run unselected and can be retried safely; no
+publication call reports success unless every barrier completes.
 
 `artifact-retention-runs` defaults to `10`. Retention orders validated run
 manifests by `(created_at, run_id)`, keeps the newest configured count, and never

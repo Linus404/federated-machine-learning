@@ -214,12 +214,13 @@ def _validate_seeds(seeds: Mapping[str, Any]) -> None:
         )
     if not isinstance(code_defaults, Mapping):
         raise ValueError("run provenance manifest has an invalid seeds.code_defaults")
-    _required_nested_fields(
-        code_defaults,
-        {"client_validation_split", "data_partition"},
-        "seeds.code_defaults",
-    )
-    if any(type(code_defaults[key]) is not int for key in code_defaults):
+    expected_code_defaults = {
+        "client_validation_split": DEFAULT_VALIDATION_SEED,
+        "data_partition": DEFAULT_SPLIT_SEED,
+    }
+    if dict(code_defaults) != expected_code_defaults or any(
+        type(value) is not int for value in code_defaults.values()
+    ):
         raise ValueError("run provenance manifest has an invalid seeds.code_defaults")
 
 

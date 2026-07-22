@@ -56,8 +56,9 @@ Both current-pointer and explicit historical consumers validate completed-run
 provenance bytes, directory/run identity, frozen public dataset and vocabulary
 bindings, checksums, and exact inventory before returning artifact bytes.
 Publication flushes captured regular files, then the completed run directory, then
-the artifact root after `current.json`; a pointer is never returned before those
-POSIX durability barriers succeed.
+the canonical `runs/` directory before writing `current.json`, and finally the
+artifact root after replacing that pointer; a pointer is never returned before
+those POSIX durability barriers succeed.
 
 Each consumer accepts only its artifact kind's current schema. Missing,
 non-integer, older, and newer versions are rejected before the artifact is used.

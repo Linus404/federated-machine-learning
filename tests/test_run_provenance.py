@@ -13,6 +13,7 @@ from src.artifact_compatibility import (
     PUBLIC_ARTIFACT_SCHEMA_VERSION,
     canonical_json_bytes,
 )
+from src.contracts import DEFAULT_SPLIT_SEED, DEFAULT_VALIDATION_SEED
 from src.run_provenance import (
     _code_revision,
     _dataset_metadata,
@@ -928,6 +929,72 @@ class RunProvenanceTests(unittest.TestCase):
                     )
                     with self.assertRaisesRegex(ValueError, field):
                         load_run_provenance_manifest(manifest_path)
+
+    def test_loader_requires_canonical_code_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with (
+                patch(
+                    "src.run_provenance._code_revision",
+                    return_value={
+                        "commit": "a" * 40,
+                        "dirty": False,
+                        "source": "git",
+                    },
+                ),
+                patch(
+                    "src.run_provenance._environment_metadata",
+                    return_value=runtime_environment(),
+                ),
+            ):
+                payload = json.loads(
+                    write_run_provenance_manifest(root / "valid", {}).read_bytes()
+                )
+
+            canonical = {
+                "client_validation_split": DEFAULT_VALIDATION_SEED,
+                "data_partition": DEFAULT_SPLIT_SEED,
+            }
+            self.assertEqual(payload["seeds"]["code_defaults"], canonical)
+            valid_path = root / "canonical.json"
+            valid_path.write_bytes(canonical_json_bytes(payload))
+            self.assertEqual(
+                load_run_provenance_manifest(valid_path)["seeds"]["code_defaults"],
+                canonical,
+            )
+
+            invalid_code_defaults = {
+                "changed-value": {
+                    **canonical,
+                    "client_validation_split": DEFAULT_VALIDATION_SEED + 1,
+                },
+                "missing-key": {"data_partition": DEFAULT_SPLIT_SEED},
+                "extra-key": {**canonical, "unexpected": 1},
+                "boolean-substitution": {
+                    **canonical,
+                    "client_validation_split": True,
+                },
+                "type-substitution": {
+                    **canonical,
+                    "client_validation_split": str(DEFAULT_VALIDATION_SEED),
+                },
+            }
+            for mutation, code_defaults in invalid_code_defaults.items():
+                with self.subTest(mutation=mutation):
+                    invalid_path = root / f"{mutation}.json"
+                    invalid_path.write_bytes(
+                        canonical_json_bytes(
+                            {
+                                **payload,
+                                "seeds": {
+                                    **payload["seeds"],
+                                    "code_defaults": code_defaults,
+                                },
+                            }
+                        )
+                    )
+                    with self.assertRaisesRegex(ValueError, "seeds.code_defaults"):
+                        load_run_provenance_manifest(invalid_path)
 
     def test_git_revision_marks_untracked_files_dirty(self) -> None:
         completed = [
