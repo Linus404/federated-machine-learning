@@ -40,8 +40,14 @@ federated learning system.
 - [x] Document what information model updates can leak.
 - [ ] Add TLS for Flower communication.
 - [ ] Add SuperNode/client authentication and certificate lifecycle documentation.
-- [ ] Evaluate secure aggregation.
-- [ ] If differential privacy is claimed, implement formal privacy accounting and publish epsilon/delta values.
+- [x] Evaluate secure aggregation.
+  - Decision: defer Flower 1.32.1 SecAgg+ until its documented integration,
+    incompatibilities, and end-to-end prerequisites are resolved; see
+    `docs/adr/0001-secure-aggregation.md`.
+- [x] If differential privacy is claimed, implement formal privacy accounting and publish epsilon/delta values.
+  - Resolved by explicit non-claim: the current update-noise ablation has no
+    accountant, composition or sensitivity model, so no epsilon/delta or formal
+    differential-privacy claim is made.
 - [ ] Add membership-inference and model-update leakage experiments.
 - [x] Keep the current update-noise feature labeled as an illustrative ablation, not production differential privacy.
 

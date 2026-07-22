@@ -11,11 +11,15 @@ The supported runtime is a local research demo, not a production security
 boundary. This repository does not implement TLS, client or SuperNode
 authentication, secure aggregation, encryption at rest, or formal differential
 privacy. `use-update-noise` is an illustrative ablation, not formal differential
-privacy, and provides no privacy accounting or epsilon/delta guarantee.
+privacy, and has no accountant, composition or sensitivity model, or
+epsilon/delta guarantee. Flower's available privacy mechanisms do not complete
+that accounting for this repository's update-noise behavior.
 
 Read [THREAT_MODEL.md](THREAT_MODEL.md) for the actual data flow, trusted and
 untrusted components, information exposed through parameters, metrics, and
 artifacts, and controls required before production or privacy claims.
+The [secure-aggregation evaluation](docs/adr/0001-secure-aggregation.md) records
+the deferred Flower 1.32.1 integration decision.
 
 ## Report a vulnerability
 

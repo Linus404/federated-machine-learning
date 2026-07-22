@@ -98,8 +98,10 @@ plaintext traffic.
   evaluation yet.
 - `use-update-noise` is an illustrative ablation, not formal differential
   privacy. It clips each tensor update separately and adds Gaussian noise, but
-  defines no adjacency relation or sampling analysis, uses no privacy accountant,
-  and publishes no epsilon or delta. It must not be used as a privacy guarantee.
+  defines no adjacency relation, sensitivity model, sampling analysis, or
+  composition across rounds, uses no privacy accountant, and publishes no epsilon
+  or delta. Flower's available mechanisms do not supply complete accounting for
+  this update-noise behavior. It must not be used as a privacy guarantee.
 
 ### Integrity
 
@@ -159,3 +161,7 @@ definition, sampling model, accountant, and published epsilon/delta when DP is
 claimed; update validation and poisoning defenses; authenticated dashboard
 access; encrypted storage; audit logs; incident response; backup and recovery;
 and leakage, membership-inference, malicious-client, and network-adversary tests.
+
+The [secure-aggregation evaluation](docs/adr/0001-secure-aggregation.md) details
+the deferred Flower 1.32.1 integration, its protection boundary, and the evidence
+required before this control can be implemented or claimed.
