@@ -1,13 +1,416 @@
 import hashlib
+import itertools
 import json
 import math
 import re
 import tomllib
 import unittest
 from pathlib import Path
+from typing import Any
+
+import numpy as np
 
 
 PROTOCOL_PATH = Path("docs/scientific-protocol-v1.toml")
+
+
+def derive_seed(
+    protocol: dict[str, Any], master_seed: int, namespace: str, attempt: int = 0
+) -> int:
+    """Derive one protocol RNG seed.
+
+    Args:
+        protocol: Parsed scientific protocol.
+        master_seed: Registered experiment seed.
+        namespace: Fully expanded ASCII RNG namespace.
+        attempt: Zero-based retry attempt.
+
+    Returns:
+        Unsigned 64-bit integer encoded by the first eight SHA-256 bytes.
+    """
+    self_contained_material = f"{master_seed}|{namespace}|{attempt}".encode("ascii")
+    return int.from_bytes(
+        hashlib.sha256(self_contained_material).digest()[:8],
+        protocol["seeding"]["uint64_byte_order"],
+        signed=False,
+    )
+
+
+def generator(
+    protocol: dict[str, Any], master_seed: int, namespace: str, attempt: int = 0
+) -> np.random.Generator:
+    """Instantiate a fresh Generator for one derived seed.
+
+    Args:
+        protocol: Parsed scientific protocol.
+        master_seed: Registered experiment seed.
+        namespace: Fully expanded ASCII RNG namespace.
+        attempt: Zero-based retry attempt.
+
+    Returns:
+        A new NumPy Generator backed by PCG64.
+    """
+    return np.random.Generator(
+        np.random.PCG64(derive_seed(protocol, master_seed, namespace, attempt))
+    )
+
+
+def official_labels(protocol: dict[str, Any]) -> np.ndarray:
+    """Build the offline official-train label vector from frozen index ranges.
+
+    Args:
+        protocol: Parsed scientific protocol.
+
+    Returns:
+        Labels in zero-based official row-index order.
+    """
+    split = protocol["dataset"]["splits"]["train"]
+    labels = np.empty(split["rows"], dtype=np.int64)
+    for label, (first, last) in zip(
+        protocol["partitioning"]["labels"], split["label_index_ranges"], strict=True
+    ):
+        labels[first : last + 1] = label
+    return labels
+
+
+def iid_partition(
+    protocol: dict[str, Any], labels: np.ndarray, seed: int, client_scale: int
+) -> tuple[int, list[np.ndarray]]:
+    """Execute the registered IID partition algorithm offline.
+
+    Args:
+        protocol: Parsed scientific protocol.
+        labels: Official train labels by row index.
+        seed: Registered master seed.
+        client_scale: Number of clients.
+
+    Returns:
+        Attempt zero and sorted row-index shards in client order.
+    """
+    allocations: list[list[np.ndarray]] = [[] for _ in range(client_scale)]
+    template = protocol["seeding"]["namespaces"]["partition_iid"]
+    for label in protocol["partitioning"]["labels"]:
+        rows = np.flatnonzero(labels == label)
+        namespace = template.format(client_scale=client_scale, label=label)
+        shuffled = generator(protocol, seed, namespace).permutation(rows)
+        for client_id, part in enumerate(np.array_split(shuffled, client_scale)):
+            allocations[client_id].append(part)
+    return 0, [np.sort(np.concatenate(parts)) for parts in allocations]
+
+
+def dirichlet_partition(
+    protocol: dict[str, Any],
+    labels: np.ndarray,
+    seed: int,
+    partition_name: str,
+    alpha: float,
+    client_scale: int,
+) -> tuple[int, list[np.ndarray]]:
+    """Execute the registered Dirichlet partition and retry algorithm offline.
+
+    Args:
+        protocol: Parsed scientific protocol.
+        labels: Official train labels by row index.
+        seed: Registered master seed.
+        partition_name: Registered Dirichlet partition name.
+        alpha: Registered Dirichlet concentration.
+        client_scale: Number of clients.
+
+    Returns:
+        Accepted zero-based attempt and sorted row-index shards.
+
+    Raises:
+        ValueError: If no attempt satisfies the minimum client size.
+    """
+    partitioning = protocol["partitioning"]
+    template = protocol["seeding"]["namespaces"]["partition_dirichlet"]
+    for attempt in range(
+        partitioning["first_attempt"], partitioning["last_attempt"] + 1
+    ):
+        label_allocations: list[tuple[np.ndarray, np.ndarray]] = []
+        client_sizes = np.zeros(client_scale, dtype=np.int64)
+        for label in partitioning["labels"]:
+            rows = np.flatnonzero(labels == label)
+            namespace = template.format(
+                partition_name=partition_name,
+                client_scale=client_scale,
+                label=label,
+            )
+            rng = generator(protocol, seed, namespace, attempt)
+            shuffled = rng.permutation(rows)
+            probabilities = rng.dirichlet(np.full(client_scale, alpha))
+            counts = rng.multinomial(rows.size, probabilities)
+            label_allocations.append((shuffled, counts))
+            client_sizes += counts
+        if client_sizes.min() >= partitioning["minimum_samples_per_client"]:
+            allocations: list[list[np.ndarray]] = [[] for _ in range(client_scale)]
+            for shuffled, counts in label_allocations:
+                boundaries = np.concatenate(([0], np.cumsum(counts)))
+                for client_id in range(client_scale):
+                    allocations[client_id].append(
+                        shuffled[boundaries[client_id] : boundaries[client_id + 1]]
+                    )
+            shards = [np.sort(np.concatenate(parts)) for parts in allocations]
+            return attempt, shards
+    raise ValueError(
+        f"no accepted {partition_name}/{client_scale} partition for seed {seed}"
+    )
+
+
+def validation_split(
+    protocol: dict[str, Any],
+    labels: np.ndarray,
+    seed: int,
+    partition_name: str,
+    client_scale: int,
+    shards: list[np.ndarray],
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Execute deterministic client-local stratified validation splitting.
+
+    Args:
+        protocol: Parsed scientific protocol.
+        labels: Official train labels by row index.
+        seed: Registered master seed.
+        partition_name: Registered partition name.
+        client_scale: Number of clients.
+        shards: Accepted client shards in numeric client order.
+
+    Returns:
+        Sorted fitted and validation row-index arrays by client.
+    """
+    template = protocol["seeding"]["namespaces"]["validation"]
+    fraction = protocol["training"]["validation_fraction"]
+    fitted_by_client: list[np.ndarray] = []
+    validation_by_client: list[np.ndarray] = []
+    for client_id, shard in enumerate(shards):
+        fitted_parts: list[np.ndarray] = []
+        validation_parts: list[np.ndarray] = []
+        for label in protocol["partitioning"]["labels"]:
+            rows = np.sort(shard[labels[shard] == label])
+            namespace = template.format(
+                partition_name=partition_name,
+                client_scale=client_scale,
+                client_id=client_id,
+                label=label,
+            )
+            shuffled = generator(protocol, seed, namespace).permutation(rows)
+            validation_size = math.floor(rows.size * fraction)
+            validation_parts.append(shuffled[:validation_size])
+            fitted_parts.append(shuffled[validation_size:])
+        fitted_by_client.append(np.sort(np.concatenate(fitted_parts)))
+        validation_by_client.append(np.sort(np.concatenate(validation_parts)))
+    return fitted_by_client, validation_by_client
+
+
+def select_update_client(
+    protocol: dict[str, Any], labels: np.ndarray, fitted: list[np.ndarray]
+) -> int:
+    """Select the lowest feasible update-leakage client.
+
+    Args:
+        protocol: Parsed scientific protocol.
+        labels: Official train labels by row index.
+        fitted: Fitted row-index arrays in numeric client order.
+
+    Returns:
+        The lowest qualifying zero-based client ID.
+
+    Raises:
+        ValueError: If no client has the fixed count for every label.
+    """
+    count = protocol["privacy"]["update_leakage"]["records_per_class_per_target_label"]
+    for client_id, rows in enumerate(fitted):
+        if all(
+            np.count_nonzero(labels[rows] == label) >= count
+            for label in protocol["partitioning"]["labels"]
+        ):
+            return client_id
+    raise ValueError("no update-leakage client has enough fitted rows per label")
+
+
+def malicious_clients(
+    protocol: dict[str, Any], seed: int, malicious_count: int
+) -> list[int]:
+    """Execute the registered nested malicious-client selection.
+
+    Args:
+        protocol: Parsed scientific protocol.
+        seed: Registered master seed.
+        malicious_count: Number of malicious clients to select.
+
+    Returns:
+        Sorted zero-based malicious client IDs.
+    """
+    client_scale = protocol["threats"]["client_scale"]
+    namespace = protocol["seeding"]["namespaces"]["malicious_order"]
+    order = generator(protocol, seed, namespace).permutation(client_scale)
+    return sorted(int(client_id) for client_id in order[:malicious_count])
+
+
+def privacy_sample(
+    protocol: dict[str, Any],
+    labels: np.ndarray,
+    seed: int,
+    namespace: str,
+    eligible: np.ndarray,
+    count_per_label: int,
+) -> np.ndarray:
+    """Select one registered balanced privacy candidate pool.
+
+    Args:
+        protocol: Parsed scientific protocol.
+        labels: Labels for the candidate split by row index.
+        seed: Registered master seed.
+        namespace: Namespace template containing ``{label}``.
+        eligible: Eligible row indices in the candidate split.
+        count_per_label: Fixed number of records selected per label.
+
+    Returns:
+        Selected indices concatenated in ascending label order.
+
+    Raises:
+        ValueError: If any label pool has too few eligible rows.
+    """
+    selected: list[np.ndarray] = []
+    for label in protocol["partitioning"]["labels"]:
+        rows = np.sort(eligible[labels[eligible] == label])
+        if rows.size < count_per_label:
+            raise ValueError(f"label {label} has {rows.size} eligible rows")
+        label_namespace = namespace.replace("{label}", str(label))
+        selected.append(
+            generator(protocol, seed, label_namespace).permutation(rows)[
+                :count_per_label
+            ]
+        )
+    return np.concatenate(selected)
+
+
+def canonical_cell_id(cell: dict[str, Any]) -> str:
+    """Serialize one matrix cell as its canonical identifier.
+
+    Args:
+        cell: Complete canonical cell field mapping.
+
+    Returns:
+        Compact sorted ASCII JSON.
+    """
+    return json.dumps(
+        cell,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def cell(
+    matrix_kind: str,
+    strategy: str,
+    partition: str | None,
+    client_scale: int | None,
+    seed: int,
+    threat: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create the complete canonical field mapping for one cell.
+
+    Args:
+        matrix_kind: Matrix subsection name.
+        strategy: Registered strategy or privacy source model.
+        partition: Registered partition or ``None``.
+        client_scale: Registered client count or ``None``.
+        seed: Registered master seed.
+        threat: Exact robustness threat mapping or ``None``.
+
+    Returns:
+        Canonical cell fields with derived alpha.
+    """
+    alpha = None if partition in (None, "iid_stratified") else float(partition[10:])
+    return {
+        "matrix_kind": matrix_kind,
+        "strategy": strategy,
+        "partition": partition,
+        "alpha": alpha,
+        "client_scale": client_scale,
+        "seed": seed,
+        "threat": threat,
+    }
+
+
+def registered_cells(protocol: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expand every registered matrix cell.
+
+    Args:
+        protocol: Parsed scientific protocol.
+
+    Returns:
+        Complete canonical field mappings for all registered cells.
+    """
+    matrix = protocol["matrix"]
+    seeds = protocol["seeding"]["seeds"]
+    cells: list[dict[str, Any]] = []
+    for matrix_kind in ("primary_federated", "local_only"):
+        entry = matrix[matrix_kind]
+        cells.extend(
+            cell(matrix_kind, strategy, partition, entry["client_scale"], seed)
+            for strategy, partition, seed in itertools.product(
+                entry["strategies"], entry["partitions"], seeds
+            )
+        )
+    centralized = matrix["centralized"]
+    cells.extend(
+        cell("centralized", strategy, None, None, seed)
+        for strategy, seed in itertools.product(centralized["strategies"], seeds)
+    )
+    scale = matrix["scale"]
+    cells.extend(
+        cell("scale", strategy, partition, client_scale, seed)
+        for strategy, partition, client_scale, seed in itertools.product(
+            scale["strategies"],
+            scale["partitions"],
+            scale["client_scales"],
+            seeds,
+        )
+    )
+    robustness = matrix["robustness"]
+    cells.extend(
+        cell(
+            "robustness",
+            strategy,
+            robustness["partition"],
+            robustness["client_scale"],
+            seed,
+            {"attack": attack, "malicious_fraction": fraction},
+        )
+        for strategy, attack, fraction, seed in itertools.product(
+            robustness["strategies"],
+            robustness["attacks"],
+            robustness["malicious_fractions"],
+            seeds,
+        )
+    )
+    membership = matrix["membership_inference"]
+    cells.extend(
+        cell(
+            "membership_inference",
+            model,
+            None if model == "centralized" else membership["fedavg_partition"],
+            None if model == "centralized" else membership["fedavg_client_scale"],
+            seed,
+        )
+        for model, seed in itertools.product(membership["models"], seeds)
+    )
+    leakage = matrix["update_leakage"]
+    cells.extend(
+        cell(
+            "update_leakage",
+            model,
+            leakage["partition"],
+            leakage["client_scale"],
+            seed,
+        )
+        for model, seed in itertools.product(leakage["models"], seeds)
+    )
+    return cells
 
 
 class ScientificProtocolTests(unittest.TestCase):
@@ -15,12 +418,58 @@ class ScientificProtocolTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.raw_protocol = PROTOCOL_PATH.read_text(encoding="utf-8")
         cls.protocol = tomllib.loads(cls.raw_protocol)
+        cls.labels = official_labels(cls.protocol)
+
+    @classmethod
+    def partition_results(
+        cls,
+    ) -> dict[tuple[int, str, int], tuple[int, list[np.ndarray]] | None]:
+        """Execute each distinct partition used by registered cells once.
+
+        Returns:
+            Partition results keyed by seed, partition, and client scale. A
+            value of ``None`` records the protocol's required retry exhaustion.
+        """
+        if hasattr(cls, "_partition_results"):
+            return cls._partition_results
+        keys = {
+            (
+                int(registered_cell["seed"]),
+                str(registered_cell["partition"]),
+                int(registered_cell["client_scale"]),
+            )
+            for registered_cell in registered_cells(cls.protocol)
+            if registered_cell["partition"] is not None
+        }
+        keys.update(
+            (seed, "iid_stratified", 4) for seed in cls.protocol["seeding"]["seeds"]
+        )
+        results: dict[tuple[int, str, int], tuple[int, list[np.ndarray]] | None] = {}
+        for seed, partition_name, client_scale in sorted(keys):
+            if partition_name == "iid_stratified":
+                result = iid_partition(cls.protocol, cls.labels, seed, client_scale)
+            else:
+                alpha = float(partition_name[10:])
+                try:
+                    result = dirichlet_partition(
+                        cls.protocol,
+                        cls.labels,
+                        seed,
+                        partition_name,
+                        alpha,
+                        client_scale,
+                    )
+                except ValueError:
+                    result = None
+            results[(seed, partition_name, client_scale)] = result
+        cls._partition_results = results
+        return results
 
     def test_protocol_is_frozen_parseable_and_complete(self) -> None:
         self.assertEqual(self.protocol["protocol_version"], 1)
         self.assertEqual(self.protocol["status"], "frozen")
         self.assertIsNone(
-            re.search(r"\b(?:TODO|TBD|null)\b", self.raw_protocol, re.IGNORECASE)
+            re.search(r"\b(?:TODO|TBD)\b", self.raw_protocol, re.IGNORECASE)
         )
 
     def test_dataset_identity_and_checksums_are_exact(self) -> None:
@@ -57,6 +506,18 @@ class ScientificProtocolTests(unittest.TestCase):
             self.assertEqual(actual["content_sha256"], content_hash)
             self.assertRegex(raw_hash, r"^[0-9a-f]{64}$")
             self.assertRegex(content_hash, r"^[0-9a-f]{64}$")
+        for split in ("train", "test"):
+            split_spec = dataset["splits"][split]
+            self.assertEqual(split_spec["label_counts"], [12500, 12500])
+            self.assertEqual(
+                split_spec["label_index_ranges"], [[0, 12499], [12500, 24999]]
+            )
+        self.assertTrue(
+            np.array_equal(
+                np.bincount(self.labels),
+                self.protocol["dataset"]["splits"]["train"]["label_counts"],
+            )
+        )
 
     def test_content_hash_recipe_is_canonical_and_preserves_unicode(self) -> None:
         dataset = self.protocol["dataset"]
@@ -205,21 +666,32 @@ class ScientificProtocolTests(unittest.TestCase):
             },
         )
 
-        def derive(master_seed: int, namespace: str, attempt: int) -> int:
-            material = f"{master_seed}|{namespace}|{attempt}".encode("ascii")
-            return int.from_bytes(
-                hashlib.sha256(material).digest()[:8], "big", signed=False
-            )
-
-        self.assertEqual(derive(67, "partition/iid/4/label-0", 0), 6926234993375836234)
         self.assertEqual(
-            derive(67, "partition/dirichlet_0.5/4", 3), 13382714623973522527
+            derive_seed(
+                self.protocol,
+                67,
+                "partition/iid/4/round--1/epoch--1/client--1/label-0",
+            ),
+            7719479962854520267,
         )
         self.assertEqual(
-            derive(401, "privacy/membership/fedavg/member", 0),
-            12749602675305737329,
+            derive_seed(
+                self.protocol,
+                67,
+                "partition/dirichlet_0.5/4/round--1/epoch--1/client--1/label-1",
+                3,
+            ),
+            12278398448260194388,
         )
-        namespace = "partition/iid/4/label-0"
+        self.assertEqual(
+            derive_seed(
+                self.protocol,
+                401,
+                "privacy/membership/CELL/member/round--1/epoch--1/client--1/label-1",
+            ),
+            10707713437964235329,
+        )
+        namespace = "partition/iid/4/round--1/epoch--1/client--1/label-0"
         master_seed = 67
         attempt = 0
         self.assertEqual(
@@ -232,29 +704,448 @@ class ScientificProtocolTests(unittest.TestCase):
                     "attempt": attempt,
                 },
             ),
-            derive(master_seed, namespace, attempt),
+            derive_seed(self.protocol, master_seed, namespace, attempt),
         )
 
         namespaces = seeding["namespaces"]
         self.assertEqual(
-            set(namespaces),
+            namespaces,
             {
-                "partition_iid",
-                "partition_dirichlet",
-                "validation",
-                "model_initialization",
-                "training_order",
-                "dropout",
-                "malicious_order",
-                "membership_member",
-                "membership_nonmember",
-                "update_member",
-                "update_nonmember",
+                "partition_iid": "partition/iid/{client_scale}/round--1/epoch--1/client--1/label-{label}",
+                "partition_dirichlet": "partition/{partition_name}/{client_scale}/round--1/epoch--1/client--1/label-{label}",
+                "validation": "validation/{partition_name}/{client_scale}/round--1/epoch--1/client-{client_id}/label-{label}",
+                "model_initialization": "model/{cell_id}/round--1/epoch--1/client-{client_id}",
+                "training_order": "training/{cell_id}/round-{round_index}/epoch-{epoch_index}/client-{client_id}",
+                "dropout": "dropout/{cell_id}/round-{round_index}/epoch-{epoch_index}/client-{client_id}",
+                "malicious_order": "malicious-order/dirichlet_0.5/4/round--1/epoch--1/client--1",
+                "membership_member": "privacy/membership/{cell_id}/member/round--1/epoch--1/client--1/label-{label}",
+                "membership_nonmember": "privacy/membership/{cell_id}/nonmember/round--1/epoch--1/client--1/label-{label}",
+                "update_member": "privacy/update-leakage/{cell_id}/member/round-{round_index}/epoch--1/client-{client_id}/label-{label}",
+                "update_nonmember": "privacy/update-leakage/{cell_id}/nonmember/round-{round_index}/epoch--1/client-{client_id}/label-{label}",
             },
         )
-        self.assertEqual(
-            namespaces["malicious_order"], "malicious-order/dirichlet_0.5/4"
+        first_generator = generator(self.protocol, 67, namespace)
+        second_generator = generator(self.protocol, 67, namespace)
+        self.assertIsNot(first_generator, second_generator)
+        self.assertTrue(
+            np.array_equal(
+                first_generator.integers(0, 2**32, 8),
+                second_generator.integers(0, 2**32, 8),
+            )
         )
+        label_one_namespace = namespace.replace("label-0", "label-1")
+        self.assertNotEqual(
+            derive_seed(self.protocol, 67, namespace),
+            derive_seed(self.protocol, 67, label_one_namespace),
+        )
+        self.assertIn("Never share or reuse", seeding["generator_lifecycle"])
+        for key in (
+            "partition_iid",
+            "partition_dirichlet",
+            "validation",
+            "membership_member",
+            "membership_nonmember",
+            "update_member",
+            "update_nonmember",
+        ):
+            self.assertIn("label-{label}", namespaces[key])
+
+    def test_cell_ids_and_zero_based_seed_namespaces_are_canonical(self) -> None:
+        cell_id_spec = self.protocol["seeding"]["cell_id"]
+        expected_fields = [
+            "matrix_kind",
+            "strategy",
+            "partition",
+            "alpha",
+            "client_scale",
+            "seed",
+            "threat",
+        ]
+        self.assertEqual(cell_id_spec["fields"], expected_fields)
+        self.assertEqual(cell_id_spec["serialization"], "compact_sorted_json")
+        self.assertTrue(cell_id_spec["serialization_is_identifier"])
+
+        cells = registered_cells(self.protocol)
+        identifiers = [canonical_cell_id(registered_cell) for registered_cell in cells]
+        self.assertEqual(len(cells), self.protocol["matrix"]["totals"]["maximum_cells"])
+        self.assertEqual(len(identifiers), len(set(identifiers)))
+        for registered_cell, identifier in zip(cells, identifiers, strict=True):
+            self.assertEqual(list(json.loads(identifier)), sorted(expected_fields))
+            self.assertNotIn(" ", identifier)
+            self.assertEqual(json.loads(identifier), registered_cell)
+            self.assertEqual(
+                eval(
+                    cell_id_spec["python_serialization"],
+                    {"json": json},
+                    registered_cell,
+                ),
+                identifier,
+            )
+
+        example = cell(
+            "robustness",
+            "fedavg",
+            "dirichlet_0.5",
+            4,
+            67,
+            {"attack": "outlier", "malicious_fraction": 0.25},
+        )
+        self.assertEqual(canonical_cell_id(example), cell_id_spec["canonical_example"])
+
+        indexing = self.protocol["indexing"]
+        self.assertTrue(indexing["all_indices_zero_based"])
+        self.assertEqual(indexing["non_applicable_seed_namespace_index"], -1)
+        self.assertEqual(
+            indexing["federated_round_indices"], "integers from 0 through 19"
+        )
+        self.assertEqual(indexing["federated_epoch_indices_per_round"], [0])
+        self.assertEqual(
+            indexing["centralized_epoch_indices"], "integers from 0 through 19"
+        )
+        self.assertEqual(
+            indexing["local_only_epoch_indices"], "integers from 0 through 19"
+        )
+        self.assertEqual(indexing["label_indices"], [0, 1])
+        self.assertEqual(
+            indexing["namespace_contexts"],
+            {
+                "federated_training": {
+                    "round_index": "0_through_19",
+                    "epoch_index": 0,
+                    "client_id": "0_through_client_scale_minus_1",
+                },
+                "centralized_training": {
+                    "round_index": -1,
+                    "epoch_index": "0_through_19",
+                    "client_id": -1,
+                },
+                "local_only_training": {
+                    "round_index": -1,
+                    "epoch_index": "0_through_19",
+                    "client_id": "0_through_3",
+                },
+                "global_model_initialization": {
+                    "round_index": -1,
+                    "epoch_index": -1,
+                    "client_id": -1,
+                },
+                "local_only_model_initialization": {
+                    "round_index": -1,
+                    "epoch_index": -1,
+                    "client_id": "0_through_3",
+                },
+            },
+        )
+        namespaces = self.protocol["seeding"]["namespaces"]
+        for namespace in namespaces.values():
+            self.assertIn("round-", namespace)
+            self.assertIn("epoch-", namespace)
+            self.assertIn("client-", namespace)
+        for key in (
+            "partition_iid",
+            "partition_dirichlet",
+            "validation",
+            "malicious_order",
+            "membership_member",
+            "membership_nonmember",
+        ):
+            self.assertIn("--1", namespaces[key])
+        identifier = canonical_cell_id(
+            cell("local_only", "local_only", "iid_stratified", 4, 67)
+        )
+        self.assertEqual(
+            namespaces["model_initialization"].format(cell_id=identifier, client_id=2),
+            f"model/{identifier}/round--1/epoch--1/client-2",
+        )
+
+    def test_offline_partitions_retries_validation_and_clients_cover_cells(
+        self,
+    ) -> None:
+        results = self.partition_results()
+        seeds = self.protocol["seeding"]["seeds"]
+        expected_attempts = {
+            ("iid_stratified", 4): [0, 0, 0, 0, 0],
+            ("iid_stratified", 16): [0, 0, 0, 0, 0],
+            ("iid_stratified", 64): [0, 0, 0, 0, 0],
+            ("dirichlet_0.5", 4): [0, 0, 0, 0, 0],
+            ("dirichlet_0.1", 4): [0, 1, 4, 3, 1],
+            ("dirichlet_1.0", 16): [0, 0, 0, 0, 0],
+            ("dirichlet_0.5", 16): [3, 0, 0, 2, 0],
+            ("dirichlet_0.1", 16): [4664, 167, 1148, 41, 547],
+            ("dirichlet_1.0", 64): [1, 0, 1, 0, 0],
+            ("dirichlet_0.5", 64): [66, 209, 172, 113, 316],
+            ("dirichlet_0.1", 64): [None, None, None, None, None],
+        }
+        actual_attempts = {
+            (partition_name, client_scale): [
+                None
+                if results[(seed, partition_name, client_scale)] is None
+                else results[(seed, partition_name, client_scale)][0]
+                for seed in seeds
+            ]
+            for partition_name, client_scale in expected_attempts
+        }
+        self.assertEqual(actual_attempts, expected_attempts)
+
+        registered = registered_cells(self.protocol)
+        for registered_cell in registered:
+            client_scale = registered_cell["client_scale"]
+            self.assertEqual(
+                list(range(client_scale or 0)),
+                sorted(range(client_scale or 0)),
+            )
+            partition_name = registered_cell["partition"]
+            if partition_name is None:
+                continue
+            result = results[
+                (
+                    registered_cell["seed"],
+                    partition_name,
+                    client_scale,
+                )
+            ]
+            if result is None:
+                self.assertEqual(
+                    (
+                        registered_cell["matrix_kind"],
+                        partition_name,
+                        client_scale,
+                    ),
+                    ("scale", "dirichlet_0.1", 64),
+                )
+                continue
+            attempt, shards = result
+            self.assertGreaterEqual(
+                attempt, self.protocol["partitioning"]["first_attempt"]
+            )
+            self.assertLessEqual(attempt, self.protocol["partitioning"]["last_attempt"])
+            self.assertEqual(len(shards), client_scale)
+            combined = np.concatenate(shards)
+            self.assertEqual(combined.size, self.labels.size)
+            self.assertTrue(
+                np.array_equal(np.sort(combined), np.arange(self.labels.size))
+            )
+            self.assertTrue(all(np.all(shard[:-1] <= shard[1:]) for shard in shards))
+
+        for (seed, partition_name, client_scale), result in results.items():
+            if result is None:
+                continue
+            _, shards = result
+            fitted, validation = validation_split(
+                self.protocol,
+                self.labels,
+                seed,
+                partition_name,
+                client_scale,
+                shards,
+            )
+            for shard, fitted_rows, validation_rows in zip(
+                shards, fitted, validation, strict=True
+            ):
+                self.assertEqual(
+                    np.intersect1d(fitted_rows, validation_rows).size,
+                    0,
+                )
+                self.assertTrue(
+                    np.array_equal(
+                        np.sort(np.concatenate((fitted_rows, validation_rows))),
+                        shard,
+                    )
+                )
+                for label in self.protocol["partitioning"]["labels"]:
+                    shard_count = np.count_nonzero(self.labels[shard] == label)
+                    validation_count = np.count_nonzero(
+                        self.labels[validation_rows] == label
+                    )
+                    self.assertEqual(
+                        validation_count,
+                        math.floor(
+                            shard_count
+                            * self.protocol["training"]["validation_fraction"]
+                        ),
+                    )
+
+        iid_result = results[(67, "iid_stratified", 64)]
+        self.assertIsNotNone(iid_result)
+        for label in self.protocol["partitioning"]["labels"]:
+            label_counts = [
+                np.count_nonzero(self.labels[shard] == label) for shard in iid_result[1]
+            ]
+            self.assertLessEqual(max(label_counts) - min(label_counts), 1)
+
+    def test_offline_update_malicious_and_privacy_selection_cover_cells(
+        self,
+    ) -> None:
+        results = self.partition_results()
+        seeds = self.protocol["seeding"]["seeds"]
+        update = self.protocol["privacy"]["update_leakage"]
+        expected_selected_clients = [0, 0, 1, 0, 3]
+        selected_clients: dict[int, int] = {}
+        fitted_by_seed: dict[int, list[np.ndarray]] = {}
+        for seed, expected_client in zip(seeds, expected_selected_clients, strict=True):
+            result = results[(seed, "dirichlet_0.5", 4)]
+            self.assertIsNotNone(result)
+            _, shards = result
+            fitted, _ = validation_split(
+                self.protocol,
+                self.labels,
+                seed,
+                "dirichlet_0.5",
+                4,
+                shards,
+            )
+            selected_client = select_update_client(self.protocol, self.labels, fitted)
+            selected_clients[seed] = selected_client
+            fitted_by_seed[seed] = fitted
+            self.assertEqual(selected_client, expected_client)
+            required = update["records_per_class_per_target_label"]
+            for label in self.protocol["partitioning"]["labels"]:
+                self.assertGreaterEqual(
+                    np.count_nonzero(self.labels[fitted[selected_client]] == label),
+                    required,
+                )
+            for earlier_client in range(selected_client):
+                self.assertTrue(
+                    any(
+                        np.count_nonzero(self.labels[fitted[earlier_client]] == label)
+                        < required
+                        for label in self.protocol["partitioning"]["labels"]
+                    )
+                )
+        with self.assertRaisesRegex(ValueError, "no update-leakage client"):
+            select_update_client(
+                self.protocol,
+                self.labels,
+                [np.arange(499), np.arange(12500, 12999)],
+            )
+
+        robustness_cells = [
+            registered_cell
+            for registered_cell in registered_cells(self.protocol)
+            if registered_cell["matrix_kind"] == "robustness"
+        ]
+        for seed in seeds:
+            one = malicious_clients(self.protocol, seed, 1)
+            two = malicious_clients(self.protocol, seed, 2)
+            self.assertEqual(len(one), 1)
+            self.assertEqual(len(two), 2)
+            self.assertLessEqual(set(one), set(two))
+            for registered_cell in robustness_cells:
+                if registered_cell["seed"] != seed:
+                    continue
+                count = round(
+                    registered_cell["threat"]["malicious_fraction"]
+                    * registered_cell["client_scale"]
+                )
+                self.assertEqual(
+                    malicious_clients(self.protocol, seed, count),
+                    one if count == 1 else two,
+                )
+
+        privacy_cells = [
+            registered_cell
+            for registered_cell in registered_cells(self.protocol)
+            if registered_cell["matrix_kind"]
+            in {"membership_inference", "update_leakage"}
+        ]
+        namespaces = self.protocol["seeding"]["namespaces"]
+        all_rows = np.arange(self.labels.size)
+        for registered_cell in privacy_cells:
+            seed = registered_cell["seed"]
+            identifier = canonical_cell_id(registered_cell)
+            if registered_cell["matrix_kind"] == "membership_inference":
+                partition_name = registered_cell["partition"] or "iid_stratified"
+                client_scale = registered_cell["client_scale"] or 4
+                result = results[(seed, partition_name, client_scale)]
+                self.assertIsNotNone(result)
+                _, shards = result
+                fitted, _ = validation_split(
+                    self.protocol,
+                    self.labels,
+                    seed,
+                    partition_name,
+                    client_scale,
+                    shards,
+                )
+                member_rows = np.sort(np.concatenate(fitted))
+                count = self.protocol["privacy"]["membership_inference"][
+                    "records_per_class_per_membership"
+                ]
+                member_namespace = namespaces["membership_member"].replace(
+                    "{cell_id}", identifier
+                )
+                nonmember_namespace = namespaces["membership_nonmember"].replace(
+                    "{cell_id}", identifier
+                )
+                member_sample = privacy_sample(
+                    self.protocol,
+                    self.labels,
+                    seed,
+                    member_namespace,
+                    member_rows,
+                    count,
+                )
+                nonmember_sample = privacy_sample(
+                    self.protocol,
+                    self.labels,
+                    seed,
+                    nonmember_namespace,
+                    all_rows,
+                    count,
+                )
+            else:
+                fitted = fitted_by_seed[seed]
+                selected_client = selected_clients[seed]
+                count = update["records_per_class_per_target_label"]
+                replacements = {
+                    "{cell_id}": identifier,
+                    "{round_index}": str(update["target_round_index"]),
+                    "{client_id}": str(selected_client),
+                }
+                member_namespace = namespaces["update_member"]
+                nonmember_namespace = namespaces["update_nonmember"]
+                for token, value in replacements.items():
+                    member_namespace = member_namespace.replace(token, value)
+                    nonmember_namespace = nonmember_namespace.replace(token, value)
+                member_sample = privacy_sample(
+                    self.protocol,
+                    self.labels,
+                    seed,
+                    member_namespace,
+                    fitted[selected_client],
+                    count,
+                )
+                nonmember_sample = privacy_sample(
+                    self.protocol,
+                    self.labels,
+                    seed,
+                    nonmember_namespace,
+                    np.sort(
+                        np.concatenate(
+                            [
+                                rows
+                                for client_id, rows in enumerate(fitted)
+                                if client_id != selected_client
+                            ]
+                        )
+                    ),
+                    count,
+                )
+            for sample in (member_sample, nonmember_sample):
+                self.assertEqual(sample.size, 2 * count)
+                self.assertEqual(np.unique(sample).size, sample.size)
+                self.assertTrue(np.all(self.labels[sample[:count]] == 0))
+                self.assertTrue(np.all(self.labels[sample[count:]] == 1))
+
+        with self.assertRaisesRegex(ValueError, "499 eligible rows"):
+            privacy_sample(
+                self.protocol,
+                self.labels,
+                67,
+                "privacy/test/label-{label}",
+                np.arange(499),
+                500,
+            )
 
     def test_partition_and_client_selection_algorithms_are_closed(self) -> None:
         partitioning = self.protocol["partitioning"]
@@ -310,6 +1201,16 @@ class ScientificProtocolTests(unittest.TestCase):
         self.assertIn("unweighted arithmetic mean", local["reporting"])
         self.assertIn("exactly four models", local["reporting"])
         self.assertIn("iid_stratified_at_4_clients", centralized["split_reference"])
+        self.assertIn("epoch indices 0 through 19", centralized["validation_reporting"])
+        self.assertIn("epoch indices 0 through 19", local["validation_reporting"])
+        self.assertEqual(
+            centralized["convergence_round_reporting"],
+            "not_applicable_and_must_not_be_reported",
+        )
+        self.assertEqual(
+            local["convergence_round_reporting"],
+            "not_applicable_and_must_not_be_reported",
+        )
         self.assertEqual(
             local["models_per_cell"],
             self.protocol["matrix"]["local_only"]["training_invocations_per_cell"],
@@ -414,13 +1315,18 @@ class ScientificProtocolTests(unittest.TestCase):
         self.assertIn("first 500", membership["sampling_algorithm"])
 
         leakage = privacy["update_leakage"]
-        self.assertEqual(
-            (leakage["target_round"], leakage["target_client"]), (1, "client-0")
+        self.assertEqual(leakage["target_round_index"], 0)
+        self.assertIn("lowest numeric zero-based client_id", leakage["selected_client"])
+        self.assertIn("hard-fail", leakage["selected_client"])
+        self.assertIn(
+            "every registered master seed", leakage["selected_client_feasibility"]
         )
-        self.assertEqual(leakage["member_source"], "client-0_fitted_training_rows")
+        self.assertEqual(
+            leakage["member_source"], "selected_client fitted training rows"
+        )
         self.assertEqual(
             leakage["nonmember_source"],
-            "union_of_client-1_client-2_client-3_fitted_training_rows",
+            "union of all non-selected clients fitted training rows from the same accepted partition",
         )
         self.assertEqual(
             (
@@ -447,9 +1353,24 @@ class ScientificProtocolTests(unittest.TestCase):
 
     def test_system_measurement_boundaries_and_retry_rules_are_exact(self) -> None:
         system = self.protocol["metrics"]["system"]
-        self.assertIn("registered_validation_accuracy", system["convergence"])
-        self.assertIn("rounds_1_through_20", system["convergence"])
-        self.assertFalse(system["convergence_round_zero_included"])
+        self.assertIn("registered validation accuracy", system["convergence"])
+        self.assertIn("round indices 0 through 19", system["convergence"])
+        self.assertFalse(system["pre_training_state_included_for_convergence"])
+        self.assertEqual(
+            system["convergence_scope"],
+            "federated matrices only: primary_federated, scale, and robustness",
+        )
+        self.assertEqual(
+            system["reported_federated"],
+            ["convergence_round", "communication_bytes", "client_training_time"],
+        )
+        self.assertIn(
+            "never report convergence_round", system["centralized_local_only_curves"]
+        )
+        self.assertEqual(
+            system["reported_centralized_local_only"],
+            ["epoch_validation_curve", "client_training_time"],
+        )
         self.assertEqual(
             system["convergence_evaluation_data"],
             "union_of_registered_train_split_validation_rows",
@@ -559,7 +1480,9 @@ class ScientificProtocolTests(unittest.TestCase):
             membership["centralized_model_source"],
         )
         self.assertIn("same_seed_final_model", membership["fedavg_model_source"])
-        self.assertIn("round_1_client-0_update", leakage["fedavg_model_source"])
+        self.assertIn(
+            "round_index_0_selected_client_update", leakage["fedavg_model_source"]
+        )
 
     def test_compute_and_abort_budget_is_exact(self) -> None:
         budget = self.protocol["budget"]

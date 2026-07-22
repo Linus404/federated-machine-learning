@@ -26,12 +26,16 @@ loading_documentation = "https://huggingface.co/docs/datasets/loading"
 
 [dataset.splits.train]
 rows = 25000
+label_counts = [12500, 12500]
+label_index_ranges = [[0, 12499], [12500, 24999]]
 use = "training_and_deterministic_validation_only"
 raw_parquet_sha256 = "db47d16b5c297cc0dd625e519c81319c24c9149e70e8496de5475f6fa928342c"
 content_sha256 = "4639bf1063fddebc3d7a446004a1032832227b0d3d28b01f58f99a4f94c0ab8a"
 
 [dataset.splits.test]
 rows = 25000
+label_counts = [12500, 12500]
+label_index_ranges = [[0, 12499], [12500, 24999]]
 use = "sole_untouched_global_test_set"
 raw_parquet_sha256 = "b52e26e2f872d282ffac460bf9770b25ac6f102cda0e6ca7158df98c94e8b3da"
 content_sha256 = "48168f7787435514498e777646a1312897c1207d239c61acdde5e049bc3f1a3f"
@@ -69,19 +73,53 @@ tensorflow_seed = "derived_uint64_modulo_2147483647_with_zero_replaced_by_one"
 default_attempt = 0
 namespace_is_utf8_ascii = true
 namespace_reuse_forbidden = true
+generator_lifecycle = "Derive one uint64 for one fully expanded namespace and attempt, instantiate exactly one numpy.random.Generator with PCG64 from it, execute only that namespace's registered stochastic operation, then discard the generator. Never share or reuse a Generator across namespaces, labels, clients, rounds, epochs, attempts, cells, or master seeds."
+label_namespace_rule = "Every stochastic operation performed separately by label has a distinct namespace ending in label-{label}; derive and instantiate its Generator independently."
+
+[seeding.cell_id]
+fields = ["matrix_kind", "strategy", "partition", "alpha", "client_scale", "seed", "threat"]
+serialization = "compact_sorted_json"
+serialization_is_identifier = true
+python_serialization = '''json.dumps({"matrix_kind": matrix_kind, "strategy": strategy, "partition": partition, "alpha": alpha, "client_scale": client_scale, "seed": seed, "threat": threat}, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False)'''
+matrix_kind = "Exact subsection name under matrix: primary_federated, centralized, local_only, scale, robustness, membership_inference, or update_leakage."
+strategy = "Registered training strategy; for privacy analysis cells this is the source model name from the matrix models list."
+partition = "Registered partition name, or JSON null for centralized cells and centralized membership-inference cells."
+alpha = "Dirichlet alpha as a JSON number for dirichlet partitions, or JSON null for iid_stratified and non-partitioned cells."
+client_scale = "Registered integer client scale, or JSON null for centralized cells and centralized membership-inference cells."
+seed = "Registered integer master seed, not its ordinal position."
+threat = '''JSON null outside robustness. For robustness, exactly {"attack": <registered attack string>, "malicious_fraction": <registered JSON number>}; no other threat keys are permitted.'''
+canonical_example = '''{"alpha":0.5,"client_scale":4,"matrix_kind":"robustness","partition":"dirichlet_0.5","seed":67,"strategy":"fedavg","threat":{"attack":"outlier","malicious_fraction":0.25}}'''
 
 [seeding.namespaces]
-partition_iid = "partition/iid/{client_scale}/label-{label}"
-partition_dirichlet = "partition/{partition_name}/{client_scale}"
-validation = "validation/{partition_name}/{client_scale}/client-{client_id}/label-{label}"
-model_initialization = "model/{matrix_name}/{strategy}/{partition_name}/{client_scale}/{cell_id}"
-training_order = "training/{matrix_name}/{strategy}/{partition_name}/{client_scale}/{cell_id}/round-{round}/client-{client_id}/epoch-{epoch}"
-dropout = "dropout/{matrix_name}/{strategy}/{partition_name}/{client_scale}/{cell_id}/round-{round}/client-{client_id}/epoch-{epoch}"
-malicious_order = "malicious-order/dirichlet_0.5/4"
-membership_member = "privacy/membership/{model}/member"
-membership_nonmember = "privacy/membership/{model}/nonmember"
-update_member = "privacy/update-leakage/fedavg/member"
-update_nonmember = "privacy/update-leakage/fedavg/nonmember"
+partition_iid = "partition/iid/{client_scale}/round--1/epoch--1/client--1/label-{label}"
+partition_dirichlet = "partition/{partition_name}/{client_scale}/round--1/epoch--1/client--1/label-{label}"
+validation = "validation/{partition_name}/{client_scale}/round--1/epoch--1/client-{client_id}/label-{label}"
+model_initialization = "model/{cell_id}/round--1/epoch--1/client-{client_id}"
+training_order = "training/{cell_id}/round-{round_index}/epoch-{epoch_index}/client-{client_id}"
+dropout = "dropout/{cell_id}/round-{round_index}/epoch-{epoch_index}/client-{client_id}"
+malicious_order = "malicious-order/dirichlet_0.5/4/round--1/epoch--1/client--1"
+membership_member = "privacy/membership/{cell_id}/member/round--1/epoch--1/client--1/label-{label}"
+membership_nonmember = "privacy/membership/{cell_id}/nonmember/round--1/epoch--1/client--1/label-{label}"
+update_member = "privacy/update-leakage/{cell_id}/member/round-{round_index}/epoch--1/client-{client_id}/label-{label}"
+update_nonmember = "privacy/update-leakage/{cell_id}/nonmember/round-{round_index}/epoch--1/client-{client_id}/label-{label}"
+
+[indexing]
+all_indices_zero_based = true
+non_applicable_seed_namespace_index = -1
+federated_round_indices = "integers from 0 through 19"
+federated_epoch_indices_per_round = [0]
+centralized_epoch_indices = "integers from 0 through 19"
+local_only_epoch_indices = "integers from 0 through 19"
+client_indices = "integers from 0 through client_scale minus 1"
+label_indices = [0, 1]
+seed_namespace_rule = "Every seed namespace that contains round, epoch, or client dimensions uses the zero-based index when applicable and the literal sentinel -1 when not applicable; the rendered sentinel therefore appears as round--1, epoch--1, or client--1."
+
+[indexing.namespace_contexts]
+federated_training = { round_index = "0_through_19", epoch_index = 0, client_id = "0_through_client_scale_minus_1" }
+centralized_training = { round_index = -1, epoch_index = "0_through_19", client_id = -1 }
+local_only_training = { round_index = -1, epoch_index = "0_through_19", client_id = "0_through_3" }
+global_model_initialization = { round_index = -1, epoch_index = -1, client_id = -1 }
+local_only_model_initialization = { round_index = -1, epoch_index = -1, client_id = "0_through_3" }
 
 [partitioning]
 registered = ["iid_stratified", "dirichlet_1.0", "dirichlet_0.5", "dirichlet_0.1"]
@@ -98,17 +136,17 @@ labels = [0, 1]
 client_id_format = "client-{zero_based_integer}"
 
 [partitioning.iid]
-algorithm = "For each label in ascending order, sort row indices, permute them with the label-specific PCG64 generator, split with numpy.array_split into client_scale parts in ascending client ID order, concatenate both label parts per client, then sort each client shard by row index."
+algorithm = "For each label in ascending order, sort row indices, derive its label-specific namespace at attempt 0, instantiate a new PCG64 Generator, permute the rows once, discard the Generator, split with numpy.array_split into client_scale parts in ascending client ID order, concatenate both label parts per client, then sort each client shard by row index."
 attempt = 0
 balance = "per_label_part_sizes_differ_by_at_most_one"
 
 [partitioning.dirichlet]
-algorithm = "For each attempt, create one PCG64 generator from the partition namespace and attempt. For each label in ascending order, sort its row indices, call generator.permutation, call generator.dirichlet with client_scale copies of alpha, call generator.multinomial with the label row count and those probabilities, then assign consecutive permuted rows to clients in ascending ID order using those counts. Concatenate both label allocations per client and sort each shard by row index."
+algorithm = "For each attempt and each label in ascending order, sort its row indices, derive that label's partition namespace with the current attempt, instantiate a new PCG64 Generator, call generator.permutation, generator.dirichlet with client_scale copies of alpha, and generator.multinomial with the label row count and those probabilities, then discard the Generator and assign consecutive permuted rows to clients in ascending ID order using those counts. Concatenate both label allocations per client and sort each shard by row index."
 retry_scope = "discard_every_client_allocation_and_restart_with_next_attempt"
 acceptance_checked_after_both_labels = true
 
 [partitioning.validation]
-algorithm = "Within each accepted client shard and each label in ascending order, sort row indices, permute with the label-specific validation generator at attempt 0, assign the first floor(label_count_times_0.2) rows to validation and all remaining rows to fitted training, then sort both resulting index sets."
+algorithm = "Within each accepted client shard and each label in ascending order, sort row indices, derive the client-and-label-specific validation namespace at attempt 0, instantiate a new PCG64 Generator, permute once, discard the Generator, assign the first floor(label_count_times_0.2) rows to validation and all remaining rows to fitted training, then sort both resulting index sets."
 validation_union_use = "server_held_per_round_global_validation_only"
 fitted_rows_use = "optimizer_input_only"
 
@@ -119,7 +157,7 @@ order = "ascending_numeric_client_id"
 random_sampling = false
 
 [selection.malicious]
-algorithm = "At attempt 0, permute ascending client IDs once with the malicious-order PCG64 generator; for malicious count k choose the first k IDs and sort the chosen IDs for execution."
+algorithm = "At attempt 0, instantiate one PCG64 Generator for the malicious-order namespace, permute ascending client IDs once, discard the Generator, and for malicious count k choose the first k IDs and sort the chosen IDs for execution."
 pairing = "Reuse the same seeded permutation across all robustness strategies, attacks, and malicious fractions for one master seed; the one-client set is a subset of the two-client set."
 
 [model]
@@ -170,6 +208,8 @@ training_rows = "union_of_the_four_iid_stratified_fitted_training_sets"
 validation_rows = "union_of_the_four_iid_stratified_registered_validation_sets"
 fitted_row_exposures = 20
 test_evaluation = "once_after_epoch_20"
+validation_reporting = "report the registered validation metric curve for zero-based epoch indices 0 through 19"
+convergence_round_reporting = "not_applicable_and_must_not_be_reported"
 
 [strategies.local_only]
 kind = "one_model_per_client"
@@ -182,6 +222,8 @@ model_aggregation = "none"
 prediction_aggregation = "none"
 reporting = "retain raw predictions and classification metrics separately for each of the four client models; the cell summary is the unweighted arithmetic mean of each reported scalar metric across exactly four models"
 test_evaluation = "each_model_once_after_epoch_20"
+validation_reporting = "report each model's registered validation metric curve for zero-based epoch indices 0 through 19"
+convergence_round_reporting = "not_applicable_and_must_not_be_reported"
 
 [strategies.fedavg]
 kind = "sample_weighted_mean"
@@ -231,7 +273,7 @@ member_records = 1000
 nonmember_records = 1000
 records_per_class_per_membership = 500
 sampling_replacement = false
-sampling_algorithm = "For members and nonmembers separately and for labels 0 then 1, sort eligible official row indices, permute with that pool namespace at attempt 0, and take the first 500. Concatenate member label-0, member label-1, nonmember label-0, and nonmember label-1 records in that order."
+sampling_algorithm = "For members and nonmembers separately and for labels 0 then 1, sort eligible official row indices, derive the pool-and-label-specific namespace at attempt 0, instantiate a new PCG64 Generator, permute once, discard the Generator, and take the first 500. Concatenate member label-0, member label-1, nonmember label-0, and nonmember label-1 records in that order; hard-fail if any pool-label has fewer than 500 eligible rows."
 membership_positive_label = 1
 membership_negative_label = 0
 prediction_clip_minimum = 1e-7
@@ -243,17 +285,18 @@ success_metrics = ["roc_auc", "max_tpr_minus_fpr", "tpr_at_1_percent_fpr"]
 [privacy.update_leakage]
 attacker = "honest_but_curious_server"
 access = ["individual_client_update", "current_global_model", "candidate_records"]
-target_round = 1
-target_client = "client-0"
-pre_update_model = "global_model_sent_to_client-0_at_start_of_round_1"
-individual_client_update = "flatten_in_model_trainable_variable_order_each_client-0_post_fit_weight_minus_corresponding_pre_update_global_weight"
-member_source = "client-0_fitted_training_rows"
-nonmember_source = "union_of_client-1_client-2_client-3_fitted_training_rows"
+target_round_index = 0
+selected_client = "lowest numeric zero-based client_id whose accepted fitted partition contains at least records_per_class_per_target_label rows of label 0 and at least that many rows of label 1; hard-fail the update-leakage cell if no client qualifies"
+selected_client_feasibility = "The fixed count 500 is feasible for every registered master seed under dirichlet_0.5 with 4 clients; executable offline protocol tests derive the exact selected client for all five seeds."
+pre_update_model = "global model sent to selected_client at the start of zero-based round index 0"
+individual_client_update = "flatten in model trainable-variable order each selected_client post-fit weight minus the corresponding pre-update global weight"
+member_source = "selected_client fitted training rows"
+nonmember_source = "union of all non-selected clients fitted training rows from the same accepted partition"
 member_records = 1000
 nonmember_records = 1000
 records_per_class_per_target_label = 500
 sampling_replacement = false
-sampling_algorithm = "For target members and target nonmembers separately and for labels 0 then 1, sort eligible official train row indices, permute with that pool namespace at attempt 0, and take the first 500. Concatenate member label-0, member label-1, nonmember label-0, and nonmember label-1 records in that order."
+sampling_algorithm = "For target members and target nonmembers separately and for labels 0 then 1, sort eligible official train row indices, derive the pool-and-label-specific namespace containing target_round_index and selected_client at attempt 0, instantiate a new PCG64 Generator, permute once, discard the Generator, and take the first 500. Concatenate member label-0, member label-1, nonmember label-0, and nonmember label-1 records in that order; hard-fail if no selected client exists or any pool-label has fewer than 500 eligible rows."
 target_membership_positive_label = 1
 target_membership_negative_label = 0
 gradient_model = "pre_update_model"
@@ -272,9 +315,11 @@ positive_label = 1
 zero_division = 0
 
 [metrics.system]
-convergence = "first_federated_round_whose_registered_validation_accuracy_is_at_least_0.95_times_the_maximum_registered_validation_accuracy_over_rounds_1_through_20"
+convergence_scope = "federated matrices only: primary_federated, scale, and robustness"
+convergence = "first zero-based federated round index whose registered validation accuracy is at least 0.95 times the maximum registered validation accuracy over round indices 0 through 19"
 convergence_evaluation_data = "union_of_registered_train_split_validation_rows"
-convergence_round_zero_included = false
+pre_training_state_included_for_convergence = false
+centralized_local_only_curves = "centralized and local_only report registered validation metric curves over zero-based epoch indices 0 through 19 and never report convergence_round"
 test_evaluation_schedule = "final_trained_model_only_after_round_20_or_epoch_20_and_never_for_convergence"
 client_fit_timer = "time.perf_counter_ns"
 client_fit_timer_start = "immediately_before_invoking_the_clients_model_fit_training_call_after_parameters_and_fitted_batches_are_ready"
@@ -290,7 +335,8 @@ communication_included_messages = ["fit_request", "fit_response", "evaluate_requ
 communication_excluded_bytes = ["transport_framing", "grpc_http2_headers", "tls", "tcp_ip", "lower_layer_retransmissions", "liveness_and_control_messages"]
 communication_retry_rule = "count every complete application message emitted by every initial attempt and retry; count a response only when its complete byte string is emitted; never double-count the receiver copy"
 communication_reporting = "report server_to_client_bytes client_to_server_bytes and their exact sum per run"
-reported = ["convergence_round", "communication_bytes", "client_training_time"]
+reported_federated = ["convergence_round", "communication_bytes", "client_training_time"]
+reported_centralized_local_only = ["epoch_validation_curve", "client_training_time"]
 
 [statistics]
 replicates = 5
@@ -355,7 +401,7 @@ cells = 10
 [matrix.update_leakage]
 models = ["fedavg"]
 seeds = 5
-fedavg_model_source = "matrix.primary_federated_fedavg_dirichlet_0.5_4_clients_same_seed_round_1_client-0_update"
+fedavg_model_source = "matrix.primary_federated_fedavg_dirichlet_0.5_4_clients_same_seed_round_index_0_selected_client_update"
 client_scale = 4
 partition = "dirichlet_0.5"
 cells = 5
