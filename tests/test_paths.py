@@ -70,6 +70,7 @@ def write_prepared_generation(
                 "schema_version": PREPARED_GENERATION_SCHEMA_VERSION,
                 "generation_id": serialized_id,
                 "logical_roots": logical_roots,
+                "preparation_request": {"partitions": 4},
             }
         )
     )
@@ -171,6 +172,21 @@ class ArtifactPathContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "identities differ"):
                 resolve_prepared_artifact_dir(root / "clients", "client")
 
+    def test_prepared_generation_rejects_older_and_newer_request_schemas(self) -> None:
+        for version in (1, PREPARED_GENERATION_SCHEMA_VERSION + 1):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                generation, _ = write_prepared_generation(root)
+                index = generation / "index.json"
+                payload = json.loads(index.read_text(encoding="utf-8"))
+                payload["schema_version"] = version
+                if version == 1:
+                    payload.pop("preparation_request")
+                index.write_bytes(canonical_json_bytes(payload))
+
+                with self.assertRaisesRegex(ValueError, "schema|field set"):
+                    resolve_prepared_artifact_dir(root / "public", "public")
+
     def test_prepared_generation_rejects_reordered_bool_and_duplicate_fields(
         self,
     ) -> None:
@@ -179,6 +195,7 @@ class ArtifactPathContractTests(unittest.TestCase):
                 "generation_id": payload["generation_id"],
                 "schema_version": payload["schema_version"],
                 "logical_roots": payload["logical_roots"],
+                "preparation_request": payload["preparation_request"],
             },
             lambda payload: {
                 **payload,
@@ -189,6 +206,14 @@ class ArtifactPathContractTests(unittest.TestCase):
                 },
             },
             lambda payload: {**payload, "schema_version": True},
+            lambda payload: {
+                **payload,
+                "preparation_request": {"partitions": True},
+            },
+            lambda payload: {
+                **payload,
+                "preparation_request": {"partitions": 0},
+            },
         )
         for mutation in mutations:
             with (
@@ -208,10 +233,11 @@ class ArtifactPathContractTests(unittest.TestCase):
             root = Path(tmpdir)
             generation, generation_id = write_prepared_generation(root)
             (generation / "index.json").write_text(
-                '{"schema_version":1,"schema_version":1,'
+                '{"schema_version":2,"schema_version":2,'
                 f'"generation_id":"{generation_id}",'
                 '"logical_roots":{"client":"clients",'
-                '"evaluation":"evaluation","public":"public"}}',
+                '"evaluation":"evaluation","public":"public"},'
+                '"preparation_request":{"partitions":4}}',
                 encoding="utf-8",
             )
 

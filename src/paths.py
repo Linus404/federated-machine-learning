@@ -5,7 +5,7 @@ import os
 import stat
 import uuid
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Mapping
 
 from src.artifact_compatibility import (
     canonical_json_bytes,
@@ -23,8 +23,34 @@ PREPARED_CURRENT_FILENAME = ".prepared-current"
 PREPARED_GENERATIONS_DIRECTORY = ".prepared-generations"
 PREPARED_LEGACY_DIRECTORY = ".prepared-legacy"
 PREPARED_MIGRATION_FILENAME = ".prepared-migration.json"
-PREPARED_GENERATION_SCHEMA_VERSION = 1
+PREPARED_GENERATION_SCHEMA_VERSION = 2
 PREPARED_ARTIFACT_KINDS = frozenset({"client", "public", "evaluation"})
+
+
+def validate_preparation_request(value: object) -> dict[str, int]:
+    """Validate artifact-affecting fields for one preparation request.
+
+    Parameters
+    ----------
+    value : object
+        Candidate request persisted in a journal or generation index.
+
+    Returns
+    -------
+    dict of str to int
+        Canonical preparation request.
+
+    Raises
+    ------
+    ValueError
+        If fields, types, or values differ from the supported request contract.
+    """
+    if not isinstance(value, Mapping) or set(value) != {"partitions"}:
+        raise ValueError("prepared generation request has an invalid field set")
+    partitions = value["partitions"]
+    if type(partitions) is not int or partitions < 1:
+        raise ValueError("prepared generation request has invalid partitions")
+    return {"partitions": partitions}
 
 
 class RunArtifactLock:
@@ -145,6 +171,7 @@ def resolve_prepared_artifact_dir(value: str | Path, artifact_kind: str) -> Path
         "schema_version",
         "generation_id",
         "logical_roots",
+        "preparation_request",
     }:
         raise ValueError("prepared generation index has an invalid field set")
     if type(payload["schema_version"]) is not int:
@@ -164,12 +191,14 @@ def resolve_prepared_artifact_dir(value: str | Path, artifact_kind: str) -> Path
         or logical_roots[artifact_kind] != logical_root.name
     ):
         raise ValueError("prepared generation index does not match configured roots")
+    preparation_request = validate_preparation_request(payload["preparation_request"])
     canonical_payload = {
         "schema_version": PREPARED_GENERATION_SCHEMA_VERSION,
         "generation_id": payload["generation_id"],
         "logical_roots": {
             name: logical_roots[name] for name in sorted(PREPARED_ARTIFACT_KINDS)
         },
+        "preparation_request": preparation_request,
     }
     if index_bytes != canonical_json_bytes(canonical_payload):
         raise ValueError("prepared generation index bytes are not canonical")

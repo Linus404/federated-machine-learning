@@ -15,19 +15,21 @@ adding an optional setting with an unchanged default is compatible.
 ## Artifact schemas
 
 Artifact schemas are scoped by artifact kind. Public manifests, client shards,
-and server artifact manifests use schema `2`; the prepared-generation index,
-evaluation artifacts, run provenance, and current-run index use schema `1`:
+server artifact manifests, and the prepared-generation index use schema `2`;
+evaluation artifacts, run provenance, and the current-run index use schema `1`:
 
 - `artifacts/public/manifest.json` uses `schema_version: 2` and describes the
   frozen train-dataset identity, checksummed vocabulary, and model dimensions.
 - Each `client-N/client_metadata.json` uses `schema_version: 2`, describes its
   client-scoped raw-review shard, and binds its records to the exact public
   manifest used by the consumer.
-- `.prepared-current/index.json` uses `schema_version: 1`; the atomic
+- `.prepared-current/index.json` uses `schema_version: 2`; the atomic
   `.prepared-current` directory link selects one
   immutable directory under `.prepared-generations/<generation-id>`. Its client,
   public, and evaluation children are always selected as one generation. The
-  canonical index bytes must record the same UUIDv4 as the selected directory.
+  canonical index bytes must record the same UUIDv4 as the selected directory and
+  bind the artifact-affecting preparation request, currently the positive client
+  partition count. The durable migration journal carries the same request.
 - `artifacts/evaluation/manifest.json` uses `schema_version: 1` and strictly
   versions and checksums the immutable official test-split JSONL artifact.
 - Each completed `server/runs/<run_id>` directory has schema-2
@@ -36,7 +38,9 @@ evaluation artifacts, run provenance, and current-run index use schema `1`:
   consistent, checksummed artifact set.
 - Each run directory has an immutable schema-1 `run_manifest.json`, which versions
   run identity, configuration, environment, code, seed, and public-dataset
-  provenance as one schema-checked record.
+  provenance as one schema-checked record. Its string-encoded public-dataset
+  identity must itself be strict, canonical JSON with the exact train-identity
+  fields and valid field types and values.
 - Schema-1 `server/current.json` atomically selects a completed run and binds its
   artifact manifest by SHA-256 checksum.
 
@@ -56,9 +60,12 @@ older and cannot be upgraded by editing a version field. Regenerate public schem
 `2`, client schema `2`, and the atomic prepared generation from the frozen source
 dataset. Server schema `1` artifacts are unbound to a public vocabulary and are
 also rejected; rerun local or federated training against the regenerated public
-artifacts to produce server schema `2`. Evaluation, run-provenance,
-prepared-generation-index, and current-run schema `1` artifacts do not require a
-schema migration.
+artifacts to produce server schema `2`. Evaluation, run-provenance, and current-run
+schema `1` artifacts do not require a schema migration. Prepared-generation schema
+`1` did not bind the requested partition count and is no longer selectable. A
+pending schema-1 preparation is safely rolled back and its journal-owned candidate
+discarded before regeneration; an already selected schema-1 generation remains
+immutable until a schema-2 generation atomically supersedes it.
 
 Artifacts are derived outputs, so regeneration into another root remains
 non-destructive:
@@ -82,11 +89,14 @@ accepts the invoking Linux user's UID/GID, and keeps `artifacts/server` read-onl
 When generation publication first encounters real legacy logical directories,
 it retains them under `.prepared-legacy/<generation-id>/` and replaces the
 logical names with links to `.prepared-current`. This controlled migration never
-deletes legacy bytes. Inspect and remove an archive only with all consumers
-stopped. Compose mounts public and per-client inputs directly through
-`.prepared-current`; evaluation remains unmounted. Because bind sources are
-resolved when containers are created, stop containers before regeneration and
-recreate them afterward.
+deletes legacy bytes. Unrecognized legacy files remain archive-only and are never
+promoted into a selected client, public, or evaluation generation. Public
+generations contain exactly `manifest.json` and the checksummed `vocab.txt`;
+client and evaluation loaders likewise enforce their exact inventories. Inspect
+and remove an archive only with all consumers stopped. Compose mounts public and
+per-client inputs directly through `.prepared-current`; evaluation remains
+unmounted. Because bind sources are resolved when containers are created, stop
+containers before regeneration and recreate them afterward.
 
 An interrupted preparation can leave an immutable, unselected directory under
 `.prepared-generations`; consumers ignore it because only `.prepared-current`

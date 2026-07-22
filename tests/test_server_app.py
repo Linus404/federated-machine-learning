@@ -28,7 +28,18 @@ def server_app_manifest(public_dir: Path) -> SimpleNamespace:
         App-manifest-shaped immutable snapshot.
     """
     snapshot = fake_app_manifest()
-    snapshot.manifest_bytes = b'{"dataset":{"id":"test"}}\n'
+    dataset = {
+        "id": "example/imdb",
+        "config": "plain_text",
+        "revision": "frozen",
+        "datasets_version": "1.0.0",
+        "split": "train",
+        "rows": 4,
+        "raw_parquet_sha256": "1" * 64,
+        "content_sha256": "2" * 64,
+    }
+    snapshot.payload["dataset"] = dataset
+    snapshot.manifest_bytes = json.dumps({"dataset": dataset}).encode("utf-8")
     snapshot.vocabulary_path = public_dir / "vocab.txt"
     return snapshot
 

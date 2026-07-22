@@ -42,7 +42,7 @@ from src.local_training import (
     load_client_shard,
     load_client_shard_snapshot,
 )
-from src.paths import resolve_prepared_artifact_dir
+from src.paths import PREPARED_GENERATION_SCHEMA_VERSION, resolve_prepared_artifact_dir
 from src.text_preprocessing import create_text_vectorizer, protocol_standardize
 
 
@@ -134,6 +134,22 @@ def public_protocol(sequence_length: int = 4) -> dict[str, object]:
     }
 
 
+def preparation_request(partitions: int = 1) -> dict[str, int]:
+    """Return the durable artifact-affecting preparation request.
+
+    Parameters
+    ----------
+    partitions : int, optional
+        Requested number of client shards.
+
+    Returns
+    -------
+    dict of str to int
+        Canonical request fields persisted with a prepared generation.
+    """
+    return {"partitions": partitions}
+
+
 def write_complete_prepared_stage(path: Path) -> dict[str, object]:
     """Write one complete prepared generation candidate for recovery tests.
 
@@ -175,7 +191,7 @@ def write_complete_prepared_stage(path: Path) -> dict[str, object]:
 
 
 def write_pending_prepared_recovery(
-    root: Path, *, final: bool
+    root: Path, *, final: bool, legacy_schema: bool = False
 ) -> tuple[dict[str, Path], Path, dict[str, object]]:
     """Create one journaled stage or final generation recovery fixture.
 
@@ -185,6 +201,8 @@ def write_pending_prepared_recovery(
         Empty temporary artifact parent.
     final : bool
         Write the candidate under its final UUID name instead of its stage name.
+    legacy_schema : bool, optional
+        Write schema 1 metadata without a durable preparation request.
 
     Returns
     -------
@@ -204,17 +222,20 @@ def write_pending_prepared_recovery(
     generations = root / ".prepared-generations"
     candidate = generations / (generation_id if final else stage_name)
     protocol = write_complete_prepared_stage(candidate)
+    schema_version = 1 if legacy_schema else PREPARED_GENERATION_SCHEMA_VERSION
     index = {
-        "schema_version": 1,
+        "schema_version": schema_version,
         "generation_id": generation_id,
         "logical_roots": {name: roots[name].name for name in sorted(roots)},
+        **({} if legacy_schema else {"preparation_request": preparation_request()}),
     }
     (candidate / "index.json").write_bytes(canonical_json_bytes(index))
     journal = {
-        "schema_version": 1,
+        "schema_version": schema_version,
         "generation_id": generation_id,
         "stage_name": stage_name,
         "logical_roots": {name: roots[name].name for name in sorted(roots)},
+        **({} if legacy_schema else {"preparation_request": preparation_request()}),
         "legacy_roots": sorted(roots),
         "alias_roots": sorted(roots),
         "previous_pointer_target": None,
@@ -402,8 +423,14 @@ def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> No
     evaluation_dir = tmp_path / "evaluation"
     public_dir.mkdir()
     client_dir.mkdir()
-    (public_dir / "keep.txt").write_text("keep", encoding="utf-8")
-    (client_dir / "keep.txt").write_text("keep", encoding="utf-8")
+    evaluation_dir.mkdir()
+    sentinels = {
+        "public": public_dir / "legacy-test-export.txt",
+        "client": client_dir / "legacy-client-export.txt",
+        "evaluation": evaluation_dir / "legacy-evaluation-export.txt",
+    }
+    for sentinel in sentinels.values():
+        sentinel.write_text("external test sentinel", encoding="utf-8")
     (client_dir / "client-0.tar.gz").write_bytes(b"legacy private shard")
     texts = np.asarray([f"Review {index} good movie" for index in range(12)])
     labels = np.asarray([index % 2 for index in range(12)], dtype="int32")
@@ -544,8 +571,24 @@ def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> No
     assert untouched_texts.isdisjoint(record["text"] for record in client_records)
     public_bytes = b"".join(path.read_bytes() for path in public_generation.iterdir())
     assert all(text.encode() not in public_bytes for text in untouched_texts)
-    assert (public_generation / "keep.txt").read_text(encoding="utf-8") == "keep"
-    assert (client_generation / "keep.txt").read_text(encoding="utf-8") == "keep"
+    assert {path.name for path in public_generation.iterdir()} == {
+        "manifest.json",
+        "vocab.txt",
+    }
+    assert {path.name for path in client_generation.iterdir()} == {
+        f"client-{index}" for index in range(4)
+    }
+    assert {path.name for path in evaluation_generation.iterdir()} == {
+        "manifest.json",
+        "test.jsonl",
+    }
+    assert not list((tmp_path / ".prepared-current").rglob("*export*"))
+    archive = next((tmp_path / ".prepared-legacy").iterdir())
+    for kind, sentinel in sentinels.items():
+        archived_root = client_dir.name if kind == "client" else kind
+        assert (archive / archived_root / sentinel.name).read_text(
+            encoding="utf-8"
+        ) == "external test sentinel"
 
 
 class ArtifactFlowTests(unittest.TestCase):
@@ -585,6 +628,20 @@ class ArtifactFlowTests(unittest.TestCase):
                 lambda candidate: candidate / "evaluation" / "test.jsonl",
                 "corrupt",
             ),
+            "extra-public": (
+                lambda candidate: candidate / "public" / "legacy-test-export.txt",
+                "extra",
+            ),
+            "extra-client": (
+                lambda candidate: candidate / "client" / "legacy-client-export.txt",
+                "extra",
+            ),
+            "extra-evaluation": (
+                lambda candidate: (
+                    candidate / "evaluation" / "legacy-evaluation-export.txt"
+                ),
+                "extra",
+            ),
         }
         for final in (False, True):
             for mutation, (target_for, operation) in mutations.items():
@@ -599,12 +656,15 @@ class ArtifactFlowTests(unittest.TestCase):
                         root, final=final
                     )
                     target = target_for(candidate)
-                    original = target.read_bytes()
+                    original = target.read_bytes() if target.exists() else None
                     if operation == "missing":
                         target.unlink()
                     elif operation == "corrupt":
                         target.write_bytes(b"corrupt\n")
+                    elif operation == "extra":
+                        target.write_text("external test sentinel", encoding="utf-8")
                     else:
+                        assert original is not None
                         tampered = json.loads(original)
                         tampered["generation_id"] = (
                             "e9c739c6-c67e-43e5-b570-6d5f48fe09b4"
@@ -618,7 +678,7 @@ class ArtifactFlowTests(unittest.TestCase):
                         ),
                         self.assertRaisesRegex(ValueError, "generation validation"),
                     ):
-                        _recover_prepared_migration(roots)
+                        _recover_prepared_migration(roots, preparation_request())
 
                     self.assertTrue((root / ".prepared-migration.json").is_file())
                     self.assertFalse((root / ".prepared-current").exists())
@@ -631,12 +691,17 @@ class ArtifactFlowTests(unittest.TestCase):
                         )
                     self.assertTrue(candidate.exists())
 
-                    target.write_bytes(original)
+                    if original is None:
+                        target.unlink()
+                    else:
+                        target.write_bytes(original)
                     with patch(
                         "src.data_prep.load_scientific_protocol",
                         return_value=protocol,
                     ):
-                        self.assertTrue(_recover_prepared_migration(roots))
+                        self.assertTrue(
+                            _recover_prepared_migration(roots, preparation_request())
+                        )
 
                     self.assertFalse((root / ".prepared-migration.json").exists())
                     self.assertTrue((root / ".prepared-current").is_symlink())
@@ -692,7 +757,7 @@ class ArtifactFlowTests(unittest.TestCase):
                 ),
                 self.assertRaisesRegex(ValueError, "generation validation"),
             ):
-                _recover_prepared_migration(roots)
+                _recover_prepared_migration(roots, preparation_request())
 
             self.assertEqual(calls, 4)
             self.assertIsNotNone(original_records)
@@ -711,7 +776,9 @@ class ArtifactFlowTests(unittest.TestCase):
                 "src.data_prep.load_scientific_protocol",
                 return_value=protocol,
             ):
-                self.assertTrue(_recover_prepared_migration(roots))
+                self.assertTrue(
+                    _recover_prepared_migration(roots, preparation_request())
+                )
 
             self.assertTrue((root / ".prepared-current").is_symlink())
             self.assertFalse((root / ".prepared-migration.json").exists())
@@ -1081,7 +1148,7 @@ class ArtifactFlowTests(unittest.TestCase):
 
             publication_attempts = 0
 
-            def publish_once_then_succeed(roots, stages):
+            def publish_once_then_succeed(roots, stages, request):
                 nonlocal publication_attempts
                 publication_attempts += 1
                 if publication_attempts == 1:
@@ -1096,8 +1163,8 @@ class ArtifactFlowTests(unittest.TestCase):
                         "src.data_prep.os.replace",
                         side_effect=fail_generation_switch,
                     ):
-                        return _publish_prepared_roots(roots, stages)
-                return _publish_prepared_roots(roots, stages)
+                        return _publish_prepared_roots(roots, stages, request)
+                return _publish_prepared_roots(roots, stages, request)
 
             with (
                 patch("src.data_prep.load_verified_imdb_dataset", return_value=dataset),
@@ -1183,18 +1250,12 @@ class ArtifactFlowTests(unittest.TestCase):
             generation_stage = generations / ".prepare-integration.staging"
             stages = {kind: generation_stage / kind for kind in roots}
             protocol = write_complete_prepared_stage(generation_stage)
-            for kind in ("client", "public"):
-                stage = stages[kind]
-                (stage / "selected.txt").write_text(
-                    f"generation-{kind}", encoding="utf-8"
-                )
-
             try:
                 with patch(
                     "src.data_prep.load_scientific_protocol",
                     return_value=protocol,
                 ):
-                    _publish_prepared_roots(roots, stages)
+                    _publish_prepared_roots(roots, stages, preparation_request())
 
                 selected_public = resolve_prepared_artifact_dir(
                     roots["public"], "public"
@@ -1203,12 +1264,11 @@ class ArtifactFlowTests(unittest.TestCase):
                     roots["client"], "client"
                 )
                 self.assertEqual(
-                    (selected_public / "selected.txt").read_text(encoding="utf-8"),
-                    "generation-public",
+                    {path.name for path in selected_public.iterdir()},
+                    {"manifest.json", "vocab.txt"},
                 )
                 self.assertEqual(
-                    (selected_client / "selected.txt").read_text(encoding="utf-8"),
-                    "generation-client",
+                    {path.name for path in selected_client.iterdir()}, {"client-0"}
                 )
 
                 compose = Path("compose.yaml").read_text(encoding="utf-8")
@@ -1224,10 +1284,7 @@ class ArtifactFlowTests(unittest.TestCase):
                 )
                 deployment_public = root / Path(public_source).relative_to("artifacts")
                 deployment_client = root / Path(client_source).relative_to("artifacts")
-                self.assertEqual(
-                    (deployment_public / "selected.txt").read_text(encoding="utf-8"),
-                    "generation-public",
-                )
+                self.assertEqual(deployment_public.resolve(), selected_public)
                 self.assertEqual(
                     (deployment_client / "reviews.jsonl").read_bytes(),
                     (selected_client / "client-0" / "reviews.jsonl").read_bytes(),
@@ -1311,7 +1368,7 @@ class ArtifactFlowTests(unittest.TestCase):
                 patch("src.data_prep.os.replace", side_effect=reject_pointer),
                 self.assertRaisesRegex(OSError, "pointer failure"),
             ):
-                _publish_prepared_roots(roots, stages)
+                _publish_prepared_roots(roots, stages, preparation_request())
 
             for kind, logical_root in roots.items():
                 with self.subTest(kind=kind):
@@ -1383,7 +1440,7 @@ class ArtifactFlowTests(unittest.TestCase):
                     os._exit(91)
 
             data_prep._publication_checkpoint = crash_at
-            data_prep._publish_prepared_roots(roots, stages)
+            data_prep._publish_prepared_roots(roots, stages, {"partitions": 1})
             """
         )
 
@@ -1403,8 +1460,6 @@ class ArtifactFlowTests(unittest.TestCase):
                 for name, logical_root in roots.items():
                     logical_root.mkdir()
                     (logical_root / "legacy.txt").write_text(name, encoding="utf-8")
-                for name in ("client", "public"):
-                    (stage / name / "new.txt").write_text(name, encoding="utf-8")
 
                 completed = subprocess.run(
                     [sys.executable, "-c", child_code, str(root), phase],
@@ -1419,15 +1474,19 @@ class ArtifactFlowTests(unittest.TestCase):
                     "src.data_prep.load_scientific_protocol",
                     return_value=protocol,
                 ):
-                    _recover_prepared_migration(roots)
+                    _recover_prepared_migration(roots, preparation_request())
                 for name, logical_root in roots.items():
                     selected = resolve_prepared_artifact_dir(logical_root, name)
                     if name == "evaluation":
                         self.assertTrue((selected / "manifest.json").is_file())
+                    elif name == "public":
+                        self.assertEqual(
+                            {path.name for path in selected.iterdir()},
+                            {"manifest.json", "vocab.txt"},
+                        )
                     else:
                         self.assertEqual(
-                            (selected / "new.txt").read_text(encoding="utf-8"),
-                            name,
+                            {path.name for path in selected.iterdir()}, {"client-0"}
                         )
                 archive = next((root / ".prepared-legacy").iterdir())
                 for name, logical_root in roots.items():
@@ -1452,7 +1511,6 @@ class ArtifactFlowTests(unittest.TestCase):
             for name, logical_root in roots.items():
                 logical_root.mkdir()
                 (logical_root / "legacy.txt").write_text(name, encoding="utf-8")
-            (stage / "public" / "new.txt").write_text("public", encoding="utf-8")
             child_code = textwrap.dedent(
                 """
                 import json
@@ -1478,7 +1536,7 @@ class ArtifactFlowTests(unittest.TestCase):
                         os._exit(92)
 
                 data_prep._publication_checkpoint = crash_at
-                data_prep._publish_prepared_roots(roots, stages)
+                data_prep._publish_prepared_roots(roots, stages, {"partitions": 1})
                 """
             )
             completed = subprocess.run(
@@ -1498,16 +1556,91 @@ class ArtifactFlowTests(unittest.TestCase):
                 patch("src.data_prep._validated_frameworks") as frameworks,
                 patch("src.data_prep.load_verified_imdb_dataset") as load_dataset,
             ):
-                prepare_all(4, roots["client"], roots["public"], roots["evaluation"])
+                prepare_all(1, roots["client"], roots["public"], roots["evaluation"])
 
             frameworks.assert_not_called()
             load_dataset.assert_not_called()
             self.assertEqual(
-                (
-                    resolve_prepared_artifact_dir(roots["public"], "public") / "new.txt"
-                ).read_text(encoding="utf-8"),
-                "public",
+                {
+                    path.name
+                    for path in resolve_prepared_artifact_dir(
+                        roots["public"], "public"
+                    ).iterdir()
+                },
+                {"manifest.json", "vocab.txt"},
             )
+
+    def test_prepare_retry_discards_mismatched_request_and_regenerates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            roots, stale_candidate, protocol = write_pending_prepared_recovery(
+                root, final=False
+            )
+            dataset = {
+                "train": {
+                    "text": ["bad", "good", "bad movie", "good movie"],
+                    "label": [0, 1, 0, 1],
+                },
+                "test": [
+                    {"text": "untouched negative", "label": 0},
+                    {"text": "untouched positive", "label": 1},
+                ],
+            }
+
+            class Vectorizer:
+                def get_vocabulary(self):
+                    return ["", "[UNK]", "good", "bad", "movie"]
+
+            with (
+                patch("src.data_prep._validated_frameworks") as frameworks,
+                patch(
+                    "src.data_prep.load_verified_imdb_dataset",
+                    return_value=dataset,
+                ) as load_dataset,
+                patch("src.data_prep.build_vectorizer", return_value=Vectorizer()),
+                patch("src.data_prep.load_scientific_protocol", return_value=protocol),
+                patch(
+                    "src.data_prep.dirichlet_split",
+                    return_value={index: [index] for index in range(4)},
+                ),
+            ):
+                prepare_all(4, roots["client"], roots["public"], roots["evaluation"])
+
+            frameworks.assert_called_once_with()
+            load_dataset.assert_called_once_with()
+            selected_client = resolve_prepared_artifact_dir(roots["client"], "client")
+            self.assertEqual(
+                {path.name for path in selected_client.iterdir()},
+                {f"client-{index}" for index in range(4)},
+            )
+            self.assertFalse(stale_candidate.exists())
+            self.assertFalse((root / ".prepared-migration.json").exists())
+            archive = next((root / ".prepared-legacy").iterdir())
+            for name, logical_root in roots.items():
+                self.assertEqual(
+                    (archive / logical_root.name / "legacy.txt").read_text(
+                        encoding="utf-8"
+                    ),
+                    name,
+                )
+
+    def test_schema_one_pending_preparation_is_rolled_back_not_recovered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            roots, candidate, _ = write_pending_prepared_recovery(
+                root, final=False, legacy_schema=True
+            )
+
+            self.assertFalse(_recover_prepared_migration(roots, preparation_request(4)))
+
+            self.assertFalse(candidate.exists())
+            self.assertFalse((root / ".prepared-migration.json").exists())
+            for name, logical_root in roots.items():
+                self.assertTrue(logical_root.is_dir())
+                self.assertFalse(logical_root.is_symlink())
+                self.assertEqual(
+                    (logical_root / "legacy.txt").read_text(encoding="utf-8"), name
+                )
 
     def test_preparation_rejects_overlapping_artifact_boundaries_before_loading(
         self,
@@ -1726,6 +1859,34 @@ class ArtifactFlowTests(unittest.TestCase):
                     )
                 self.assertEqual(external.read_text(encoding="utf-8"), "outside")
 
+    def test_public_manifest_rejects_unexpected_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            public = Path(tmpdir)
+            write_public_artifacts(public)
+            (public / "legacy-test-export.txt").write_text(
+                "external test sentinel", encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(ValueError, "unexpected files"):
+                load_app_manifest(
+                    public_artifact_dir=public, protocol=public_protocol()
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            public = Path(tmpdir)
+            (public / "legacy-test-export.txt").write_text(
+                "external test sentinel", encoding="utf-8"
+            )
+
+            class Vectorizer:
+                def get_vocabulary(self):
+                    return ["", "[UNK]", "good", "bad", "movie"]
+
+            with self.assertRaisesRegex(ValueError, "unexpected files"):
+                publish_public_artifacts(
+                    Vectorizer(), public, protocol=public_protocol()
+                )
+
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             clients = root / "clients"
@@ -1786,6 +1947,13 @@ class ArtifactFlowTests(unittest.TestCase):
             }
             lock = _acquire_preparation_lock(roots)
             try:
+                alternate_roots = {
+                    "client": root / "other-clients",
+                    "public": root / "other-public",
+                    "evaluation": root / "other-evaluation",
+                }
+                with self.assertRaisesRegex(RuntimeError, "already in progress"):
+                    _acquire_preparation_lock(alternate_roots)
                 with (
                     patch("src.data_prep.load_verified_imdb_dataset") as load_dataset,
                     self.assertRaisesRegex(RuntimeError, "already in progress"),
@@ -1797,6 +1965,19 @@ class ArtifactFlowTests(unittest.TestCase):
                         roots["evaluation"],
                     )
                 load_dataset.assert_not_called()
+
+                independent_root = root / "independent"
+                independent_roots = {
+                    "client": independent_root / "clients",
+                    "public": independent_root / "public",
+                    "evaluation": independent_root / "evaluation",
+                }
+                independent_root.mkdir()
+                independent_lock = _acquire_preparation_lock(independent_roots)
+                try:
+                    self.assertNotEqual(lock.path, independent_lock.path)
+                finally:
+                    independent_lock.release()
             finally:
                 lock.release()
 

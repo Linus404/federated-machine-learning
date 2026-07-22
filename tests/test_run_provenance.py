@@ -539,6 +539,100 @@ class RunProvenanceTests(unittest.TestCase):
                 {"upper": 1e308, "lower": -1e308},
             )
 
+    def test_embedded_dataset_identity_is_strict_canonical_and_schema_valid(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with (
+                patch(
+                    "src.run_provenance._code_revision",
+                    return_value={
+                        "commit": None,
+                        "dirty": None,
+                        "source": "unavailable",
+                    },
+                ),
+                patch(
+                    "src.run_provenance._environment_metadata",
+                    return_value=runtime_environment(),
+                ),
+            ):
+                base = json.loads(
+                    write_run_provenance_manifest(root / "base", {}).read_text(
+                        encoding="utf-8"
+                    )
+                )
+
+            identity = {
+                "id": "stanfordnlp/imdb",
+                "config": "plain_text",
+                "revision": "e6281661ce1c48d982bc483cf8a173c1bbeb5d31",
+                "datasets_version": "4.8.5",
+                "split": "train",
+                "rows": 25000,
+                "raw_parquet_sha256": "1" * 64,
+                "content_sha256": "2" * 64,
+            }
+            canonical_identity = json.dumps(
+                identity,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            base["dataset"] = {
+                **base["dataset"],
+                "identity": canonical_identity,
+                "checksums": {"manifest.json": "sha256:" + "3" * 64},
+                "status": "available",
+            }
+            valid_path = root / "valid.json"
+            valid_path.write_bytes(canonical_json_bytes(base))
+            self.assertEqual(
+                load_run_provenance_manifest(valid_path)["dataset"]["identity"],
+                canonical_identity,
+            )
+
+            hostile_identities = {
+                "nested duplicate": canonical_identity.replace(
+                    '"id":"stanfordnlp/imdb"',
+                    '"extra":{"value":1,"value":2},"id":"stanfordnlp/imdb"',
+                ),
+                "overflow": canonical_identity.replace('"rows":25000', '"rows":1e999'),
+                "nonfinite": canonical_identity.replace('"rows":25000', '"rows":NaN'),
+                "noncanonical": json.dumps(identity, ensure_ascii=False),
+                "malformed": canonical_identity[:-1],
+                "missing field": json.dumps(
+                    {key: value for key, value in identity.items() if key != "split"},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                "extra field": json.dumps(
+                    {**identity, "source": "test"},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                "wrong field type": json.dumps(
+                    {**identity, "rows": "25000"},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                "wrong field value": json.dumps(
+                    {**identity, "split": "test"},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            }
+            for name, hostile_identity in hostile_identities.items():
+                with self.subTest(name=name):
+                    hostile = json.loads(json.dumps(base))
+                    hostile["dataset"]["identity"] = hostile_identity
+                    hostile_path = root / f"hostile-{name.replace(' ', '-')}.json"
+                    hostile_path.write_bytes(canonical_json_bytes(hostile))
+                    with self.assertRaisesRegex(ValueError, "dataset.identity"):
+                        load_run_provenance_manifest(hostile_path)
+
     def test_loader_rejects_missing_and_invalid_nested_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

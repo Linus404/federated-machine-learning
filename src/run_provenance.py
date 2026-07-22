@@ -44,6 +44,16 @@ ENVIRONMENT_FIELDS = {
     "machine",
     "packages",
 }
+DATASET_IDENTITY_FIELDS = {
+    "id",
+    "config",
+    "revision",
+    "datasets_version",
+    "split",
+    "rows",
+    "raw_parquet_sha256",
+    "content_sha256",
+}
 
 
 def _required_nested_fields(
@@ -189,6 +199,80 @@ def _validate_seeds(seeds: Mapping[str, Any]) -> None:
         raise ValueError("run provenance manifest has an invalid seeds.code_defaults")
 
 
+def _canonical_dataset_identity(identity: Mapping[str, Any]) -> str:
+    """Serialize embedded public-dataset identity in its canonical string form.
+
+    Parameters
+    ----------
+    identity : mapping of str to Any
+        Validated public train-dataset identity.
+
+    Returns
+    -------
+    str
+        Compact, key-sorted JSON without insignificant whitespace.
+    """
+    return json.dumps(
+        dict(identity),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _validate_dataset_identity(identity: str) -> None:
+    """Strictly decode and validate embedded public-dataset identity JSON.
+
+    Parameters
+    ----------
+    identity : str
+        Canonical JSON string stored in ``dataset.identity``.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If decoding, schema, values, or canonical serialization are invalid.
+    """
+    try:
+        decoded = strict_json_loads(
+            identity, source="run provenance manifest dataset.identity"
+        )
+    except ValueError as error:
+        raise ValueError(
+            "run provenance manifest has an invalid dataset.identity"
+        ) from error
+    if not isinstance(decoded, Mapping) or set(decoded) != DATASET_IDENTITY_FIELDS:
+        raise ValueError("run provenance manifest has an invalid dataset.identity")
+    text_fields = {
+        "id",
+        "config",
+        "revision",
+        "datasets_version",
+    }
+    if (
+        any(
+            not isinstance(decoded[field], str) or not decoded[field]
+            for field in text_fields
+        )
+        or decoded["split"] != "train"
+        or type(decoded["rows"]) is not int
+        or decoded["rows"] < 1
+        or any(
+            not isinstance(decoded[field], str)
+            or len(decoded[field]) != 64
+            or any(character not in "0123456789abcdef" for character in decoded[field])
+            for field in ("raw_parquet_sha256", "content_sha256")
+        )
+        or identity != _canonical_dataset_identity(decoded)
+    ):
+        raise ValueError("run provenance manifest has an invalid dataset.identity")
+
+
 def _validate_dataset(dataset: Mapping[str, Any]) -> None:
     """Validate public-dataset provenance and the private-data boundary.
 
@@ -217,6 +301,8 @@ def _validate_dataset(dataset: Mapping[str, Any]) -> None:
     private_shards = dataset["private_client_shards"]
     if identity is not None and (not isinstance(identity, str) or not identity):
         raise ValueError("run provenance manifest has an invalid dataset.identity")
+    if identity is not None:
+        _validate_dataset_identity(identity)
     if not isinstance(checksums, Mapping) or any(
         not isinstance(name, str)
         or not name
@@ -489,13 +575,7 @@ def _dataset_metadata(
         }
 
     manifest = app_manifest or load_app_manifest(public_artifact_dir=public_dir)
-    identity = json.dumps(
-        json.loads(manifest.manifest_bytes)["dataset"],
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
+    identity = _canonical_dataset_identity(manifest.payload["dataset"])
     return {
         "identity": identity,
         "checksums": {

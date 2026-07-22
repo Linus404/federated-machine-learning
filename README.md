@@ -83,9 +83,10 @@ The first generation created over real legacy `artifacts/clients`,
 directories by same-filesystem rename into
 `artifacts/.prepared-legacy/<generation-id>/`. It then installs the logical paths
 as aliases to `.prepared-current`. Nothing in the legacy directories is deleted;
-inspect and remove an archived copy only while every consumer is stopped. Files
-not owned by preparation are also copied into the new public/client generation as
-before.
+inspect and remove an archived copy only while every consumer is stopped.
+Unrecognized legacy files remain only in that archive and are never copied into a
+selected client, public, or evaluation generation. Public generations expose
+exactly the canonical `manifest.json` and checksummed `vocab.txt` inventory.
 
 The server does not read raw shard files during training, but it receives each
 client's resulting model parameters, sample counts, training metrics, and

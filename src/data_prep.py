@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.metadata
-import json
 import os
 import shutil
 import stat
@@ -17,13 +16,18 @@ from src.protocol_runtime import validate_protocol_runtime
 
 import numpy as np
 
-from src.app_manifest import load_app_manifest, protocol_model_dimensions
+from src.app_manifest import (
+    PUBLIC_ARTIFACT_FILENAMES,
+    load_app_manifest,
+    protocol_model_dimensions,
+)
 from src.artifact_compatibility import (
     PUBLIC_ARTIFACT_SCHEMA_VERSION,
     canonical_json_bytes,
     read_regular_file,
     require_secure_artifact_platform,
     sha256_file,
+    strict_json_loads,
     write_json_atomically,
 )
 from src.contracts import (
@@ -48,7 +52,7 @@ from src.paths import (
     RunArtifactLock,
     default_evaluation_artifact_dir,
     default_public_artifact_dir,
-    resolve_prepared_artifact_dir,
+    validate_preparation_request,
 )
 from src.text_preprocessing import create_text_vectorizer
 
@@ -274,8 +278,7 @@ def _acquire_preparation_lock(roots: Mapping[str, Path]) -> RunArtifactLock:
     ValueError
         If the lock path is not a single-link regular file.
     """
-    material = "\0".join(str(roots[name]) for name in sorted(roots)).encode()
-    lock_name = f".fml-prepare-{hashlib.sha256(material).hexdigest()[:16]}.lock"
+    lock_name = ".fml-prepare.lock"
     lock_path = roots["client"].parent / lock_name
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -306,78 +309,6 @@ def _acquire_preparation_lock(roots: Mapping[str, Path]) -> RunArtifactLock:
             "Another artifact preparation is already in progress"
         ) from error
     return RunArtifactLock(lock_path, file)
-
-
-def _copy_preserved_children(source: Path, staging: Path, owned: set[str]) -> None:
-    """Copy allowed non-owned regular files into an owned staging root.
-
-    Parameters
-    ----------
-    source : pathlib.Path
-        Existing reusable output root.
-    staging : pathlib.Path
-        New owned staging directory.
-    owned : set of str
-        Generated filenames or prefixes, with prefixes ending in ``*``.
-
-    Returns
-    -------
-    None
-
-    Raises
-    ------
-    ValueError
-        If an existing child is linked, non-regular, or otherwise unsafe.
-    """
-    if not source.exists():
-        return
-    canonical_source = source.resolve(strict=True)
-    for child in source.iterdir():
-        is_owned = any(
-            child.name.startswith(name[:-1])
-            if name.endswith("*")
-            else child.name == name
-            for name in owned
-        )
-        if is_owned and child.is_dir():
-            _validate_client_directory(child, canonical_source)
-        else:
-            _validate_output_child(child, canonical_source, directory=False)
-        if is_owned:
-            continue
-        if not child.is_file():
-            raise ValueError(
-                f"non-owned artifact child must be a regular file: {child.name}"
-            )
-        _write_bytes_atomically(
-            staging / child.name,
-            read_regular_file(child, parent=canonical_source),
-        )
-
-
-def _preparation_source(root: Path, artifact_kind: str) -> Path:
-    """Select a legacy directory or the active immutable generation as input.
-
-    Parameters
-    ----------
-    root : pathlib.Path
-        Validated logical preparation root.
-    artifact_kind : str
-        Prepared artifact kind selected below an active generation.
-
-    Returns
-    -------
-    pathlib.Path
-        Existing source directory, or the absent logical root for a first run.
-
-    Raises
-    ------
-    ValueError
-        If an existing logical link does not safely select the active generation.
-    """
-    if root.is_symlink():
-        return resolve_prepared_artifact_dir(root, artifact_kind)
-    return root
 
 
 def _fsync_directory(path: Path) -> None:
@@ -474,11 +405,8 @@ def _validate_migration_journal(
     ValueError
         If the journal is malformed, noncanonical, or belongs to other roots.
     """
-    try:
-        payload = json.loads(journal_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError("prepared migration journal is invalid") from error
-    fields = {
+    payload = strict_json_loads(journal_bytes, source="prepared migration journal")
+    legacy_fields = {
         "schema_version",
         "generation_id",
         "stage_name",
@@ -487,7 +415,15 @@ def _validate_migration_journal(
         "alias_roots",
         "previous_pointer_target",
     }
-    if not isinstance(payload, dict) or set(payload) != fields:
+    if not isinstance(payload, dict):
+        raise ValueError("prepared migration journal must be an object")
+    schema_version = payload.get("schema_version")
+    fields = (
+        legacy_fields | {"preparation_request"}
+        if schema_version == PREPARED_GENERATION_SCHEMA_VERSION
+        else legacy_fields
+    )
+    if set(payload) != fields:
         raise ValueError("prepared migration journal has an invalid field set")
     generation_id = payload["generation_id"]
     try:
@@ -495,8 +431,8 @@ def _validate_migration_journal(
     except ValueError as error:
         raise ValueError("prepared migration journal generation is invalid") from error
     if (
-        type(payload["schema_version"]) is not int
-        or payload["schema_version"] != PREPARED_GENERATION_SCHEMA_VERSION
+        type(schema_version) is not int
+        or schema_version not in {1, PREPARED_GENERATION_SCHEMA_VERSION}
         or parsed_id is None
         or parsed_id.version != 4
         or str(parsed_id) != generation_id
@@ -514,6 +450,11 @@ def _validate_migration_journal(
     logical_roots = payload["logical_roots"]
     if not isinstance(logical_roots, dict) or logical_roots != expected_roots:
         raise ValueError("prepared migration journal does not match configured roots")
+    request = (
+        validate_preparation_request(payload["preparation_request"])
+        if schema_version == PREPARED_GENERATION_SCHEMA_VERSION
+        else None
+    )
     legacy_roots = payload["legacy_roots"]
     alias_roots = payload["alias_roots"]
     for value, name in (
@@ -549,10 +490,11 @@ def _validate_migration_journal(
         if previous_id.version != 4 or str(previous_id) != parts[1]:
             raise ValueError("prepared migration journal previous pointer is invalid")
     canonical = {
-        "schema_version": PREPARED_GENERATION_SCHEMA_VERSION,
+        "schema_version": schema_version,
         "generation_id": generation_id,
         "stage_name": stage_name,
         "logical_roots": expected_roots,
+        **({"preparation_request": request} if request is not None else {}),
         "legacy_roots": legacy_roots,
         "alias_roots": alias_roots,
         "previous_pointer_target": previous_target,
@@ -585,6 +527,92 @@ def _load_migration_journal(roots: Mapping[str, Path]) -> dict[str, Any] | None:
 
 class _PreparedGenerationValidationError(ValueError):
     """Identify recovery validation failures that must retain their journal."""
+
+
+def _validate_owned_generation_index(
+    generation: Path, transaction: Mapping[str, Any]
+) -> None:
+    """Validate ownership metadata before discarding a mismatched generation.
+
+    Parameters
+    ----------
+    generation : pathlib.Path
+        Sole staged or final candidate named by the durable journal.
+    transaction : mapping of str to Any
+        Validated current or legacy migration journal.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If the candidate is unsafe or its canonical index differs from the journal.
+    """
+    generations = generation.parent
+    if (
+        generations.is_symlink()
+        or not generations.is_dir()
+        or generation.is_symlink()
+        or not generation.is_dir()
+        or generation.resolve(strict=True).parent != generations.resolve(strict=True)
+    ):
+        raise ValueError("prepared migration generation is unsafe")
+    expected_index = {
+        "schema_version": transaction["schema_version"],
+        "generation_id": transaction["generation_id"],
+        "logical_roots": transaction["logical_roots"],
+        **(
+            {"preparation_request": transaction["preparation_request"]}
+            if "preparation_request" in transaction
+            else {}
+        ),
+    }
+    index_bytes = read_regular_file(
+        generation / "index.json", parent=generation.resolve(strict=True)
+    )
+    if index_bytes != canonical_json_bytes(expected_index):
+        raise ValueError("prepared migration generation index differs from its journal")
+
+
+def _discard_mismatched_prepared_migration(
+    roots: Mapping[str, Path], transaction: Mapping[str, Any]
+) -> None:
+    """Rollback and remove one journal-owned generation for another request.
+
+    Parameters
+    ----------
+    roots : mapping of str to pathlib.Path
+        Configured logical client, public, and evaluation roots.
+    transaction : mapping of str to Any
+        Validated migration journal whose request cannot satisfy the caller.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If ownership is ambiguous or the candidate cannot be safely identified.
+    """
+    parent = roots["client"].parent
+    generations = parent / PREPARED_GENERATIONS_DIRECTORY
+    stage = generations / transaction["stage_name"]
+    generation = generations / transaction["generation_id"]
+    candidates = [
+        candidate
+        for candidate in (stage, generation)
+        if candidate.exists() or candidate.is_symlink()
+    ]
+    if len(candidates) != 1:
+        raise ValueError("prepared migration generation ownership is ambiguous")
+    candidate = candidates[0]
+    _validate_owned_generation_index(candidate, transaction)
+    _rollback_prepared_migration(roots, transaction)
+    shutil.rmtree(candidate)
+    _fsync_directory(generations)
 
 
 def _validate_recovery_generation(
@@ -624,9 +652,14 @@ def _validate_recovery_generation(
             raise ValueError("prepared migration generation escapes its root")
 
         expected_index = {
-            "schema_version": PREPARED_GENERATION_SCHEMA_VERSION,
+            "schema_version": transaction["schema_version"],
             "generation_id": transaction["generation_id"],
             "logical_roots": transaction["logical_roots"],
+            **(
+                {"preparation_request": transaction["preparation_request"]}
+                if "preparation_request" in transaction
+                else {}
+            ),
         }
         index_bytes = read_regular_file(
             generation / "index.json", parent=canonical_generation
@@ -649,11 +682,8 @@ def _validate_recovery_generation(
 
         client_ids: list[int] = []
         for child in client_root.iterdir():
-            if child.is_symlink():
+            if child.is_symlink() or not child.is_dir():
                 raise ValueError("prepared migration client child is unsafe")
-            if not child.is_dir():
-                _validate_output_child(child, canonical_client_root, directory=False)
-                continue
             prefix, separator, identifier = child.name.partition("-")
             if (
                 prefix != "client"
@@ -665,7 +695,8 @@ def _validate_recovery_generation(
                 raise ValueError("prepared migration client directory is invalid")
             client_ids.append(int(identifier))
         client_ids.sort()
-        if client_ids != list(range(len(client_ids))) or not client_ids:
+        partitions = transaction["preparation_request"]["partitions"]
+        if client_ids != list(range(partitions)):
             raise ValueError("prepared migration client generation is incomplete")
 
         from src.local_training import load_client_shard_snapshot
@@ -694,13 +725,17 @@ def _validate_recovery_generation(
         ) from error
 
 
-def _recover_prepared_migration(roots: Mapping[str, Path]) -> bool:
+def _recover_prepared_migration(
+    roots: Mapping[str, Path], preparation_request: Mapping[str, Any]
+) -> bool:
     """Finish one journaled prepared-root publication after process death.
 
     Parameters
     ----------
     roots : mapping of str to pathlib.Path
         Configured logical client, public, and evaluation roots.
+    preparation_request : mapping of str to Any
+        Current artifact-affecting request that a recovered generation must match.
 
     Returns
     -------
@@ -714,6 +749,10 @@ def _recover_prepared_migration(roots: Mapping[str, Path]) -> bool:
     """
     transaction = _load_migration_journal(roots)
     if transaction is None:
+        return False
+    request = validate_preparation_request(preparation_request)
+    if transaction.get("preparation_request") != request:
+        _discard_mismatched_prepared_migration(roots, transaction)
         return False
     parent = roots["client"].parent
     generations = parent / PREPARED_GENERATIONS_DIRECTORY
@@ -905,7 +944,9 @@ def _rollback_prepared_migration(
 
 
 def _publish_prepared_roots(
-    roots: Mapping[str, Path], stages: Mapping[str, Path]
+    roots: Mapping[str, Path],
+    stages: Mapping[str, Path],
+    preparation_request: Mapping[str, Any],
 ) -> None:
     """Publish one immutable generation through a single atomic index update.
 
@@ -915,6 +956,8 @@ def _publish_prepared_roots(
         Logical client, public, and evaluation roots sharing one parent.
     stages : mapping of str to pathlib.Path
         Complete artifact directories within one owned generation staging root.
+    preparation_request : mapping of str to Any
+        Artifact-affecting request bound to the generation and recovery journal.
 
     Returns
     -------
@@ -929,6 +972,7 @@ def _publish_prepared_roots(
     """
     if set(roots) != {"client", "public", "evaluation"} or set(stages) != set(roots):
         raise ValueError("prepared publication requires all three artifact kinds")
+    request = validate_preparation_request(preparation_request)
     parents = {root.parent for root in roots.values()}
     stage_parents = {stage.parent for stage in stages.values()}
     if len(parents) != 1 or len(stage_parents) != 1:
@@ -946,6 +990,7 @@ def _publish_prepared_roots(
             "schema_version": PREPARED_GENERATION_SCHEMA_VERSION,
             "generation_id": generation_id,
             "logical_roots": {name: roots[name].name for name in sorted(roots)},
+            "preparation_request": request,
         },
         overwrite=False,
     )
@@ -968,6 +1013,7 @@ def _publish_prepared_roots(
         "generation_id": generation_id,
         "stage_name": generation_stage.name,
         "logical_roots": {name: roots[name].name for name in sorted(roots)},
+        "preparation_request": request,
         "legacy_roots": sorted(legacy_roots),
         "alias_roots": sorted(
             name for name, root in roots.items() if not root.is_symlink()
@@ -980,7 +1026,7 @@ def _publish_prepared_roots(
     _fsync_directory(parent)
     _publication_checkpoint("parent:journal-fsynced")
     try:
-        if not _recover_prepared_migration(roots):
+        if not _recover_prepared_migration(roots, request):
             raise RuntimeError("prepared migration journal disappeared")
     except _PreparedGenerationValidationError:
         _rollback_prepared_migration(roots, transaction, retain_journal=True)
@@ -1364,6 +1410,14 @@ def publish_public_artifacts(
     """
     output_path = _preflight_output_root(output_dir, "public", reusable=True)
     output_path.mkdir(parents=True, exist_ok=True)
+    unexpected = {
+        child.name for child in output_path.iterdir()
+    } - PUBLIC_ARTIFACT_FILENAMES
+    if unexpected:
+        raise ValueError(
+            "public artifact contains unexpected files: "
+            + ", ".join(sorted(unexpected))
+        )
     vocabulary = vectorizer.get_vocabulary()
     vocabulary_bytes = b"".join(item.encode("utf-8") + b"\n" for item in vocabulary)
     frozen = protocol or load_scientific_protocol()
@@ -1402,6 +1456,8 @@ def publish_public_artifacts(
         },
     }
     write_json_atomically(output_path / "manifest.json", manifest)
+    if {child.name for child in output_path.iterdir()} != PUBLIC_ARTIFACT_FILENAMES:
+        raise ValueError("public artifact contains unexpected files")
     return manifest
 
 
@@ -1434,6 +1490,7 @@ def prepare_all(
         If direct preparation runs outside the supported Linux platform.
     """
     require_secure_artifact_platform()
+    request = validate_preparation_request({"partitions": partitions})
     client_dir = _preflight_output_root(
         client_shard_dir, "client", reusable=True, allow_prepared_alias=True
     )
@@ -1480,7 +1537,7 @@ def prepare_all(
         ):
             raise ValueError("prepared generations root must be a regular directory")
         generations.mkdir(mode=0o755, exist_ok=True)
-        if _recover_prepared_migration(roots):
+        if _recover_prepared_migration(roots, request):
             return
         for residue in generations.glob(".prepare-*.staging"):
             residue_stat = residue.lstat()
@@ -1493,12 +1550,6 @@ def prepare_all(
         stages = {name: generation_stage / name for name in roots}
         stages["public"].mkdir()
         stages["client"].mkdir()
-        public_source = _preparation_source(public_dir, "public")
-        client_source = _preparation_source(client_dir, "client")
-        _copy_preserved_children(
-            public_source, stages["public"], {"manifest.json", "vocab.txt"}
-        )
-        _copy_preserved_children(client_source, stages["client"], {"client-*"})
 
         _validated_frameworks()
         dataset = load_verified_imdb_dataset()
@@ -1545,7 +1596,7 @@ def prepare_all(
         load_evaluation_artifact_snapshot(stages["evaluation"], protocol=protocol)
         for stage in stages.values():
             _fsync_directory_tree(stage)
-        _publish_prepared_roots(roots, stages)
+        _publish_prepared_roots(roots, stages, request)
         stages = {}
     finally:
         if stages:

@@ -22,6 +22,8 @@ from src.paths import (
     resolve_prepared_artifact_dir,
 )
 
+PUBLIC_ARTIFACT_FILENAMES = frozenset({"manifest.json", "vocab.txt"})
+
 
 @dataclass(frozen=True)
 class AppManifest:
@@ -182,6 +184,8 @@ def load_app_manifest(
                 supported_version=PUBLIC_ARTIFACT_SCHEMA_VERSION,
             )
         )
+        if {entry.name for entry in public_dir.iterdir()} != PUBLIC_ARTIFACT_FILENAMES:
+            raise ValueError("public artifact contains unexpected files")
         canonical_manifest = canonical_json_bytes(payload)
         if manifest_bytes != canonical_manifest:
             raise ValueError("public manifest bytes are not canonical")
@@ -220,14 +224,8 @@ def load_app_manifest(
     }:
         raise ValueError("public vocabulary contract is invalid")
     filename = vocabulary["filename"]
-    if (
-        not isinstance(filename, str)
-        or not filename
-        or Path(filename).is_absolute()
-        or Path(filename).name != filename
-        or filename in {".", ".."}
-    ):
-        raise ValueError("public vocabulary path must be a safe relative filename")
+    if not isinstance(filename, str) or filename != "vocab.txt":
+        raise ValueError("public vocabulary filename must be vocab.txt")
     if vocabulary["sha256"] != preprocessing["vocabulary_sha256"]:
         raise ValueError("public vocabulary SHA-256 differs from the frozen protocol")
     vocabulary_path = public_dir / filename
