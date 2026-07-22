@@ -784,6 +784,33 @@ def _validate_recovery_generation(
         ) from error
 
 
+def _validate_recovery_generation_or_rollback(
+    roots: Mapping[str, Path],
+    generation: Path,
+    transaction: Mapping[str, Any],
+) -> None:
+    """Validate a recovery candidate and restore journal-owned visibility on failure.
+
+    Parameters
+    ----------
+    roots : mapping of str to pathlib.Path
+        Configured logical client, public, and evaluation roots.
+    generation : pathlib.Path
+        Staged or final generation named by the durable journal.
+    transaction : mapping of str to Any
+        Validated durable migration transaction.
+
+    Returns
+    -------
+    None
+    """
+    try:
+        _validate_recovery_generation(generation, transaction)
+    except _PreparedGenerationValidationError:
+        _rollback_prepared_migration(roots, transaction, retain_journal=True)
+        raise
+
+
 def _recover_prepared_migration(
     roots: Mapping[str, Path], preparation_request: Mapping[str, Any]
 ) -> bool:
@@ -826,20 +853,19 @@ def _recover_prepared_migration(
     if stage_exists and generation_exists:
         raise ValueError("prepared migration has both staged and final generations")
     if stage_exists:
-        _validate_recovery_generation(stage, transaction)
+        _validate_recovery_generation_or_rollback(roots, stage, transaction)
         os.rename(stage, generation)
         _publication_checkpoint("generation:renamed")
     elif not generation_exists:
         raise ValueError("prepared migration generation data is missing")
     else:
-        _validate_recovery_generation(generation, transaction)
+        _validate_recovery_generation_or_rollback(roots, generation, transaction)
     _fsync_directory(generations)
     _publication_checkpoint("generations:fsynced")
-    _validate_recovery_generation(generation, transaction)
+    _validate_recovery_generation_or_rollback(roots, generation, transaction)
 
     legacy_names = transaction["legacy_roots"]
     archive: Path | None = None
-    roots_mutated = False
     if legacy_names:
         legacy_root = parent / PREPARED_LEGACY_DIRECTORY
         if legacy_root.is_symlink() or (
@@ -872,7 +898,6 @@ def _recover_prepared_migration(
                 if not root.is_dir():
                     raise ValueError(f"prepared {name} legacy root is unsafe")
                 os.rename(root, archived)
-                roots_mutated = True
                 _publication_checkpoint(f"archive:{name}:renamed")
             elif not root.is_symlink():
                 raise ValueError(f"prepared {name} legacy data is missing")
@@ -891,7 +916,6 @@ def _recover_prepared_migration(
             raise ValueError(f"{name} artifact root was not archived")
         else:
             root.symlink_to(expected, target_is_directory=True)
-            roots_mutated = True
             _publication_checkpoint(f"alias:{name}:created")
         _fsync_directory(parent)
         _publication_checkpoint(f"parent:alias-{name}-fsynced")
@@ -905,12 +929,7 @@ def _recover_prepared_migration(
     if current_target not in {previous_target, new_target}:
         raise ValueError("prepared generation pointer changed during migration")
     temporary_pointer = parent / f".{PREPARED_CURRENT_FILENAME}.{generation_id}.tmp"
-    try:
-        _validate_recovery_generation(generation, transaction)
-    except _PreparedGenerationValidationError:
-        if roots_mutated:
-            _rollback_prepared_migration(roots, transaction, retain_journal=True)
-        raise
+    _validate_recovery_generation_or_rollback(roots, generation, transaction)
     if current_target != new_target:
         if temporary_pointer.exists() or temporary_pointer.is_symlink():
             if (
@@ -923,13 +942,7 @@ def _recover_prepared_migration(
             _publication_checkpoint("pointer-temporary:created")
             _fsync_directory(parent)
             _publication_checkpoint("parent:pointer-temporary-fsynced")
-        try:
-            _validate_recovery_generation(generation, transaction)
-        except _PreparedGenerationValidationError:
-            temporary_pointer.unlink(missing_ok=True)
-            if roots_mutated:
-                _rollback_prepared_migration(roots, transaction, retain_journal=True)
-            raise
+        _validate_recovery_generation_or_rollback(roots, generation, transaction)
         os.replace(temporary_pointer, pointer)
         _publication_checkpoint("pointer:replaced")
     else:
@@ -965,6 +978,11 @@ def _rollback_prepared_migration(
     Returns
     -------
     None
+
+    Raises
+    ------
+    ValueError
+        If rollback encounters content whose ownership is not proven by the journal.
     """
     parent = roots["client"].parent
     generation_id = transaction["generation_id"]
@@ -972,37 +990,94 @@ def _rollback_prepared_migration(
     new_target = _migration_target(generation_id)
     previous_target = transaction["previous_pointer_target"]
     temporary_pointer = parent / f".{PREPARED_CURRENT_FILENAME}.{generation_id}.tmp"
-    temporary_pointer.unlink(missing_ok=True)
-    if pointer.is_symlink() and os.readlink(pointer) == new_target:
+    ambiguous: list[str] = []
+    if temporary_pointer.is_symlink():
+        if os.readlink(temporary_pointer) == new_target:
+            temporary_pointer.unlink()
+        else:
+            ambiguous.append("temporary pointer")
+    elif temporary_pointer.exists():
+        ambiguous.append("temporary pointer")
+
+    current_target = os.readlink(pointer) if pointer.is_symlink() else None
+    if current_target == new_target:
         if previous_target is None:
             pointer.unlink()
         else:
             rollback_pointer = parent / f".{PREPARED_CURRENT_FILENAME}.rollback.tmp"
-            rollback_pointer.unlink(missing_ok=True)
-            rollback_pointer.symlink_to(previous_target, target_is_directory=True)
-            os.replace(rollback_pointer, pointer)
+            if rollback_pointer.is_symlink():
+                if os.readlink(rollback_pointer) != previous_target:
+                    ambiguous.append("rollback pointer")
+                else:
+                    os.replace(rollback_pointer, pointer)
+            elif rollback_pointer.exists():
+                ambiguous.append("rollback pointer")
+            else:
+                rollback_pointer.symlink_to(previous_target, target_is_directory=True)
+                os.replace(rollback_pointer, pointer)
+    elif pointer.is_symlink():
+        if current_target != previous_target:
+            ambiguous.append("generation pointer")
+    elif pointer.exists() or previous_target is not None:
+        ambiguous.append("generation pointer")
 
     for name in reversed(transaction["alias_roots"]):
         root = roots[name]
         expected = Path(PREPARED_CURRENT_FILENAME) / name
-        if root.is_symlink() and Path(os.readlink(root)) == expected:
-            root.unlink()
+        if root.is_symlink():
+            if Path(os.readlink(root)) == expected:
+                root.unlink()
+            else:
+                ambiguous.append(f"{name} artifact root")
 
-    archive = parent / PREPARED_LEGACY_DIRECTORY / generation_id
-    if archive.is_dir() and not archive.is_symlink():
+    legacy_root = parent / PREPARED_LEGACY_DIRECTORY
+    archive = legacy_root / generation_id
+    archive_is_safe = not legacy_root.is_symlink() and (
+        not legacy_root.exists() or legacy_root.is_dir()
+    )
+    if not archive_is_safe:
+        ambiguous.append("legacy archive root")
+    elif archive.is_symlink() or (archive.exists() and not archive.is_dir()):
+        ambiguous.append("legacy transaction archive")
+        archive_is_safe = False
+
+    if archive_is_safe:
         for name in reversed(transaction["legacy_roots"]):
             root = roots[name]
             archived = archive / root.name
-            if archived.is_dir() and not archived.is_symlink() and not root.exists():
+            root_present = root.exists() or root.is_symlink()
+            archived_present = archived.exists() or archived.is_symlink()
+            if archived.is_symlink() or (archived_present and not archived.is_dir()):
+                ambiguous.append(f"{name} legacy archive")
+            elif archived_present and not root_present:
                 os.rename(archived, root)
+            elif archived_present:
+                ambiguous.append(f"{name} legacy root")
+            elif root.is_symlink() or (root_present and not root.is_dir()):
+                ambiguous.append(f"{name} legacy root")
+            elif not root_present:
+                ambiguous.append(f"{name} legacy data")
+
+        for name in set(transaction["alias_roots"]) - set(transaction["legacy_roots"]):
+            root = roots[name]
+            if root.exists() or root.is_symlink():
+                ambiguous.append(f"{name} artifact root")
+
+    if archive_is_safe and archive.is_dir():
         _fsync_directory(archive)
         _fsync_directory(parent)
         if not any(archive.iterdir()):
             archive.rmdir()
-            _fsync_directory(archive.parent)
+            _fsync_directory(legacy_root)
+    _fsync_directory(parent)
+    if ambiguous:
+        raise ValueError(
+            "prepared migration rollback ownership is ambiguous: "
+            + ", ".join(sorted(set(ambiguous)))
+        )
     if not retain_journal:
         (parent / PREPARED_MIGRATION_FILENAME).unlink(missing_ok=True)
-    _fsync_directory(parent)
+        _fsync_directory(parent)
 
 
 def _publish_prepared_roots(
@@ -1091,7 +1166,6 @@ def _publish_prepared_roots(
         if not _recover_prepared_migration(roots, request):
             raise RuntimeError("prepared migration journal disappeared")
     except _PreparedGenerationValidationError:
-        _rollback_prepared_migration(roots, transaction, retain_journal=True)
         raise
     except BaseException:
         _rollback_prepared_migration(roots, transaction)

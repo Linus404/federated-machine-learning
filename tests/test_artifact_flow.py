@@ -325,6 +325,64 @@ def write_pending_prepared_recovery(
     return roots, candidate, protocol
 
 
+CRASHING_PREPARED_PUBLICATION = textwrap.dedent(
+    """
+    import json
+    import os
+    import sys
+    from pathlib import Path
+
+    import src.data_prep as data_prep
+
+    root = Path(sys.argv[1])
+    phase = sys.argv[2]
+    roots = {
+        "client": root / "clients",
+        "public": root / "public",
+        "evaluation": root / "evaluation",
+    }
+    stage = root / ".prepared-generations" / ".prepare-crash.staging"
+    stages = {name: stage / name for name in roots}
+    protocol = json.loads((root / "protocol.json").read_text(encoding="utf-8"))
+    data_prep.load_scientific_protocol = lambda: protocol
+
+    def crash_at(value):
+        if value == phase:
+            os._exit(91)
+
+    data_prep._publication_checkpoint = crash_at
+    data_prep._publish_prepared_roots(roots, stages, {"partitions": 1})
+    """
+)
+
+
+def crash_prepared_publication(root: Path, phase: str) -> None:
+    """Terminate prepared publication at one durable checkpoint.
+
+    Parameters
+    ----------
+    root : pathlib.Path
+        Disposable artifact parent containing a complete crash staging tree.
+    phase : str
+        Publication checkpoint at which the child must terminate.
+
+    Returns
+    -------
+    None
+    """
+    completed = subprocess.run(
+        [sys.executable, "-c", CRASHING_PREPARED_PUBLICATION, str(root), phase],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ.copy(),
+    )
+    if completed.returncode != 91:
+        raise AssertionError(
+            f"publication did not crash at {phase}: {completed.stderr}"
+        )
+
+
 def write_client_artifacts(
     path: Path,
     manifest: AppManifest,
@@ -838,6 +896,294 @@ class ArtifactFlowTests(unittest.TestCase):
                         self.assertEqual(
                             selected.parent.name,
                             "4c03285d-83b3-45d1-bc29-00a516eeef93",
+                        )
+
+    def test_corrupt_first_migration_recovery_rolls_back_every_archive_alias_checkpoint(
+        self,
+    ) -> None:
+        phases = [
+            checkpoint
+            for name in ("client", "evaluation", "public")
+            for checkpoint in (
+                f"archive:{name}:renamed",
+                f"archive:{name}:fsynced",
+                f"parent:archive-{name}-fsynced",
+            )
+        ]
+        phases.extend(
+            checkpoint
+            for name in ("client", "evaluation", "public")
+            for checkpoint in (
+                f"alias:{name}:created",
+                f"parent:alias-{name}-fsynced",
+            )
+        )
+
+        for phase in phases:
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                roots = {
+                    "client": root / "clients",
+                    "public": root / "public",
+                    "evaluation": root / "evaluation",
+                }
+                stage = root / ".prepared-generations" / ".prepare-crash.staging"
+                protocol = write_complete_prepared_stage(stage)
+                (root / "protocol.json").write_text(
+                    json.dumps(protocol), encoding="utf-8"
+                )
+                for name, logical_root in roots.items():
+                    logical_root.mkdir()
+                    (logical_root / "legacy.txt").write_text(name, encoding="utf-8")
+
+                crash_prepared_publication(root, phase)
+                journal_path = root / ".prepared-migration.json"
+                journal_bytes = journal_path.read_bytes()
+                journal = json.loads(journal_bytes)
+                candidate = root / ".prepared-generations" / journal["generation_id"]
+                self.assertTrue(candidate.is_dir())
+                self.assertFalse(stage.exists())
+                records = candidate / "evaluation" / "test.jsonl"
+                original_records = records.read_bytes()
+                records.write_bytes(b"corrupt after process death\n")
+
+                for retry in range(2):
+                    with (
+                        self.subTest(retry=retry),
+                        patch(
+                            "src.data_prep.load_scientific_protocol",
+                            return_value=protocol,
+                        ),
+                        self.assertRaisesRegex(ValueError, "generation validation"),
+                    ):
+                        _recover_prepared_migration(roots, preparation_request())
+
+                    self.assertEqual(journal_path.read_bytes(), journal_bytes)
+                    self.assertTrue(candidate.is_dir())
+                    self.assertEqual(
+                        records.read_bytes(), b"corrupt after process death\n"
+                    )
+                    pointer = root / ".prepared-current"
+                    self.assertFalse(pointer.exists() or pointer.is_symlink())
+                    for name, logical_root in roots.items():
+                        self.assertTrue(logical_root.is_dir())
+                        self.assertFalse(logical_root.is_symlink())
+                        self.assertEqual(
+                            (logical_root / "legacy.txt").read_text(encoding="utf-8"),
+                            name,
+                        )
+
+                records.write_bytes(original_records)
+                with patch(
+                    "src.data_prep.load_scientific_protocol", return_value=protocol
+                ):
+                    self.assertTrue(
+                        _recover_prepared_migration(roots, preparation_request())
+                    )
+                self.assertTrue((root / ".prepared-current").is_symlink())
+                self.assertFalse(journal_path.exists())
+
+    def test_corrupt_process_death_recovery_preserves_absent_and_previous_pointers(
+        self,
+    ) -> None:
+        cases = (
+            (False, "parent:journal-fsynced", "stage"),
+            (False, "generations:fsynced", "final"),
+            (True, "parent:journal-fsynced", "stage"),
+            (True, "generations:fsynced", "final"),
+        )
+        for has_previous, phase, candidate_form in cases:
+            with (
+                self.subTest(
+                    has_previous=has_previous,
+                    phase=phase,
+                    candidate_form=candidate_form,
+                ),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                if has_previous:
+                    roots, _, protocol = write_pending_prepared_recovery(
+                        root, final=False
+                    )
+                    with patch(
+                        "src.data_prep.load_scientific_protocol",
+                        return_value=protocol,
+                    ):
+                        self.assertTrue(
+                            _recover_prepared_migration(roots, preparation_request())
+                        )
+                    pointer = root / ".prepared-current"
+                    previous_target = os.readlink(pointer)
+                    previous_roots = {
+                        name: resolve_prepared_artifact_dir(logical_root, name)
+                        for name, logical_root in roots.items()
+                    }
+                else:
+                    roots = {
+                        "client": root / "clients",
+                        "public": root / "public",
+                        "evaluation": root / "evaluation",
+                    }
+                    for name, logical_root in roots.items():
+                        logical_root.mkdir()
+                        (logical_root / "legacy.txt").write_text(name, encoding="utf-8")
+                    previous_target = None
+                    previous_roots = {}
+
+                stage = root / ".prepared-generations" / ".prepare-crash.staging"
+                protocol = write_complete_prepared_stage(stage)
+                (root / "protocol.json").write_text(
+                    json.dumps(protocol), encoding="utf-8"
+                )
+                crash_prepared_publication(root, phase)
+
+                journal_path = root / ".prepared-migration.json"
+                journal_bytes = journal_path.read_bytes()
+                journal = json.loads(journal_bytes)
+                final = root / ".prepared-generations" / journal["generation_id"]
+                candidate = stage if candidate_form == "stage" else final
+                self.assertTrue(candidate.is_dir())
+                self.assertFalse(
+                    (final if candidate_form == "stage" else stage).exists()
+                )
+                records = candidate / "evaluation" / "test.jsonl"
+                original_records = records.read_bytes()
+                records.write_bytes(b"corrupt after process death\n")
+
+                for retry in range(2):
+                    with (
+                        self.subTest(retry=retry),
+                        patch(
+                            "src.data_prep.load_scientific_protocol",
+                            return_value=protocol,
+                        ),
+                        self.assertRaisesRegex(ValueError, "generation validation"),
+                    ):
+                        _recover_prepared_migration(roots, preparation_request())
+
+                    self.assertEqual(journal_path.read_bytes(), journal_bytes)
+                    self.assertTrue(candidate.is_dir())
+                    self.assertEqual(
+                        records.read_bytes(), b"corrupt after process death\n"
+                    )
+                    pointer = root / ".prepared-current"
+                    if previous_target is None:
+                        self.assertFalse(pointer.exists() or pointer.is_symlink())
+                        for name, logical_root in roots.items():
+                            self.assertEqual(
+                                (logical_root / "legacy.txt").read_text(
+                                    encoding="utf-8"
+                                ),
+                                name,
+                            )
+                    else:
+                        self.assertEqual(os.readlink(pointer), previous_target)
+                        for name, logical_root in roots.items():
+                            self.assertEqual(
+                                resolve_prepared_artifact_dir(logical_root, name),
+                                previous_roots[name],
+                            )
+
+                records.write_bytes(original_records)
+                with patch(
+                    "src.data_prep.load_scientific_protocol", return_value=protocol
+                ):
+                    self.assertTrue(
+                        _recover_prepared_migration(roots, preparation_request())
+                    )
+                self.assertNotEqual(
+                    os.readlink(root / ".prepared-current"), previous_target
+                )
+                self.assertFalse(journal_path.exists())
+
+    def test_corrupt_process_death_recovery_refuses_ambiguous_rollback_ownership(
+        self,
+    ) -> None:
+        cases = (
+            ("alias:client:created", "logical-root"),
+            ("alias:public:created", "control-residue"),
+        )
+        for phase, ambiguity in cases:
+            with (
+                self.subTest(phase=phase, ambiguity=ambiguity),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                roots = {
+                    "client": root / "clients",
+                    "public": root / "public",
+                    "evaluation": root / "evaluation",
+                }
+                stage = root / ".prepared-generations" / ".prepare-crash.staging"
+                protocol = write_complete_prepared_stage(stage)
+                (root / "protocol.json").write_text(
+                    json.dumps(protocol), encoding="utf-8"
+                )
+                for name, logical_root in roots.items():
+                    logical_root.mkdir()
+                    (logical_root / "legacy.txt").write_text(name, encoding="utf-8")
+                crash_prepared_publication(root, phase)
+
+                journal_path = root / ".prepared-migration.json"
+                journal_bytes = journal_path.read_bytes()
+                journal = json.loads(journal_bytes)
+                candidate = root / ".prepared-generations" / journal["generation_id"]
+                records = candidate / "evaluation" / "test.jsonl"
+                records.write_bytes(b"corrupt after process death\n")
+                if ambiguity == "logical-root":
+                    external = roots["evaluation"]
+                    external.mkdir()
+                    ambiguous_path = external / "external.txt"
+                else:
+                    ambiguous_path = (
+                        root / f"..prepared-current.{journal['generation_id']}.tmp"
+                    )
+                ambiguous_path.write_bytes(b"externally owned\n")
+
+                for retry in range(2):
+                    with (
+                        self.subTest(retry=retry),
+                        patch(
+                            "src.data_prep.load_scientific_protocol",
+                            return_value=protocol,
+                        ),
+                        self.assertRaisesRegex(
+                            ValueError, "rollback ownership is ambiguous"
+                        ),
+                    ):
+                        _recover_prepared_migration(roots, preparation_request())
+
+                    self.assertEqual(ambiguous_path.read_bytes(), b"externally owned\n")
+                    self.assertEqual(journal_path.read_bytes(), journal_bytes)
+                    self.assertTrue(candidate.is_dir())
+                    self.assertEqual(
+                        records.read_bytes(), b"corrupt after process death\n"
+                    )
+                    pointer = root / ".prepared-current"
+                    self.assertFalse(pointer.exists() or pointer.is_symlink())
+                    for name in ("client", "public"):
+                        self.assertEqual(
+                            (roots[name] / "legacy.txt").read_text(encoding="utf-8"),
+                            name,
+                        )
+                    if ambiguity == "logical-root":
+                        archive = (
+                            root
+                            / ".prepared-legacy"
+                            / journal["generation_id"]
+                            / roots["evaluation"].name
+                        )
+                        self.assertEqual(
+                            (archive / "legacy.txt").read_text(encoding="utf-8"),
+                            "evaluation",
+                        )
+                    else:
+                        self.assertEqual(
+                            (roots["evaluation"] / "legacy.txt").read_text(
+                                encoding="utf-8"
+                            ),
+                            "evaluation",
                         )
 
     def test_recovery_revalidates_immediately_before_pointer_replacement(
