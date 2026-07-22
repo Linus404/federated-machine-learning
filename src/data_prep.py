@@ -54,6 +54,51 @@ from src.paths import (
 from src.text_preprocessing import create_text_vectorizer
 
 
+def _validate_absolute_output_ancestors(
+    output_dir: str | Path, artifact_name: str
+) -> Path | None:
+    """Validate existing ancestors of an absolute output path without following links.
+
+    Parameters
+    ----------
+    output_dir : str or pathlib.Path
+        Configured artifact root.
+    artifact_name : str
+        Human-readable artifact kind used in errors.
+
+    Returns
+    -------
+    pathlib.Path or None
+        Lexically normalized absolute path, or ``None`` for a relative path.
+
+    Raises
+    ------
+    ValueError
+        If an existing ancestor is a symlink or not a directory.
+    """
+    candidate = Path(output_dir).expanduser()
+    if not candidate.is_absolute():
+        return None
+    output_path = Path(os.path.abspath(candidate))
+    anchor = Path(output_path.anchor)
+    current = anchor
+    for component in output_path.parent.parts[len(anchor.parts) :]:
+        current /= component
+        try:
+            component_stat = current.lstat()
+        except FileNotFoundError:
+            break
+        except OSError as error:
+            raise ValueError(
+                f"{artifact_name} artifact path component is unsafe"
+            ) from error
+        if not stat.S_ISDIR(component_stat.st_mode):
+            raise ValueError(
+                f"{artifact_name} artifact path component must be a regular directory"
+            )
+    return output_path
+
+
 def _preflight_output_root(
     output_dir: str | Path,
     artifact_name: str,
@@ -86,7 +131,12 @@ def _preflight_output_root(
     ValueError
         If the root or its existing parent is a symlink or invalid path type.
     """
+    lexical_path = _validate_absolute_output_ancestors(output_dir, artifact_name)
     output_path = resolve_dir(output_dir)
+    if lexical_path is not None and output_path != lexical_path:
+        raise ValueError(
+            f"{artifact_name} artifact path component must be a regular directory"
+        )
     if output_path.is_symlink():
         expected = Path(PREPARED_CURRENT_FILENAME) / artifact_name
         if not (

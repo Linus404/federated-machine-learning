@@ -22,6 +22,7 @@ from src.artifact_compatibility import (
 from src.contracts import canonical_client_row_bytes, client_shard_metadata
 from src.data_prep import (
     _acquire_preparation_lock,
+    _preflight_output_root,
     _publish_prepared_roots,
     _recover_prepared_migration,
     _validate_recovery_generation,
@@ -887,6 +888,40 @@ class ArtifactFlowTests(unittest.TestCase):
                         outputs["evaluation"],
                     )
                 load_dataset.assert_not_called()
+
+    def test_preflight_rejects_absolute_symlinked_ancestor_without_mutation(
+        self,
+    ) -> None:
+        for artifact_name, output_name in (
+            ("client", "clients"),
+            ("public", "public"),
+            ("evaluation", "evaluation"),
+        ):
+            with (
+                self.subTest(artifact_name=artifact_name),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                external = root / "external"
+                external.mkdir()
+                marker = external / "must-survive"
+                marker.write_text("external", encoding="utf-8")
+                alias = root / "alias"
+                try:
+                    alias.symlink_to(external, target_is_directory=True)
+                except OSError as error:
+                    self.skipTest(f"directory symlinks are unavailable: {error}")
+
+                with self.assertRaisesRegex(ValueError, "path component"):
+                    _preflight_output_root(
+                        alias / output_name,
+                        artifact_name,
+                        reusable=True,
+                        allow_prepared_alias=True,
+                    )
+
+                self.assertEqual(marker.read_text(encoding="utf-8"), "external")
+                self.assertFalse((external / output_name).exists())
 
     def test_public_publisher_rejects_symlink_without_external_writes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

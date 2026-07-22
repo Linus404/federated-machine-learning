@@ -129,6 +129,35 @@ class ArtifactHistoryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "invalid run_id"):
                 resolve_current_run_dir(root)
 
+    def test_current_index_rejects_boolean_schema_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "current.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": True,
+                        "run_id": RUN_IDS[0],
+                        "artifact_manifest_checksum": "sha256:" + "0" * 64,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "invalid schema_version"):
+                resolve_current_run_dir(root)
+
+    def test_dangling_current_index_symlink_is_not_legacy_absence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            pointer = root / "current.json"
+            try:
+                pointer.symlink_to("missing-current.json")
+            except OSError as error:
+                self.skipTest(f"file symlinks are unavailable: {error}")
+
+            with self.assertRaisesRegex(ValueError, "invalid current-run index"):
+                resolve_current_run_dir(root)
+
     def test_retention_refuses_a_symlinked_runs_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir) / "root"

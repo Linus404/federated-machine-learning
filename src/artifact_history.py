@@ -174,7 +174,7 @@ def _load_current_index(artifact_root: str | Path) -> Mapping[str, Any] | None:
     """
     root, _ = _history_paths(artifact_root)
     path = root / CURRENT_RUN_FILENAME
-    if not path.exists():
+    if not path.exists() and not path.is_symlink():
         return None
     try:
         payload = json.loads(read_regular_file(path, parent=root).decode("utf-8"))
@@ -182,7 +182,10 @@ def _load_current_index(artifact_root: str | Path) -> Mapping[str, Any] | None:
         raise ValueError(f"invalid current-run index: {path}") from error
     if not isinstance(payload, Mapping):
         raise ValueError("current-run index must be a JSON object")
-    if payload.get("schema_version") != ARTIFACT_SCHEMA_VERSION:
+    schema_version = payload.get("schema_version")
+    if type(schema_version) is not int:
+        raise ValueError("current-run index has an invalid schema_version")
+    if schema_version != ARTIFACT_SCHEMA_VERSION:
         raise ValueError("current-run index has an unsupported schema_version")
     run_id = payload.get("run_id")
     checksum = payload.get("artifact_manifest_checksum")
