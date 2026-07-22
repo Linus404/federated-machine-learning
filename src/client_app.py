@@ -38,7 +38,7 @@ def _proximal_penalty(local_weights: list[Any], global_weights: list[Any]) -> An
 
 
 class SentimentClient(NumPyClient):
-    """Flower client that tokenizes and trains on its raw private shard."""
+    """Flower client that tokenizes and trains on its client-scoped shard."""
 
     def __init__(
         self,
@@ -70,7 +70,7 @@ class SentimentClient(NumPyClient):
         self.model = build_model_from_manifest(manifest)
 
     def _add_update_noise(self, weights_before: list, weights_after: list) -> list:
-        """Clip and noise the weight update for an illustrative ablation."""
+        """Apply illustrative update-noise ablation, not formal differential privacy."""
         noisy_weights = []
 
         for w_before, w_after in zip(weights_before, weights_after):
@@ -116,7 +116,7 @@ class SentimentClient(NumPyClient):
     def fit(
         self, parameters: NDArrays, config: dict[str, Scalar]
     ) -> tuple[NDArrays, int, dict[str, Scalar]]:
-        """Train locally and optionally apply illustrative update noise."""
+        """Train with illustrative update-noise, not formal differential privacy."""
         self.model.set_weights(parameters)
         if PROXIMAL_MU_CONFIG_KEY in config:
             self._configure_proximal_loss(float(config[PROXIMAL_MU_CONFIG_KEY]))

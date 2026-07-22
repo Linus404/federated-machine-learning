@@ -58,7 +58,7 @@ def weighted_average(metrics: list[tuple[int, dict[str, float]]]) -> dict[str, f
 
 
 class SentimentServer(FedProx):
-    """FedProx (non-IID robust) + Huber aggregation (Byzantine robust) + artifact saving."""
+    """Run FedProx with optional experimental Huber aggregation and artifacts."""
 
     def __init__(
         self,

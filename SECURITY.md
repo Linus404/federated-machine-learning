@@ -5,6 +5,18 @@
 This project has not published stable releases. Security fixes are applied to
 the current `main` branch; older commits and forks are not supported.
 
+## System security posture
+
+The supported runtime is a local research demo, not a production security
+boundary. This repository does not implement TLS, client or SuperNode
+authentication, secure aggregation, encryption at rest, or formal differential
+privacy. `use-update-noise` is an illustrative ablation, not formal differential
+privacy, and provides no privacy accounting or epsilon/delta guarantee.
+
+Read [THREAT_MODEL.md](THREAT_MODEL.md) for the actual data flow, trusted and
+untrusted components, information exposed through parameters, metrics, and
+artifacts, and controls required before production or privacy claims.
+
 ## Report a vulnerability
 
 Do not open a public issue, pull request, discussion, or proof-of-concept for a

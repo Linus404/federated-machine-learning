@@ -55,7 +55,7 @@ def client_shard_metadata(
     manifest_checksum: str | None = None,
     extra_metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build authoritative metadata for one private client shard.
+    """Build authoritative metadata for one client-scoped shard.
 
     Parameters
     ----------

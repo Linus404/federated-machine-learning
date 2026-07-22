@@ -190,7 +190,7 @@ def prepare_all(
     client_shard_dir: str | Path,
     public_artifact_dir: str | Path,
 ) -> None:
-    """Create raw private client shards and shared public artifacts."""
+    """Centrally create client-scoped demo shards and public artifacts."""
     texts, labels = load_imdb_training_data()
     vectorizer = build_vectorizer(texts)
     manifest = publish_public_artifacts(vectorizer, public_artifact_dir)

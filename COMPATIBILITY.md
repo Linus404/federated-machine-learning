@@ -18,7 +18,8 @@ The current artifact schema is `1`. Every persisted contract carries
 `schema_version: 1`:
 
 - `artifacts/public/manifest.json` describes the vocabulary and model dimensions.
-- Each `client-N/client_metadata.json` describes its private raw-review shard.
+- Each `client-N/client_metadata.json` describes its client-scoped raw-review
+  shard, which `src.data_prep` creates centrally for the demo.
 - Each completed `server/runs/<run_id>` directory has `artifact_manifest.json`,
   which versions the Keras model and both metrics CSV layouts as one consistent,
   checksummed artifact set.

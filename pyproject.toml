@@ -44,6 +44,7 @@ client-data-dir = "artifacts/clients/client-{partition}"
 proximal-mu = 0.1
 use-huber = false
 huber-threshold = 10.0
+# Illustrative update-noise ablation only; not formal differential privacy.
 use-update-noise = false
 update-noise-l2-norm-clip = 1.0
 update-noise-multiplier = 0.001
