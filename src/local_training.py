@@ -8,7 +8,7 @@ import warnings
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, TypeAlias
+from typing import Any, Mapping, Sequence, TypeAlias
 
 from src.protocol_runtime import validate_protocol_runtime
 
@@ -407,18 +407,47 @@ def _tokenize_client_shard(
     PartitionSplit
         Tokenized training and validation arrays.
     """
-    vectorizer = create_text_vectorizer(
-        sequence_length=manifest.payload["sequence_length"],
-        vocabulary=manifest.vocabulary_terms[2:],
-    )
-    x = np.asarray(vectorizer([row[1] for row in snapshot.rows]), dtype="int32")
-    y = np.asarray([row[2] for row in snapshot.rows], dtype="float32")
+    x, y = tokenize_rows(snapshot.rows, manifest)
 
     train_indices, validation_indices = _stratified_split_indices(y, validation_split)
 
     return (
         (x[train_indices], y[train_indices]),
         (x[validation_indices], y[validation_indices]),
+    )
+
+
+def tokenize_rows(
+    rows: Sequence[tuple[str, str, int]], manifest: AppManifest
+) -> ArrayPair:
+    """Tokenize validated review rows with the frozen public vocabulary.
+
+    Parameters
+    ----------
+    rows : sequence of tuple
+        Validated ``(row_id, text, label)`` records in evaluation order.
+    manifest : AppManifest
+        Public vocabulary and model contract.
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        Token IDs with ``int32`` dtype and labels with ``float32`` dtype.
+
+    Raises
+    ------
+    ValueError
+        If no rows are supplied.
+    """
+    if not rows:
+        raise ValueError("at least one validated review row is required")
+    vectorizer = create_text_vectorizer(
+        sequence_length=manifest.payload["sequence_length"],
+        vocabulary=manifest.vocabulary_terms[2:],
+    )
+    return (
+        np.asarray(vectorizer([row[1] for row in rows]), dtype="int32"),
+        np.asarray([row[2] for row in rows], dtype="float32"),
     )
 
 

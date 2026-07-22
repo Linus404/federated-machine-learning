@@ -101,6 +101,13 @@ class EvaluationArtifactTests(unittest.TestCase):
                 [record["text"] for record in records],
                 [row["text"] for row in self.rows],
             )
+            self.assertEqual(
+                first_snapshot.rows,
+                tuple(
+                    (f"test:{index}", str(row["text"]), int(row["label"]))
+                    for index, row in enumerate(self.rows)
+                ),
+            )
             self.assertTrue(first_snapshot.records.endswith(b"\n"))
             with self.assertRaises(TypeError):
                 first_snapshot.manifest["dataset"]["id"] = "mutated"
