@@ -114,6 +114,7 @@ def create_run_artifact_dir(
     *,
     public_artifact_dir: str | Path | None = None,
     client_shard: Mapping[str, Any] | None = None,
+    app_manifest: AppManifest | None = None,
     flower_run_id: int | None = None,
 ) -> Path:
     """Create one immutable run namespace and its provenance manifest.
@@ -128,6 +129,8 @@ def create_run_artifact_dir(
         Public artifacts used by this run.
     client_shard : mapping of str to Any or None, optional
         Validated private-shard evidence for a local-training run.
+    app_manifest : AppManifest or None, optional
+        Already validated public snapshot retained by this operation.
     flower_run_id : int or None, optional
         Flower infrastructure run identifier.
 
@@ -146,6 +149,7 @@ def create_run_artifact_dir(
             run_config,
             public_artifact_dir=public_artifact_dir,
             client_shard=client_shard,
+            app_manifest=app_manifest,
             flower_run_id=flower_run_id,
             run_id=run_id,
         )

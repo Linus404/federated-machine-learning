@@ -1,7 +1,10 @@
 import hashlib
 import json
 import os
+import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 from collections import Counter
 from pathlib import Path
@@ -20,6 +23,7 @@ from src.contracts import canonical_client_row_bytes, client_shard_metadata
 from src.data_prep import (
     _acquire_preparation_lock,
     _publish_prepared_roots,
+    _recover_prepared_migration,
     build_vectorizer,
     main,
     package_raw_client_shards,
@@ -510,10 +514,7 @@ class ArtifactFlowTests(unittest.TestCase):
                 Counter(map(tuple, expected_ids)),
             )
 
-            dashboard.load_vectorizer.clear()
-            with patch.object(dashboard, "load_public_snapshot", return_value=manifest):
-                dashboard_vectorizer = dashboard.load_vectorizer()
-            dashboard.load_vectorizer.clear()
+            dashboard_vectorizer = dashboard.load_vectorizer(manifest)
             np.testing.assert_array_equal(
                 dashboard_vectorizer(tf.constant(cases)), producer(tf.constant(cases))
             )
@@ -828,12 +829,10 @@ class ArtifactFlowTests(unittest.TestCase):
 
                 compose = Path("compose.yaml").read_text(encoding="utf-8")
                 public_source = next(
-                    line.strip().removeprefix("- ")
+                    line.split("source: ", maxsplit=1)[1].strip()
                     for line in compose.splitlines()
-                    if line.strip().startswith(
-                        "- ./artifacts/.prepared-current/public:"
-                    )
-                ).split(":", maxsplit=1)[0]
+                    if "source: ./artifacts/.prepared-current/public" in line
+                )
                 client_source = next(
                     line.split("source: ", maxsplit=1)[1].strip()
                     for line in compose.splitlines()
@@ -937,6 +936,168 @@ class ArtifactFlowTests(unittest.TestCase):
                     )
             self.assertFalse((root / ".prepared-current").exists())
             self.assertEqual(list((root / ".prepared-legacy").iterdir()), [])
+
+    def test_legacy_migration_recovers_after_process_death_at_every_boundary(
+        self,
+    ) -> None:
+        phases = [
+            "journal:published",
+            "parent:journal-fsynced",
+            "generation:renamed",
+            "generations:fsynced",
+            "legacy-root:created",
+            "parent:legacy-root-fsynced",
+            "legacy-archive:created",
+            "legacy-root:archive-fsynced",
+        ]
+        for name in ("client", "evaluation", "public"):
+            phases.extend(
+                (
+                    f"archive:{name}:renamed",
+                    f"archive:{name}:fsynced",
+                    f"parent:archive-{name}-fsynced",
+                )
+            )
+        for name in ("client", "evaluation", "public"):
+            phases.extend((f"alias:{name}:created", f"parent:alias-{name}-fsynced"))
+        phases.extend(
+            (
+                "pointer-temporary:created",
+                "parent:pointer-temporary-fsynced",
+                "pointer:replaced",
+                "parent:pointer-fsynced",
+                "journal:removed",
+                "parent:journal-removal-fsynced",
+            )
+        )
+        child_code = textwrap.dedent(
+            """
+            import os
+            import sys
+            from pathlib import Path
+
+            import src.data_prep as data_prep
+
+            root = Path(sys.argv[1])
+            phase = sys.argv[2]
+            roots = {
+                "client": root / "clients",
+                "public": root / "public",
+                "evaluation": root / "evaluation",
+            }
+            stage = root / ".prepared-generations" / ".prepare-crash.staging"
+            stages = {name: stage / name for name in roots}
+
+            def crash_at(value):
+                if value == phase:
+                    os._exit(91)
+
+            data_prep._publication_checkpoint = crash_at
+            data_prep._publish_prepared_roots(roots, stages)
+            """
+        )
+
+        for phase in phases:
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                roots = {
+                    "client": root / "clients",
+                    "public": root / "public",
+                    "evaluation": root / "evaluation",
+                }
+                stage = root / ".prepared-generations" / ".prepare-crash.staging"
+                for name, logical_root in roots.items():
+                    logical_root.mkdir()
+                    (logical_root / "legacy.txt").write_text(name, encoding="utf-8")
+                    (stage / name).mkdir(parents=True)
+                    (stage / name / "new.txt").write_text(name, encoding="utf-8")
+
+                completed = subprocess.run(
+                    [sys.executable, "-c", child_code, str(root), phase],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=os.environ.copy(),
+                )
+
+                self.assertEqual(completed.returncode, 91, completed.stderr)
+                _recover_prepared_migration(roots)
+                for name, logical_root in roots.items():
+                    selected = resolve_prepared_artifact_dir(logical_root, name)
+                    self.assertEqual(
+                        (selected / "new.txt").read_text(encoding="utf-8"), name
+                    )
+                archive = next((root / ".prepared-legacy").iterdir())
+                for name, logical_root in roots.items():
+                    self.assertEqual(
+                        (archive / logical_root.name / "legacy.txt").read_text(
+                            encoding="utf-8"
+                        ),
+                        name,
+                    )
+
+    def test_prepare_retry_recovers_before_dataset_or_framework_loading(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            roots = {
+                "client": root / "clients",
+                "public": root / "public",
+                "evaluation": root / "evaluation",
+            }
+            stage = root / ".prepared-generations" / ".prepare-retry.staging"
+            for name, logical_root in roots.items():
+                logical_root.mkdir()
+                (logical_root / "legacy.txt").write_text(name, encoding="utf-8")
+                (stage / name).mkdir(parents=True)
+                (stage / name / "new.txt").write_text(name, encoding="utf-8")
+            child_code = textwrap.dedent(
+                """
+                import os
+                import sys
+                from pathlib import Path
+
+                import src.data_prep as data_prep
+
+                root = Path(sys.argv[1])
+                roots = {
+                    "client": root / "clients",
+                    "public": root / "public",
+                    "evaluation": root / "evaluation",
+                }
+                stage = root / ".prepared-generations" / ".prepare-retry.staging"
+                stages = {name: stage / name for name in roots}
+
+                def crash_at(value):
+                    if value == "archive:client:renamed":
+                        os._exit(92)
+
+                data_prep._publication_checkpoint = crash_at
+                data_prep._publish_prepared_roots(roots, stages)
+                """
+            )
+            completed = subprocess.run(
+                [sys.executable, "-c", child_code, str(root)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=os.environ.copy(),
+            )
+            self.assertEqual(completed.returncode, 92, completed.stderr)
+
+            with (
+                patch("src.data_prep._validated_frameworks") as frameworks,
+                patch("src.data_prep.load_verified_imdb_dataset") as load_dataset,
+            ):
+                prepare_all(4, roots["client"], roots["public"], roots["evaluation"])
+
+            frameworks.assert_not_called()
+            load_dataset.assert_not_called()
+            self.assertEqual(
+                (
+                    resolve_prepared_artifact_dir(roots["public"], "public") / "new.txt"
+                ).read_text(encoding="utf-8"),
+                "public",
+            )
 
     def test_preparation_rejects_overlapping_artifact_boundaries_before_loading(
         self,

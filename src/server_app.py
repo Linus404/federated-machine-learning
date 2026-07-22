@@ -19,7 +19,7 @@ from flwr.server.strategy import FedProx
 from flwr.serverapp import ServerApp
 
 from src import parse_run_config_bool
-from src.app_manifest import load_app_manifest, resolve_public_artifact_dir
+from src.app_manifest import AppManifest, load_app_manifest, resolve_public_artifact_dir
 from src.artifact_history import (
     DEFAULT_ARTIFACT_RETENTION_RUNS,
     create_run_artifact_dir,
@@ -542,6 +542,7 @@ def create_strategy(
     artifact_retention_runs: int = DEFAULT_ARTIFACT_RETENTION_RUNS,
     final_round: int | None = None,
     public_artifact_dir: str | Path | None = None,
+    app_manifest: AppManifest | None = None,
     proximal_mu: float = 0.1,
     use_huber: bool = False,
     huber_threshold: float = DEFAULT_HUBER_THRESHOLD,
@@ -564,6 +565,8 @@ def create_strategy(
         One-based final Flower round.
     public_artifact_dir : str or pathlib.Path, optional
         Directory containing the public application manifest.
+    app_manifest : AppManifest or None, optional
+        Already validated public snapshot retained by the server run.
     proximal_mu : float, optional
         FedProx proximal coefficient.
     use_huber : bool, optional
@@ -585,10 +588,10 @@ def create_strategy(
         raise ValueError("min_clients must be a positive built-in integer")
     resolved_artifact_dir = resolve_dir(artifact_dir or default_server_artifact_dir())
 
-    app_manifest = load_app_manifest(
+    manifest = app_manifest or load_app_manifest(
         public_artifact_dir=public_artifact_dir,
     )
-    initial_model = build_model_from_manifest(app_manifest)
+    initial_model = build_model_from_manifest(manifest)
     initial_weights = initial_model.get_weights()
 
     strategy = SentimentServer(
@@ -599,7 +602,7 @@ def create_strategy(
         artifact_root=artifact_root,
         artifact_retention_runs=artifact_retention_runs,
         final_round=final_round,
-        app_manifest=app_manifest,
+        app_manifest=manifest,
         huber_threshold=huber_threshold,
         use_huber=use_huber,
         fraction_fit=1.0,
@@ -658,12 +661,14 @@ def server_fn(context: Context) -> ServerAppComponents:
         or resolved_public_dir.is_relative_to(resolved_artifact_root)
     ):
         raise ValueError("server and public artifact directories must not overlap")
+    app_manifest = load_app_manifest(public_artifact_dir=public_artifact_dir)
     artifact_lock = acquire_run_artifact_lock(artifact_root)
     try:
         run_dir = create_run_artifact_dir(
             artifact_root,
             run_config,
             public_artifact_dir=public_artifact_dir,
+            app_manifest=app_manifest,
             flower_run_id=getattr(context, "run_id", None),
         )
         prune_run_history(artifact_root, retention_runs, active_run_dir=run_dir)
@@ -675,6 +680,7 @@ def server_fn(context: Context) -> ServerAppComponents:
             artifact_retention_runs=retention_runs,
             final_round=num_rounds,
             public_artifact_dir=run_config.get("public-artifact-dir"),
+            app_manifest=app_manifest,
             proximal_mu=float(run_config.get("proximal-mu", 0.1)),
             use_huber=parse_run_config_bool(run_config.get("use-huber"), default=False),
             huber_threshold=float(

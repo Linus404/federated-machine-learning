@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from src.app_manifest import load_app_manifest, resolve_public_artifact_dir
+from src.app_manifest import AppManifest, load_app_manifest, resolve_public_artifact_dir
 from src.artifact_compatibility import (
     ARTIFACT_SCHEMA_VERSION,
     sha256_bytes,
@@ -437,6 +437,7 @@ def _code_revision() -> dict[str, Any]:
 def _dataset_metadata(
     public_artifact_dir: str | Path | None,
     client_shard: Mapping[str, Any] | None = None,
+    app_manifest: AppManifest | None = None,
 ) -> dict[str, Any]:
     """Capture public dataset identity and checksums available to the server.
 
@@ -446,6 +447,8 @@ def _dataset_metadata(
         Directory containing the public model and vocabulary manifest.
     client_shard : mapping of str to Any or None, optional
         Validated private-shard identity and checksums available to local training.
+    app_manifest : AppManifest or None, optional
+        Already validated public snapshot retained by this operation.
 
     Returns
     -------
@@ -457,11 +460,11 @@ def _dataset_metadata(
     ValueError
         If a declared public artifact escapes its configured directory.
     """
-    public_dir = (
-        resolve_public_artifact_dir(public_artifact_dir=public_artifact_dir)
-        if public_artifact_dir
-        else None
-    )
+    public_dir = None
+    if app_manifest is None and public_artifact_dir:
+        public_dir = resolve_public_artifact_dir(
+            public_artifact_dir=public_artifact_dir
+        )
     private_status = (
         {
             "status": "available",
@@ -474,7 +477,9 @@ def _dataset_metadata(
             "reason": "client shard identity is not collected by the server application",
         }
     )
-    if public_dir is None or not (public_dir / "manifest.json").exists():
+    if app_manifest is None and (
+        public_dir is None or not (public_dir / "manifest.json").exists()
+    ):
         return {
             "identity": None,
             "checksums": {},
@@ -482,7 +487,7 @@ def _dataset_metadata(
             "private_client_shards": private_status,
         }
 
-    manifest = load_app_manifest(public_artifact_dir=public_dir)
+    manifest = app_manifest or load_app_manifest(public_artifact_dir=public_dir)
     identity = json.dumps(
         json.loads(manifest.manifest_bytes)["dataset"],
         ensure_ascii=False,
@@ -507,6 +512,7 @@ def write_run_provenance_manifest(
     *,
     public_artifact_dir: str | Path | None = None,
     client_shard: Mapping[str, Any] | None = None,
+    app_manifest: AppManifest | None = None,
     flower_run_id: int | None = None,
     created_at: str | None = None,
     run_id: str | None = None,
@@ -523,6 +529,8 @@ def write_run_provenance_manifest(
         Public artifacts used by the run.
     client_shard : mapping of str to Any or None, optional
         Validated private shard evidence available only to local training.
+    app_manifest : AppManifest or None, optional
+        Already validated public snapshot retained by this operation.
     flower_run_id : int or None, optional
         Flower's infrastructure-level run identifier when available.
     created_at : str or None, optional
@@ -573,7 +581,9 @@ def write_run_provenance_manifest(
                 "data_partition": DEFAULT_SPLIT_SEED,
             },
         },
-        "dataset": _dataset_metadata(public_artifact_dir, client_shard),
+        "dataset": _dataset_metadata(
+            public_artifact_dir, client_shard, app_manifest=app_manifest
+        ),
     }
     _validate_environment(payload["environment"])
     _validate_code_revision(payload["code_revision"])

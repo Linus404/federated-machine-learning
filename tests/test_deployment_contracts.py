@@ -1,3 +1,7 @@
+import shutil
+import subprocess
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -146,6 +150,10 @@ class DistributedDeploymentContractTests(unittest.TestCase):
 
         self.assertIn(".git", dockerignore)
         self.assertNotIn("COPY .git", dockerfile)
+        self.assertIn(
+            "COPY docs/scientific-protocol-v1.toml ./docs/scientific-protocol-v1.toml",
+            dockerfile,
+        )
 
     def test_contract_helpers_follow_project_docstring_conventions(self) -> None:
         docstring = service_block.__doc__ or ""
@@ -165,6 +173,7 @@ class DistributedDeploymentContractTests(unittest.TestCase):
                 )
                 self.assertIn("target: /app/client-data", clientapp)
                 self.assertIn("read_only: true", clientapp)
+                self.assertIn("create_host_path: false", clientapp)
                 for other_index in set(range(4)) - {index}:
                     self.assertNotIn(f"client-{other_index}", clientapp)
 
@@ -193,8 +202,16 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         for service in consumers:
             with self.subTest(service=service):
                 self.assertIn(
-                    "./artifacts/.prepared-current/public:/app/artifacts/public:ro",
+                    "source: ./artifacts/.prepared-current/public",
                     service_block(self.compose, service),
+                )
+                self.assertIn(
+                    "target: /app/artifacts/public",
+                    service_block(self.compose, service),
+                )
+                self.assertIn("read_only: true", service_block(self.compose, service))
+                self.assertIn(
+                    "create_host_path: false", service_block(self.compose, service)
                 )
         for service in ["superlink"] + [f"supernode-{index}" for index in range(4)]:
             with self.subTest(service=service):
@@ -256,13 +273,59 @@ class DistributedDeploymentContractTests(unittest.TestCase):
 
         self.assertNotIn("./artifacts/public:/app/artifacts/public:ro", self.compose)
         self.assertEqual(
-            self.compose.count(
-                "./artifacts/.prepared-current/public:/app/artifacts/public:ro"
-            ),
+            self.compose.count("source: ./artifacts/.prepared-current/public"),
             6,
         )
+        self.assertEqual(self.compose.count("create_host_path: false"), 10)
         self.assertIn("already-running containers", readme.lower())
         self.assertIn("docker compose down", readme)
+
+    def test_docker_engine_refuses_absent_prepared_bind_without_mutation(self) -> None:
+        if shutil.which("docker") is None:
+            self.skipTest("Docker CLI is unavailable")
+        if subprocess.run(
+            ["docker", "info"], check=False, capture_output=True
+        ).returncode:
+            self.skipTest("Docker engine is unavailable")
+        image = "federated-machine-learning:latest"
+        if subprocess.run(
+            ["docker", "image", "inspect", image], check=False, capture_output=True
+        ).returncode:
+            self.skipTest("exact application image has not been built")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            absent = root / "missing-prepared-source"
+            compose = root / "compose.yaml"
+            compose.write_text(
+                textwrap.dedent(
+                    f"""
+                    services:
+                      probe:
+                        image: {image}
+                        pull_policy: never
+                        entrypoint: ["/bin/true"]
+                        volumes:
+                          - type: bind
+                            source: {absent}
+                            target: /app/prepared
+                            read_only: true
+                            bind:
+                              create_host_path: false
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                ["docker", "compose", "-f", str(compose), "run", "--rm", "probe"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertFalse(absent.exists())
 
     def test_local_superlink_profile_uses_user_flower_config(self) -> None:
         pyproject = Path("pyproject.toml").read_text(encoding="utf-8")

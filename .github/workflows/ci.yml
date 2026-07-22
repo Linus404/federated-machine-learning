@@ -109,12 +109,14 @@ jobs:
       - name: Build application image
         run: docker compose build superlink
       - name: Smoke test application image
-        run: >-
-          docker compose run --rm --no-deps superlink
-          uv run --no-sync python -c
-          'from src.client_app import app as client_app;
-          from src.server_app import app as server_app;
-          assert client_app is not None and server_app is not None'
+        run: |
+          docker compose run --rm --no-deps superlink \
+            uv run --no-sync python -c \
+            'from src.client_app import app as client_app; from src.server_app import app as server_app; from src.evaluation_artifact import load_scientific_protocol; assert client_app is not None and server_app is not None and load_scientific_protocol()["protocol_version"] == 1'
+          docker compose run --rm --no-deps superlink \
+            uv run --no-sync python -m src.data_prep --help
+      - name: Probe absent prepared bind behavior
+        run: python -m unittest tests.test_deployment_contracts
       - name: Report container vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         env:

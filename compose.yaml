@@ -90,7 +90,12 @@ services:
       superlink:
         condition: service_healthy
     volumes:
-      - ./artifacts/.prepared-current/public:/app/artifacts/public:ro
+      - type: bind
+        source: ./artifacts/.prepared-current/public
+        target: /app/artifacts/public
+        read_only: true
+        bind:
+          create_host_path: false
       - ./artifacts/server:/app/artifacts/server
 
   supernode-0:
@@ -119,11 +124,18 @@ services:
       supernode-0:
         condition: service_healthy
     volumes:
-      - ./artifacts/.prepared-current/public:/app/artifacts/public:ro
+      - type: bind
+        source: ./artifacts/.prepared-current/public
+        target: /app/artifacts/public
+        read_only: true
+        bind:
+          create_host_path: false
       - type: bind
         source: ./artifacts/.prepared-current/client/client-0
         target: /app/client-data
         read_only: true
+        bind:
+          create_host_path: false
 
   supernode-1:
     <<: *supernode
@@ -151,11 +163,18 @@ services:
       supernode-1:
         condition: service_healthy
     volumes:
-      - ./artifacts/.prepared-current/public:/app/artifacts/public:ro
+      - type: bind
+        source: ./artifacts/.prepared-current/public
+        target: /app/artifacts/public
+        read_only: true
+        bind:
+          create_host_path: false
       - type: bind
         source: ./artifacts/.prepared-current/client/client-1
         target: /app/client-data
         read_only: true
+        bind:
+          create_host_path: false
 
   supernode-2:
     <<: *supernode
@@ -183,11 +202,18 @@ services:
       supernode-2:
         condition: service_healthy
     volumes:
-      - ./artifacts/.prepared-current/public:/app/artifacts/public:ro
+      - type: bind
+        source: ./artifacts/.prepared-current/public
+        target: /app/artifacts/public
+        read_only: true
+        bind:
+          create_host_path: false
       - type: bind
         source: ./artifacts/.prepared-current/client/client-2
         target: /app/client-data
         read_only: true
+        bind:
+          create_host_path: false
 
   supernode-3:
     <<: *supernode
@@ -215,11 +241,18 @@ services:
       supernode-3:
         condition: service_healthy
     volumes:
-      - ./artifacts/.prepared-current/public:/app/artifacts/public:ro
+      - type: bind
+        source: ./artifacts/.prepared-current/public
+        target: /app/artifacts/public
+        read_only: true
+        bind:
+          create_host_path: false
       - type: bind
         source: ./artifacts/.prepared-current/client/client-3
         target: /app/client-data
         read_only: true
+        bind:
+          create_host_path: false
 
   dashboard:
     <<: *flower-service
@@ -234,7 +267,12 @@ services:
     ports:
       - "127.0.0.1:8501:8501"
     volumes:
-      - ./artifacts/.prepared-current/public:/app/artifacts/public:ro
+      - type: bind
+        source: ./artifacts/.prepared-current/public
+        target: /app/artifacts/public
+        read_only: true
+        bind:
+          create_host_path: false
       - ./artifacts/server:/app/artifacts/server:ro
 
 volumes:

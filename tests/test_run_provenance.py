@@ -123,6 +123,28 @@ def runtime_environment() -> dict[str, object]:
 
 
 class RunProvenanceTests(unittest.TestCase):
+    def test_supplied_public_snapshot_is_not_reopened_for_provenance(self) -> None:
+        from src.app_manifest import load_app_manifest
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            public_dir = Path(tmpdir) / "public"
+            public_dir.mkdir()
+            protocol = write_public_dataset_contract(public_dir)
+            snapshot = load_app_manifest(
+                public_artifact_dir=public_dir, protocol=protocol
+            )
+            with patch(
+                "src.run_provenance.load_app_manifest",
+                side_effect=AssertionError("public pointer reopened"),
+            ):
+                metadata = _dataset_metadata(public_dir, app_manifest=snapshot)
+
+        self.assertEqual(metadata["status"], "available")
+        self.assertEqual(
+            metadata["checksums"]["manifest.json"],
+            "sha256:" + hashlib.sha256(snapshot.manifest_bytes).hexdigest(),
+        )
+
     def test_public_checksums_use_the_same_snapshot_as_validation(self) -> None:
         from src.app_manifest import load_app_manifest
 

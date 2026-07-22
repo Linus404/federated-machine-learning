@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.metadata
+import json
 import os
 import shutil
 import stat
@@ -43,6 +44,7 @@ from src.paths import (
     PREPARED_GENERATIONS_DIRECTORY,
     PREPARED_GENERATION_SCHEMA_VERSION,
     PREPARED_LEGACY_DIRECTORY,
+    PREPARED_MIGRATION_FILENAME,
     RunArtifactLock,
     default_evaluation_artifact_dir,
     default_public_artifact_dir,
@@ -376,6 +378,355 @@ def _fsync_directory_tree(root: Path) -> None:
         _fsync_directory(directory)
 
 
+def _publication_checkpoint(phase: str) -> None:
+    """Expose a no-op process-death checkpoint for durability regression tests.
+
+    Parameters
+    ----------
+    phase : str
+        Stable publication phase identifier.
+
+    Returns
+    -------
+    None
+    """
+
+
+def _migration_target(generation_id: str) -> str:
+    """Return the canonical relative pointer target for one generation.
+
+    Parameters
+    ----------
+    generation_id : str
+        Canonical prepared generation UUID.
+
+    Returns
+    -------
+    str
+        Relative target beneath the prepared generations directory.
+    """
+    return f"{PREPARED_GENERATIONS_DIRECTORY}/{generation_id}"
+
+
+def _validate_migration_journal(
+    roots: Mapping[str, Path], journal_bytes: bytes
+) -> dict[str, Any]:
+    """Validate and normalize one durable prepared-root migration journal.
+
+    Parameters
+    ----------
+    roots : mapping of str to pathlib.Path
+        Configured logical artifact roots.
+    journal_bytes : bytes
+        Exact journal bytes read through the secure artifact boundary.
+
+    Returns
+    -------
+    dict of str to Any
+        Canonically ordered validated transaction fields.
+
+    Raises
+    ------
+    ValueError
+        If the journal is malformed, noncanonical, or belongs to other roots.
+    """
+    try:
+        payload = json.loads(journal_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("prepared migration journal is invalid") from error
+    fields = {
+        "schema_version",
+        "generation_id",
+        "stage_name",
+        "logical_roots",
+        "legacy_roots",
+        "alias_roots",
+        "previous_pointer_target",
+    }
+    if not isinstance(payload, dict) or set(payload) != fields:
+        raise ValueError("prepared migration journal has an invalid field set")
+    generation_id = payload["generation_id"]
+    try:
+        parsed_id = uuid.UUID(generation_id) if isinstance(generation_id, str) else None
+    except ValueError as error:
+        raise ValueError("prepared migration journal generation is invalid") from error
+    if (
+        type(payload["schema_version"]) is not int
+        or payload["schema_version"] != PREPARED_GENERATION_SCHEMA_VERSION
+        or parsed_id is None
+        or parsed_id.version != 4
+        or str(parsed_id) != generation_id
+    ):
+        raise ValueError("prepared migration journal identity is invalid")
+    stage_name = payload["stage_name"]
+    if (
+        not isinstance(stage_name, str)
+        or Path(stage_name).name != stage_name
+        or not stage_name.startswith(".prepare-")
+        or not stage_name.endswith(".staging")
+    ):
+        raise ValueError("prepared migration journal stage is invalid")
+    expected_roots = {name: roots[name].name for name in sorted(roots)}
+    logical_roots = payload["logical_roots"]
+    if not isinstance(logical_roots, dict) or logical_roots != expected_roots:
+        raise ValueError("prepared migration journal does not match configured roots")
+    legacy_roots = payload["legacy_roots"]
+    alias_roots = payload["alias_roots"]
+    for value, name in (
+        (legacy_roots, "legacy roots"),
+        (alias_roots, "alias roots"),
+    ):
+        if (
+            not isinstance(value, list)
+            or value != sorted(value)
+            or len(value) != len(set(value))
+            or any(item not in roots for item in value)
+        ):
+            raise ValueError(f"prepared migration journal {name} are invalid")
+    if not set(legacy_roots) <= set(alias_roots):
+        raise ValueError("prepared migration journal root state is inconsistent")
+    previous_target = payload["previous_pointer_target"]
+    if previous_target is not None:
+        if not isinstance(previous_target, str):
+            raise ValueError("prepared migration journal previous pointer is invalid")
+        parts = Path(previous_target).parts
+        if (
+            len(parts) != 2
+            or parts[0] != PREPARED_GENERATIONS_DIRECTORY
+            or previous_target != "/".join(parts)
+        ):
+            raise ValueError("prepared migration journal previous pointer is invalid")
+        try:
+            previous_id = uuid.UUID(parts[1])
+        except ValueError as error:
+            raise ValueError(
+                "prepared migration journal previous pointer is invalid"
+            ) from error
+        if previous_id.version != 4 or str(previous_id) != parts[1]:
+            raise ValueError("prepared migration journal previous pointer is invalid")
+    canonical = {
+        "schema_version": PREPARED_GENERATION_SCHEMA_VERSION,
+        "generation_id": generation_id,
+        "stage_name": stage_name,
+        "logical_roots": expected_roots,
+        "legacy_roots": legacy_roots,
+        "alias_roots": alias_roots,
+        "previous_pointer_target": previous_target,
+    }
+    if journal_bytes != canonical_json_bytes(canonical):
+        raise ValueError("prepared migration journal bytes are not canonical")
+    return canonical
+
+
+def _load_migration_journal(roots: Mapping[str, Path]) -> dict[str, Any] | None:
+    """Load a pending migration journal without following unsafe paths.
+
+    Parameters
+    ----------
+    roots : mapping of str to pathlib.Path
+        Configured logical artifact roots sharing one parent.
+
+    Returns
+    -------
+    dict of str to Any or None
+        Validated transaction, or ``None`` when no recovery is pending.
+    """
+    parent = roots["client"].parent
+    path = parent / PREPARED_MIGRATION_FILENAME
+    if not path.exists() and not path.is_symlink():
+        return None
+    journal_bytes = read_regular_file(path, parent=parent.resolve(strict=True))
+    return _validate_migration_journal(roots, journal_bytes)
+
+
+def _recover_prepared_migration(roots: Mapping[str, Path]) -> bool:
+    """Finish one journaled prepared-root publication after process death.
+
+    Parameters
+    ----------
+    roots : mapping of str to pathlib.Path
+        Configured logical client, public, and evaluation roots.
+
+    Returns
+    -------
+    bool
+        ``True`` when a pending transaction was recovered.
+
+    Raises
+    ------
+    ValueError
+        If recovery encounters missing data or state not owned by the journal.
+    """
+    transaction = _load_migration_journal(roots)
+    if transaction is None:
+        return False
+    parent = roots["client"].parent
+    generations = parent / PREPARED_GENERATIONS_DIRECTORY
+    generation_id = transaction["generation_id"]
+    stage = generations / transaction["stage_name"]
+    generation = generations / generation_id
+    stage_exists = stage.exists() or stage.is_symlink()
+    generation_exists = generation.exists() or generation.is_symlink()
+    if stage_exists and generation_exists:
+        raise ValueError("prepared migration has both staged and final generations")
+    if stage_exists:
+        if stage.is_symlink() or not stage.is_dir():
+            raise ValueError("prepared migration stage is unsafe")
+        os.rename(stage, generation)
+        _publication_checkpoint("generation:renamed")
+    elif not generation_exists:
+        raise ValueError("prepared migration generation data is missing")
+    if generation.is_symlink() or not generation.is_dir():
+        raise ValueError("prepared migration generation is unsafe")
+    _fsync_directory(generations)
+    _publication_checkpoint("generations:fsynced")
+
+    legacy_names = transaction["legacy_roots"]
+    archive: Path | None = None
+    if legacy_names:
+        legacy_root = parent / PREPARED_LEGACY_DIRECTORY
+        if legacy_root.is_symlink() or (
+            legacy_root.exists() and not legacy_root.is_dir()
+        ):
+            raise ValueError("prepared legacy archive must be a regular directory")
+        if not legacy_root.exists():
+            legacy_root.mkdir(mode=0o755)
+            _publication_checkpoint("legacy-root:created")
+            _fsync_directory(parent)
+            _publication_checkpoint("parent:legacy-root-fsynced")
+        archive = legacy_root / generation_id
+        if archive.is_symlink() or (archive.exists() and not archive.is_dir()):
+            raise ValueError("prepared legacy transaction archive is unsafe")
+        if not archive.exists():
+            archive.mkdir(mode=0o700)
+            _publication_checkpoint("legacy-archive:created")
+            _fsync_directory(legacy_root)
+            _publication_checkpoint("legacy-root:archive-fsynced")
+
+        for name in legacy_names:
+            root = roots[name]
+            archived = archive / root.name
+            if archived.exists() or archived.is_symlink():
+                if archived.is_symlink() or not archived.is_dir():
+                    raise ValueError(f"prepared {name} legacy archive is unsafe")
+                if root.exists() and not root.is_symlink():
+                    raise ValueError(f"prepared {name} legacy root is duplicated")
+            elif root.exists() and not root.is_symlink():
+                if not root.is_dir():
+                    raise ValueError(f"prepared {name} legacy root is unsafe")
+                os.rename(root, archived)
+                _publication_checkpoint(f"archive:{name}:renamed")
+            elif not root.is_symlink():
+                raise ValueError(f"prepared {name} legacy data is missing")
+            _fsync_directory(archive)
+            _publication_checkpoint(f"archive:{name}:fsynced")
+            _fsync_directory(parent)
+            _publication_checkpoint(f"parent:archive-{name}-fsynced")
+
+    for name in sorted(roots):
+        root = roots[name]
+        expected = Path(PREPARED_CURRENT_FILENAME) / name
+        if root.is_symlink():
+            if Path(os.readlink(root)) != expected:
+                raise ValueError(f"{name} artifact root has an unsafe prepared alias")
+        elif root.exists():
+            raise ValueError(f"{name} artifact root was not archived")
+        else:
+            root.symlink_to(expected, target_is_directory=True)
+            _publication_checkpoint(f"alias:{name}:created")
+        _fsync_directory(parent)
+        _publication_checkpoint(f"parent:alias-{name}-fsynced")
+
+    pointer = parent / PREPARED_CURRENT_FILENAME
+    new_target = _migration_target(generation_id)
+    previous_target = transaction["previous_pointer_target"]
+    if pointer.exists() and not pointer.is_symlink():
+        raise ValueError("prepared generation pointer is unsafe")
+    current_target = os.readlink(pointer) if pointer.is_symlink() else None
+    if current_target not in {previous_target, new_target}:
+        raise ValueError("prepared generation pointer changed during migration")
+    temporary_pointer = parent / f".{PREPARED_CURRENT_FILENAME}.{generation_id}.tmp"
+    if current_target != new_target:
+        if temporary_pointer.exists() or temporary_pointer.is_symlink():
+            if (
+                not temporary_pointer.is_symlink()
+                or os.readlink(temporary_pointer) != new_target
+            ):
+                raise ValueError("prepared temporary pointer is unsafe")
+        else:
+            temporary_pointer.symlink_to(new_target, target_is_directory=True)
+            _publication_checkpoint("pointer-temporary:created")
+            _fsync_directory(parent)
+            _publication_checkpoint("parent:pointer-temporary-fsynced")
+        os.replace(temporary_pointer, pointer)
+        _publication_checkpoint("pointer:replaced")
+    else:
+        temporary_pointer.unlink(missing_ok=True)
+    _fsync_directory(parent)
+    _publication_checkpoint("parent:pointer-fsynced")
+
+    journal = parent / PREPARED_MIGRATION_FILENAME
+    journal.unlink()
+    _publication_checkpoint("journal:removed")
+    _fsync_directory(parent)
+    _publication_checkpoint("parent:journal-removal-fsynced")
+    return True
+
+
+def _rollback_prepared_migration(
+    roots: Mapping[str, Path], transaction: Mapping[str, Any]
+) -> None:
+    """Restore pre-transaction visibility after an in-process publication error.
+
+    Parameters
+    ----------
+    roots : mapping of str to pathlib.Path
+        Configured logical artifact roots.
+    transaction : mapping of str to Any
+        Validated durable migration transaction.
+
+    Returns
+    -------
+    None
+    """
+    parent = roots["client"].parent
+    generation_id = transaction["generation_id"]
+    pointer = parent / PREPARED_CURRENT_FILENAME
+    new_target = _migration_target(generation_id)
+    previous_target = transaction["previous_pointer_target"]
+    temporary_pointer = parent / f".{PREPARED_CURRENT_FILENAME}.{generation_id}.tmp"
+    temporary_pointer.unlink(missing_ok=True)
+    if pointer.is_symlink() and os.readlink(pointer) == new_target:
+        if previous_target is None:
+            pointer.unlink()
+        else:
+            rollback_pointer = parent / f".{PREPARED_CURRENT_FILENAME}.rollback.tmp"
+            rollback_pointer.unlink(missing_ok=True)
+            rollback_pointer.symlink_to(previous_target, target_is_directory=True)
+            os.replace(rollback_pointer, pointer)
+
+    for name in reversed(transaction["alias_roots"]):
+        root = roots[name]
+        expected = Path(PREPARED_CURRENT_FILENAME) / name
+        if root.is_symlink() and Path(os.readlink(root)) == expected:
+            root.unlink()
+
+    archive = parent / PREPARED_LEGACY_DIRECTORY / generation_id
+    if archive.is_dir() and not archive.is_symlink():
+        for name in reversed(transaction["legacy_roots"]):
+            root = roots[name]
+            archived = archive / root.name
+            if archived.is_dir() and not archived.is_symlink() and not root.exists():
+                os.rename(archived, root)
+        _fsync_directory(archive)
+        _fsync_directory(parent)
+        if not any(archive.iterdir()):
+            archive.rmdir()
+            _fsync_directory(archive.parent)
+    (parent / PREPARED_MIGRATION_FILENAME).unlink(missing_ok=True)
+    _fsync_directory(parent)
+
+
 def _publish_prepared_roots(
     roots: Mapping[str, Path], stages: Mapping[str, Path]
 ) -> None:
@@ -412,7 +763,6 @@ def _publish_prepared_roots(
         raise ValueError("prepared generation staging directory escapes its root")
 
     generation_id = str(uuid.uuid4())
-    generation = generations / generation_id
     write_json_atomically(
         generation_stage / "index.json",
         {
@@ -423,8 +773,6 @@ def _publish_prepared_roots(
         overwrite=False,
     )
     _fsync_directory_tree(generation_stage)
-    os.rename(generation_stage, generation)
-    _fsync_directory(generations)
     pointer = parent / PREPARED_CURRENT_FILENAME
     if pointer.exists() and not pointer.is_symlink():
         raise ValueError("prepared generation pointer is unsafe")
@@ -437,55 +785,29 @@ def _publish_prepared_roots(
         expected_alias = Path(PREPARED_CURRENT_FILENAME) / name
         if root.is_symlink() and Path(os.readlink(root)) != expected_alias:
             raise ValueError(f"{name} artifact root has an unsafe prepared alias")
-
-    legacy_archive: Path | None = None
-    if legacy_roots:
-        legacy_root = parent / PREPARED_LEGACY_DIRECTORY
-        if legacy_root.is_symlink() or (
-            legacy_root.exists() and not legacy_root.is_dir()
-        ):
-            raise ValueError("prepared legacy archive must be a regular directory")
-        legacy_root.mkdir(mode=0o755, exist_ok=True)
-        legacy_archive = legacy_root / generation_id
-        legacy_archive.mkdir(mode=0o700)
-        _fsync_directory(legacy_root)
-
-    aliases_created: list[Path] = []
-    roots_archived: list[tuple[Path, Path]] = []
-    temporary_pointer = parent / f".{PREPARED_CURRENT_FILENAME}.{uuid.uuid4().hex}.tmp"
-    try:
-        for name, root in roots.items():
-            if root in legacy_roots.values():
-                if legacy_archive is None:
-                    raise RuntimeError("legacy archive was not initialized")
-                archived = legacy_archive / root.name
-                os.rename(root, archived)
-                roots_archived.append((root, archived))
-            if not root.is_symlink():
-                root.symlink_to(
-                    Path(PREPARED_CURRENT_FILENAME) / name,
-                    target_is_directory=True,
-                )
-                aliases_created.append(root)
-        if legacy_archive is not None:
-            _fsync_directory(legacy_archive)
-            _fsync_directory(legacy_archive.parent)
-            _fsync_directory(parent)
-        temporary_pointer.symlink_to(
-            Path(PREPARED_GENERATIONS_DIRECTORY) / generation_id,
-            target_is_directory=True,
-        )
-        os.replace(temporary_pointer, pointer)
-    except BaseException:
-        temporary_pointer.unlink(missing_ok=True)
-        for alias in reversed(aliases_created):
-            alias.unlink(missing_ok=True)
-        for root, archived in reversed(roots_archived):
-            os.rename(archived, root)
-        if legacy_archive is not None:
-            legacy_archive.rmdir()
-        raise
+    previous_pointer_target = os.readlink(pointer) if pointer.is_symlink() else None
+    transaction = {
+        "schema_version": PREPARED_GENERATION_SCHEMA_VERSION,
+        "generation_id": generation_id,
+        "stage_name": generation_stage.name,
+        "logical_roots": {name: roots[name].name for name in sorted(roots)},
+        "legacy_roots": sorted(legacy_roots),
+        "alias_roots": sorted(
+            name for name, root in roots.items() if not root.is_symlink()
+        ),
+        "previous_pointer_target": previous_pointer_target,
+    }
+    journal = parent / PREPARED_MIGRATION_FILENAME
+    write_json_atomically(journal, transaction, overwrite=False)
+    _publication_checkpoint("journal:published")
     _fsync_directory(parent)
+    _publication_checkpoint("parent:journal-fsynced")
+    try:
+        if not _recover_prepared_migration(roots):
+            raise RuntimeError("prepared migration journal disappeared")
+    except BaseException:
+        _rollback_prepared_migration(roots, transaction)
+        raise
 
 
 def _raw_split_path(
@@ -978,6 +1300,8 @@ def prepare_all(
         ):
             raise ValueError("prepared generations root must be a regular directory")
         generations.mkdir(mode=0o755, exist_ok=True)
+        if _recover_prepared_migration(roots):
+            return
         for residue in generations.glob(".prepare-*.staging"):
             residue_stat = residue.lstat()
             if residue.is_symlink() or not stat.S_ISDIR(residue_stat.st_mode):

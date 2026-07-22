@@ -18,8 +18,37 @@ DEFAULT_EVALUATION_ARTIFACT_DIR = Path("artifacts/evaluation")
 PREPARED_CURRENT_FILENAME = ".prepared-current"
 PREPARED_GENERATIONS_DIRECTORY = ".prepared-generations"
 PREPARED_LEGACY_DIRECTORY = ".prepared-legacy"
+PREPARED_MIGRATION_FILENAME = ".prepared-migration.json"
 PREPARED_GENERATION_SCHEMA_VERSION = 1
 PREPARED_ARTIFACT_KINDS = frozenset({"client", "public", "evaluation"})
+
+
+def _reject_duplicate_json_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    """Decode one JSON object while rejecting duplicate member names.
+
+    Parameters
+    ----------
+    pairs : list of tuple of str and object
+        Decoded object members in source order.
+
+    Returns
+    -------
+    dict of str to object
+        Unique decoded members preserving their source order.
+
+    Raises
+    ------
+    ValueError
+        If a member name occurs more than once.
+    """
+    result: dict[str, object] = {}
+    for key, item in pairs:
+        if key in result:
+            raise ValueError(f"duplicate prepared generation index field: {key}")
+        result[key] = item
+    return result
 
 
 class RunArtifactLock:
@@ -128,9 +157,12 @@ def resolve_prepared_artifact_dir(value: str | Path, artifact_kind: str) -> Path
     canonical_generation = generation.resolve(strict=True)
     if canonical_generation.parent != canonical_generations:
         raise ValueError("selected prepared generation escapes its artifact root")
+
     try:
         index_bytes = read_regular_file(index_path, parent=canonical_generation)
-        payload = json.loads(index_bytes.decode("utf-8"))
+        payload = json.loads(
+            index_bytes.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_keys
+        )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         raise ValueError("prepared generation index is invalid or unsafe") from error
     if not isinstance(payload, dict) or set(payload) != {
@@ -139,8 +171,8 @@ def resolve_prepared_artifact_dir(value: str | Path, artifact_kind: str) -> Path
         "logical_roots",
     }:
         raise ValueError("prepared generation index has an invalid field set")
-    if index_bytes != canonical_json_bytes(payload):
-        raise ValueError("prepared generation index bytes are not canonical")
+    if type(payload["schema_version"]) is not int:
+        raise ValueError("prepared generation index has an invalid schema_version")
     if payload["schema_version"] != PREPARED_GENERATION_SCHEMA_VERSION:
         raise ValueError("prepared generation index has an unsupported schema_version")
     logical_roots = payload["logical_roots"]
@@ -156,6 +188,15 @@ def resolve_prepared_artifact_dir(value: str | Path, artifact_kind: str) -> Path
         or logical_roots[artifact_kind] != logical_root.name
     ):
         raise ValueError("prepared generation index does not match configured roots")
+    canonical_payload = {
+        "schema_version": PREPARED_GENERATION_SCHEMA_VERSION,
+        "generation_id": payload["generation_id"],
+        "logical_roots": {
+            name: logical_roots[name] for name in sorted(PREPARED_ARTIFACT_KINDS)
+        },
+    }
+    if index_bytes != canonical_json_bytes(canonical_payload):
+        raise ValueError("prepared generation index bytes are not canonical")
     index_generation_id = payload["generation_id"]
     try:
         parsed_id = (

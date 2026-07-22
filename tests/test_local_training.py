@@ -140,6 +140,10 @@ class LocalTrainingTests(unittest.TestCase):
                     side_effect=write_manifest,
                 ),
                 patch(
+                    "src.run_provenance.load_app_manifest",
+                    side_effect=AssertionError("public pointer reopened"),
+                ),
+                patch(
                     "src.local_training.load_client_shard_snapshot",
                     side_effect=lambda *args, **kwargs: (
                         events.append("private-data")

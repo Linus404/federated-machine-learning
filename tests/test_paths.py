@@ -55,8 +55,8 @@ def write_prepared_generation(
     generation.mkdir(parents=True)
     logical_roots = {
         "client": "clients",
-        "public": "public",
         "evaluation": "evaluation",
+        "public": "public",
     }
     for kind, logical_name in logical_roots.items():
         (generation / kind).mkdir()
@@ -170,6 +170,53 @@ class ArtifactPathContractTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "identities differ"):
                 resolve_prepared_artifact_dir(root / "clients", "client")
+
+    def test_prepared_generation_rejects_reordered_bool_and_duplicate_fields(
+        self,
+    ) -> None:
+        mutations = (
+            lambda payload: {
+                "generation_id": payload["generation_id"],
+                "schema_version": payload["schema_version"],
+                "logical_roots": payload["logical_roots"],
+            },
+            lambda payload: {
+                **payload,
+                "logical_roots": {
+                    "client": "clients",
+                    "public": "public",
+                    "evaluation": "evaluation",
+                },
+            },
+            lambda payload: {**payload, "schema_version": True},
+        )
+        for mutation in mutations:
+            with (
+                self.subTest(mutation=mutation),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                generation, _ = write_prepared_generation(root)
+                index = generation / "index.json"
+                payload = json.loads(index.read_text(encoding="utf-8"))
+                index.write_bytes(canonical_json_bytes(mutation(payload)))
+
+                with self.assertRaises(ValueError):
+                    resolve_prepared_artifact_dir(root / "public", "public")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            generation, generation_id = write_prepared_generation(root)
+            (generation / "index.json").write_text(
+                '{"schema_version":1,"schema_version":1,'
+                f'"generation_id":"{generation_id}",'
+                '"logical_roots":{"client":"clients",'
+                '"evaluation":"evaluation","public":"public"}}',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "invalid or unsafe"):
+                resolve_prepared_artifact_dir(root / "public", "public")
 
     def test_prepared_generation_rejects_pointer_swap_and_hostile_entries(
         self,

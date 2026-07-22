@@ -14,6 +14,25 @@ from src.artifact_compatibility import load_server_artifact_manifest
 from tests.artifact_helpers import fake_app_manifest
 
 
+def server_app_manifest(public_dir: Path) -> SimpleNamespace:
+    """Return a public snapshot suitable for server startup provenance.
+
+    Parameters
+    ----------
+    public_dir : pathlib.Path
+        Public directory used for diagnostic vocabulary identity.
+
+    Returns
+    -------
+    types.SimpleNamespace
+        App-manifest-shaped immutable snapshot.
+    """
+    snapshot = fake_app_manifest()
+    snapshot.manifest_bytes = b'{"dataset":{"id":"test"}}\n'
+    snapshot.vocabulary_path = public_dir / "vocab.txt"
+    return snapshot
+
+
 class ServerStartupArtifactHistoryTests(unittest.TestCase):
     def test_server_fn_creates_a_new_run_without_overwriting_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -47,6 +66,11 @@ class ServerStartupArtifactHistoryTests(unittest.TestCase):
                 return Mock(name="strategy")
 
             with (
+                patch.object(
+                    server_app,
+                    "load_app_manifest",
+                    return_value=server_app_manifest(public_dir),
+                ),
                 patch.object(
                     server_app, "create_strategy", side_effect=create_strategy_probe
                 ),
@@ -98,6 +122,54 @@ class ServerStartupArtifactHistoryTests(unittest.TestCase):
             create_strategy.assert_not_called()
             self.assertTrue(manifest.exists())
 
+    def test_server_fn_threads_one_public_snapshot_through_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            public_dir = root / "public"
+            public_dir.mkdir()
+            artifact_dir = root / "server"
+            snapshot = server_app_manifest(public_dir)
+            context = cast(
+                Context,
+                SimpleNamespace(
+                    run_config={
+                        "public-artifact-dir": public_dir,
+                        "server-artifact-dir": artifact_dir,
+                        "num-server-rounds": 1,
+                    }
+                ),
+            )
+            strategy = SimpleNamespace()
+            run_dir = artifact_dir / "runs" / "run"
+            with (
+                patch.object(
+                    server_app,
+                    "load_app_manifest",
+                    side_effect=(snapshot, AssertionError("pointer reopened")),
+                ) as load_manifest,
+                patch.object(
+                    server_app,
+                    "create_run_artifact_dir",
+                    return_value=run_dir,
+                ) as create_run,
+                patch.object(server_app, "prune_run_history"),
+                patch.object(
+                    server_app, "create_strategy", return_value=strategy
+                ) as create_strategy,
+                patch.object(
+                    server_app,
+                    "ServerAppComponents",
+                    side_effect=lambda **kwargs: kwargs,
+                ),
+            ):
+                result = cast(dict[str, Any], server_app.server_fn(context))
+
+            load_manifest.assert_called_once_with(public_artifact_dir=public_dir)
+            self.assertIs(create_run.call_args.kwargs["app_manifest"], snapshot)
+            self.assertIs(create_strategy.call_args.kwargs["app_manifest"], snapshot)
+            self.assertIs(result["strategy"], strategy)
+            create_strategy.call_args.kwargs["artifact_lock"].release()
+
     def test_server_fn_rejects_overlapping_artifact_writers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             public_dir = Path(tmpdir) / "public"
@@ -121,6 +193,11 @@ class ServerStartupArtifactHistoryTests(unittest.TestCase):
                 return strategy
 
             with (
+                patch.object(
+                    server_app,
+                    "load_app_manifest",
+                    return_value=server_app_manifest(public_dir),
+                ),
                 patch.object(
                     server_app, "create_strategy", side_effect=create_strategy_probe
                 ),
@@ -156,8 +233,17 @@ class ServerStartupArtifactHistoryTests(unittest.TestCase):
                 ),
             )
 
-            with patch.object(
-                server_app, "create_strategy", side_effect=ValueError("invalid app")
+            with (
+                patch.object(
+                    server_app,
+                    "load_app_manifest",
+                    return_value=server_app_manifest(public_dir),
+                ),
+                patch.object(
+                    server_app,
+                    "create_strategy",
+                    side_effect=ValueError("invalid app"),
+                ),
             ):
                 with self.assertRaisesRegex(ValueError, "invalid app"):
                     server_app.server_fn(context)

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import dashboard
 import numpy as np
@@ -309,6 +309,75 @@ class DashboardArtifactTests(unittest.TestCase):
             dashboard._load_public_snapshot_at.clear()
             self.assertEqual(load_manifest.call_count, 2)
 
+    def test_no_arg_vectorizer_changes_with_the_selected_public_generation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            first = Path(tmpdir) / "first" / "public"
+            second = Path(tmpdir) / "second" / "public"
+            first.mkdir(parents=True)
+            second.mkdir(parents=True)
+            first_snapshot = SimpleNamespace(
+                payload={"sequence_length": 3},
+                vocabulary_terms=("", "[UNK]", "first"),
+            )
+            second_snapshot = SimpleNamespace(
+                payload={"sequence_length": 4},
+                vocabulary_terms=("", "[UNK]", "second"),
+            )
+            first_vectorizer = object()
+            second_vectorizer = object()
+            dashboard._load_public_snapshot_at.clear()
+            with (
+                patch.object(
+                    dashboard,
+                    "resolve_public_artifact_dir",
+                    side_effect=(first, second),
+                ),
+                patch.object(
+                    dashboard,
+                    "load_app_manifest",
+                    side_effect=(first_snapshot, second_snapshot),
+                ),
+                patch.object(
+                    dashboard,
+                    "create_text_vectorizer",
+                    side_effect=(first_vectorizer, second_vectorizer),
+                ) as create_vectorizer,
+            ):
+                self.assertIs(dashboard.load_vectorizer(), first_vectorizer)
+                self.assertIs(dashboard.load_vectorizer(), second_vectorizer)
+
+            dashboard._load_public_snapshot_at.clear()
+            self.assertEqual(
+                create_vectorizer.call_args_list[0].kwargs["vocabulary"], ("first",)
+            )
+            self.assertEqual(
+                create_vectorizer.call_args_list[1].kwargs["vocabulary"], ("second",)
+            )
+
+    def test_prediction_reuses_one_public_snapshot_at_every_boundary(self) -> None:
+        snapshot = fake_app_manifest()
+        model = SimpleNamespace(predict=lambda *_args, **_kwargs: [[0.75]])
+        vectorizer = Mock(side_effect=lambda value: value)
+        with (
+            patch.object(
+                dashboard, "load_public_snapshot", return_value=snapshot
+            ) as load_snapshot,
+            patch.object(
+                dashboard, "_load_bound_model", return_value=model
+            ) as load_model,
+            patch.object(
+                dashboard, "load_vectorizer", return_value=vectorizer
+            ) as load_vectorizer,
+        ):
+            probability, label = dashboard.predict_sentiment("good")
+
+        load_snapshot.assert_called_once_with()
+        load_model.assert_called_once_with(snapshot)
+        load_vectorizer.assert_called_once_with(snapshot)
+        self.assertEqual((probability, label), (0.75, "positive"))
+
     def test_vectorizer_rejects_conflicting_preimport_environment(self) -> None:
         with (
             patch.dict(os.environ, {"KERAS_BACKEND": "jax"}),
@@ -324,10 +393,8 @@ class DashboardArtifactTests(unittest.TestCase):
             ) as vectorizer,
             self.assertRaisesRegex(ValueError, "startup environment differs"),
         ):
-            dashboard.load_vectorizer.clear()
             dashboard.load_vectorizer()
 
-        dashboard.load_vectorizer.clear()
         vectorizer.assert_not_called()
 
 

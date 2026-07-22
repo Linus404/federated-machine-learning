@@ -507,9 +507,9 @@ def train(args: argparse.Namespace) -> tuple[Any, Any]:
         "validation-seed": DEFAULT_VALIDATION_SEED,
         "validation-split": args.validation_split,
     }
+    manifest = load_app_manifest(public_artifact_dir=args.public_artifact_dir)
     lock = acquire_run_artifact_lock(artifact_root)
     try:
-        manifest = load_app_manifest(public_artifact_dir=args.public_artifact_dir)
         shard_snapshot = load_client_shard_snapshot(
             args.client_data_dir,
             manifest,
@@ -520,6 +520,7 @@ def train(args: argparse.Namespace) -> tuple[Any, Any]:
             run_config,
             public_artifact_dir=args.public_artifact_dir,
             client_shard=shard_snapshot.provenance(),
+            app_manifest=manifest,
         )
         prune_run_history(artifact_root, retention_runs, active_run_dir=run_dir)
         write_server_artifact_manifest(run_dir, app_manifest=manifest)

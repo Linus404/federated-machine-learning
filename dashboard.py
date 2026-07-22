@@ -62,13 +62,17 @@ def _is_fresh_artifact_root(root: Path) -> bool:
     )
 
 
-def load_model(path: Path | None = None) -> Any:
+def load_model(
+    path: Path | None = None, *, app_manifest: AppManifest | None = None
+) -> Any:
     """Load the trained global sentiment model.
 
     Parameters
     ----------
     path : pathlib.Path or None, optional
         Explicit legacy model path, or ``None`` to load the current run snapshot.
+    app_manifest : AppManifest or None, optional
+        Public snapshot already retained by the dashboard operation.
 
     Returns
     -------
@@ -81,8 +85,8 @@ def load_model(path: Path | None = None) -> Any:
         If no trained model artifact exists.
     """
     validate_protocol_runtime()
-    app_manifest = load_public_snapshot()
-    return _load_bound_model(app_manifest, path)
+    public_snapshot = app_manifest or load_public_snapshot()
+    return _load_bound_model(public_snapshot, path)
 
 
 @st.cache_resource
@@ -204,9 +208,15 @@ def _validate_model_dimensions(model: Any, public_manifest: Mapping[str, Any]) -
         )
 
 
-@st.cache_resource
-def load_vectorizer() -> keras.layers.TextVectorization:
+def load_vectorizer(
+    app_manifest: AppManifest | None = None,
+) -> keras.layers.TextVectorization:
     """Load the checksum-verified public vocabulary into the shared vectorizer.
+
+    Parameters
+    ----------
+    app_manifest : AppManifest or None, optional
+        Public snapshot already retained by the current operation.
 
     Returns
     -------
@@ -218,10 +228,10 @@ def load_vectorizer() -> keras.layers.TextVectorization:
     ValueError
         If the public manifest or vocabulary artifact is invalid.
     """
-    app_manifest = load_public_snapshot()
+    public_snapshot = app_manifest or load_public_snapshot()
     return create_text_vectorizer(
-        sequence_length=app_manifest.payload["sequence_length"],
-        vocabulary=app_manifest.vocabulary_terms[2:],
+        sequence_length=public_snapshot.payload["sequence_length"],
+        vocabulary=public_snapshot.vocabulary_terms[2:],
     )
 
 
@@ -273,13 +283,17 @@ def load_metrics(
     return df
 
 
-def predict_sentiment(review_text: str) -> tuple[float, str]:
+def predict_sentiment(
+    review_text: str, *, app_manifest: AppManifest | None = None
+) -> tuple[float, str]:
     """Predict sentiment with one mutually bound model and vocabulary snapshot.
 
     Parameters
     ----------
     review_text : str
         Review text to classify.
+    app_manifest : AppManifest or None, optional
+        Public snapshot already retained by the current dashboard rerun.
 
     Returns
     -------
@@ -292,12 +306,9 @@ def predict_sentiment(review_text: str) -> tuple[float, str]:
         If runtime or artifact compatibility validation fails.
     """
     validate_protocol_runtime()
-    app_manifest = load_public_snapshot()
-    model = _load_bound_model(app_manifest)
-    vectorizer = create_text_vectorizer(
-        sequence_length=app_manifest.payload["sequence_length"],
-        vocabulary=app_manifest.vocabulary_terms[2:],
-    )
+    public_snapshot = app_manifest or load_public_snapshot()
+    model = _load_bound_model(public_snapshot)
+    vectorizer = load_vectorizer(public_snapshot)
     inputs = tf.constant([review_text])
     token_ids = vectorizer(inputs)
     preds = model.predict(token_ids, verbose=0)
@@ -321,6 +332,7 @@ def main() -> None:
     None
     """
     st.set_page_config(page_title="Federated Sentiment Dashboard", layout="wide")
+    app_manifest = load_public_snapshot()
 
     if "auto_refresh" not in st.session_state:
         st.session_state.auto_refresh = True
@@ -382,7 +394,9 @@ def main() -> None:
 
         if st.button("Predict sentiment") and review.strip():
             try:
-                positive_prob, label = predict_sentiment(review)
+                positive_prob, label = predict_sentiment(
+                    review, app_manifest=app_manifest
+                )
                 st.markdown("### Positive sentiment probability")
                 st.markdown(f"**{positive_prob * 100:.1f}%**")
                 st.markdown(f"**Prediction:** {label}")
@@ -392,7 +406,6 @@ def main() -> None:
     with col_right:
         st.subheader("Training metrics")
 
-        app_manifest = load_public_snapshot()
         df_metrics = load_metrics(app_manifest=app_manifest)
         if df_metrics is None:
             st.info(
