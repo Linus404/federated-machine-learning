@@ -13,7 +13,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping, Never
 
 if TYPE_CHECKING:
     from src.app_manifest import AppManifest
@@ -73,6 +73,53 @@ def reject_duplicate_json_keys(
             raise ValueError(f"duplicate JSON object member: {key}")
         result[key] = item
     return result
+
+
+def _reject_non_finite_json_constant(constant: str) -> Never:
+    """Reject one non-standard non-finite JSON numeric constant.
+
+    Parameters
+    ----------
+    constant : str
+        Decoder token, such as ``NaN`` or ``Infinity``.
+
+    Raises
+    ------
+    ValueError
+        Always, because JSON does not define non-finite numeric constants.
+    """
+    raise ValueError(f"non-finite JSON constant: {constant}")
+
+
+def strict_json_loads(document: str | bytes | bytearray, *, source: str) -> Any:
+    """Decode strict JSON and normalize parser failures for one trust boundary.
+
+    Parameters
+    ----------
+    document : str, bytes, or bytearray
+        JSON document to decode.
+    source : str
+        Boundary-specific description included in the public error.
+
+    Returns
+    -------
+    Any
+        Decoded JSON value.
+
+    Raises
+    ------
+    ValueError
+        If UTF-8 or JSON syntax is invalid, an object member is duplicated, or a
+        non-finite numeric constant is present.
+    """
+    try:
+        return json.loads(
+            document,
+            object_pairs_hook=reject_duplicate_json_keys,
+            parse_constant=_reject_non_finite_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError(f"invalid {source}") from error
 
 
 def require_secure_artifact_platform() -> None:
@@ -499,9 +546,13 @@ def write_server_artifact_manifest(
     existing: Mapping[str, Any] | None = None
     if path.exists():
         try:
-            decoded = json.loads(read_regular_file(path, parent=canonical_dir))
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
-            raise ValueError("existing server artifact manifest is invalid") from error
+            document = read_regular_file(path, parent=canonical_dir)
+        except ValueError as error:
+            raise ValueError("invalid existing server artifact manifest") from error
+        decoded = strict_json_loads(
+            document,
+            source="existing server artifact manifest",
+        )
         existing = validate_artifact_schema(
             decoded,
             "server artifact manifest",
@@ -593,14 +644,14 @@ def load_server_artifact_snapshot(
                 "server artifact manifest has no valid schema_version; regenerate its "
                 "artifacts"
             ) from error
-    try:
-        payload = validate_artifact_schema(
-            json.loads(manifest_bytes.decode("utf-8")),
-            "server artifact manifest",
-            supported_version=SERVER_ARTIFACT_SCHEMA_VERSION,
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError(f"invalid server artifact manifest: {path}") from error
+    payload = validate_artifact_schema(
+        strict_json_loads(
+            manifest_bytes,
+            source=f"server artifact manifest: {path}",
+        ),
+        "server artifact manifest",
+        supported_version=SERVER_ARTIFACT_SCHEMA_VERSION,
+    )
     artifacts = payload.get("artifacts")
     mismatch_message = (
         "server artifact manifest does not match schema_version "

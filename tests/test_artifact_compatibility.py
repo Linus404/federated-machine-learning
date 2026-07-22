@@ -235,6 +235,59 @@ class ArtifactCompatibilityTests(unittest.TestCase):
                 canonical_json_bytes(payload),
             )
 
+    def test_server_manifest_read_boundaries_reject_hostile_json(self) -> None:
+        for operation in ("load", "finalize"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = Path(tmpdir)
+                manifest_path = write_server_artifact_manifest(
+                    path, app_manifest=fake_app_manifest()
+                )
+                valid = manifest_path.read_text(encoding="utf-8")
+            hostile_documents = (
+                valid.replace(
+                    '"schema_version": 2,',
+                    '"schema_version": 1,\n  "schema_version": 2,',
+                    1,
+                ),
+                valid.replace(
+                    '"public_manifest_checksum":',
+                    '"public_manifest_checksum": "invalid",\n'
+                    '    "public_manifest_checksum":',
+                    1,
+                ),
+                valid.replace(
+                    '"vocabulary_size": 20000,',
+                    '"vocabulary_size": 1,\n      "vocabulary_size": 20000,',
+                    1,
+                ),
+                *(
+                    valid[:-2] + f',\n  "producer": {constant}\n}}\n'
+                    for constant in ("NaN", "Infinity", "-Infinity")
+                ),
+            )
+            for document in hostile_documents:
+                with (
+                    self.subTest(operation=operation, document=document),
+                    tempfile.TemporaryDirectory() as tmpdir,
+                ):
+                    path = Path(tmpdir)
+                    manifest_path = write_server_artifact_manifest(
+                        path, app_manifest=fake_app_manifest()
+                    )
+                    manifest_path.write_text(document, encoding="utf-8")
+
+                    with self.assertRaisesRegex(
+                        ValueError, "invalid (existing )?server artifact manifest"
+                    ):
+                        if operation == "load":
+                            load_server_artifact_snapshot(path)
+                        else:
+                            write_server_artifact_manifest(
+                                path,
+                                app_manifest=fake_app_manifest(),
+                                finalized=True,
+                            )
+
     def test_server_artifact_manifest_rejects_changed_layout_without_version(
         self,
     ) -> None:

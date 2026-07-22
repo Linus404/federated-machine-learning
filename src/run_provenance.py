@@ -17,6 +17,7 @@ from src.app_manifest import AppManifest, load_app_manifest, resolve_public_arti
 from src.artifact_compatibility import (
     ARTIFACT_SCHEMA_VERSION,
     sha256_bytes,
+    strict_json_loads,
     validate_artifact_schema,
     write_json_atomically,
 )
@@ -620,16 +621,18 @@ def load_run_provenance_manifest(
     """
     manifest_path = Path(path)
     try:
-        payload = validate_artifact_schema(
-            json.loads(
-                manifest_path.read_text(encoding="utf-8")
-                if manifest_bytes is None
-                else manifest_bytes.decode("utf-8")
-            ),
-            "run provenance manifest",
+        document = (
+            manifest_path.read_bytes() if manifest_bytes is None else manifest_bytes
         )
-    except (UnicodeDecodeError, json.JSONDecodeError, OSError) as error:
+    except OSError as error:
         raise ValueError(f"invalid run provenance manifest: {manifest_path}") from error
+    payload = validate_artifact_schema(
+        strict_json_loads(
+            document,
+            source=f"run provenance manifest: {manifest_path}",
+        ),
+        "run provenance manifest",
+    )
     missing = REQUIRED_FIELDS - payload.keys()
     if missing:
         raise ValueError(

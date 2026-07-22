@@ -471,6 +471,66 @@ class RunProvenanceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "missing"):
                 load_run_provenance_manifest(path)
 
+    def test_loader_rejects_hostile_json_and_accepts_finite_additions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with (
+                patch(
+                    "src.run_provenance._code_revision",
+                    return_value={
+                        "commit": None,
+                        "dirty": None,
+                        "source": "unavailable",
+                    },
+                ),
+                patch(
+                    "src.run_provenance._environment_metadata",
+                    return_value=runtime_environment(),
+                ),
+            ):
+                manifest_path = write_run_provenance_manifest(
+                    root,
+                    {},
+                    run_id="12345678-1234-4234-9234-123456789abc",
+                )
+            valid = manifest_path.read_text(encoding="utf-8")
+            hostile_documents = (
+                valid.replace(
+                    '"schema_version": 1,',
+                    '"schema_version": 0,\n  "schema_version": 1,',
+                    1,
+                ),
+                valid.replace(
+                    '"run_id": "12345678-1234-4234-9234-123456789abc",',
+                    '"run_id": "attacker",\n  '
+                    '"run_id": "12345678-1234-4234-9234-123456789abc",',
+                    1,
+                ),
+                valid.replace(
+                    '"identity": null,',
+                    '"identity": "attacker",\n    "identity": null,',
+                    1,
+                ),
+                *(
+                    valid[:-2] + f',\n  "producer": {constant}\n}}\n'
+                    for constant in ("NaN", "Infinity", "-Infinity")
+                ),
+            )
+            for document in hostile_documents:
+                with self.subTest(document=document):
+                    manifest_path.write_text(document, encoding="utf-8")
+                    with self.assertRaisesRegex(
+                        ValueError, "invalid run provenance manifest"
+                    ):
+                        load_run_provenance_manifest(manifest_path)
+
+            finite = valid[:-2] + ',\n  "producer": {"attempt": 1.5}\n}\n'
+            manifest_path.write_text(finite, encoding="utf-8")
+            self.assertEqual(
+                load_run_provenance_manifest(manifest_path)["producer"],
+                {"attempt": 1.5},
+            )
+
     def test_loader_rejects_missing_and_invalid_nested_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

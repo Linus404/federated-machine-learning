@@ -171,6 +171,25 @@ class ArtifactHistoryTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "invalid current-run index"):
                     resolve_current_run_dir(root)
 
+    def test_current_index_rejects_non_finite_constants(self) -> None:
+        checksum = "sha256:" + "0" * 64
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            with (
+                self.subTest(constant=constant),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                (root / "current.json").write_text(
+                    '{"schema_version":1,'
+                    f'"run_id":"{RUN_IDS[0]}",'
+                    f'"artifact_manifest_checksum":"{checksum}",'
+                    f'"producer":{constant}}}',
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(ValueError, "invalid current-run index"):
+                    resolve_current_run_dir(root)
+
     def test_dangling_current_index_symlink_is_not_legacy_absence(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -272,6 +291,50 @@ class ArtifactHistoryTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "cannot be finalized again"):
                 publish_completed_run(root, run)
+
+    def test_finalization_rejects_hostile_provenance_json(self) -> None:
+        for hostile_case in (
+            "duplicate schema",
+            "duplicate run identity",
+            "duplicate dataset identity",
+            "NaN",
+            "Infinity",
+            "-Infinity",
+        ):
+            with (
+                self.subTest(hostile_case=hostile_case),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+                provenance_path = run / "run_manifest.json"
+                valid = provenance_path.read_text(encoding="utf-8")
+                if hostile_case == "duplicate schema":
+                    document = valid.replace(
+                        '"schema_version": 1,',
+                        '"schema_version": 0,\n  "schema_version": 1,',
+                        1,
+                    )
+                elif hostile_case == "duplicate run identity":
+                    document = valid.replace(
+                        f'"run_id": "{RUN_IDS[0]}",',
+                        f'"run_id": "{RUN_IDS[1]}",\n  "run_id": "{RUN_IDS[0]}",',
+                        1,
+                    )
+                elif hostile_case == "duplicate dataset identity":
+                    document = valid.replace(
+                        '"identity": null,',
+                        '"identity": "attacker",\n    "identity": null,',
+                        1,
+                    )
+                else:
+                    document = valid[:-2] + f',\n  "producer": {hostile_case}\n}}\n'
+                provenance_path.write_text(document, encoding="utf-8")
+
+                with self.assertRaisesRegex(
+                    ValueError, "invalid run provenance manifest"
+                ):
+                    publish_completed_run(root, run)
 
     def test_finalization_recovers_after_current_index_write_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
