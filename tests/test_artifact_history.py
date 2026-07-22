@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from src.app_manifest import expected_train_dataset
+from src.app_manifest import AppManifest, expected_train_dataset, load_app_manifest
 from src.artifact_history import (
     load_current_run_snapshot,
     prune_run_history,
@@ -18,11 +18,15 @@ from src.artifact_history import (
 )
 from src.artifact_compatibility import (
     canonical_json_bytes,
+    server_artifact_binding,
+    sha256_bytes,
     write_server_artifact_manifest,
 )
 from src.run_provenance import write_run_provenance_manifest
-from tests.artifact_helpers import fake_app_manifest
-from tests.test_run_provenance import runtime_environment
+from tests.test_run_provenance import (
+    runtime_environment,
+    write_public_dataset_contract,
+)
 
 
 RUN_IDS = (
@@ -32,7 +36,44 @@ RUN_IDS = (
 )
 
 
-def create_run(root: Path, run_id: str, created_at: str) -> Path:
+def create_public_snapshot(
+    root: Path, name: str, *, metadata: str | None = None
+) -> AppManifest:
+    """Create and load one valid public-manifest snapshot.
+
+    Parameters
+    ----------
+    root : pathlib.Path
+        Test artifact root.
+    name : str
+        Unique public artifact directory name.
+    metadata : str or None, optional
+        Additive manifest metadata used to create a distinct valid snapshot.
+
+    Returns
+    -------
+    src.app_manifest.AppManifest
+        Validated immutable public artifact snapshot.
+    """
+    public_dir = root / name
+    public_dir.mkdir()
+    protocol = write_public_dataset_contract(public_dir)
+    if metadata is not None:
+        path = public_dir / "manifest.json"
+        payload = json.loads(path.read_bytes())
+        payload["metadata"] = metadata
+        path.write_bytes(canonical_json_bytes(payload))
+    return load_app_manifest(public_artifact_dir=public_dir, protocol=protocol)
+
+
+def create_run(
+    root: Path,
+    run_id: str,
+    created_at: str,
+    *,
+    provenance_app_manifest: AppManifest | None = None,
+    artifact_app_manifest: AppManifest | None = None,
+) -> Path:
     """Create a complete run candidate for history tests.
 
     Parameters
@@ -43,12 +84,20 @@ def create_run(root: Path, run_id: str, created_at: str) -> Path:
         Canonical UUID4 directory identity.
     created_at : str
         Deterministic provenance timestamp.
+    provenance_app_manifest : src.app_manifest.AppManifest or None, optional
+        Public snapshot recorded by run provenance.
+    artifact_app_manifest : src.app_manifest.AppManifest or None, optional
+        Public snapshot bound by the server artifact manifest.
 
     Returns
     -------
     pathlib.Path
         Created run directory.
     """
+    provenance_manifest = provenance_app_manifest or create_public_snapshot(
+        root, f"public-{run_id}"
+    )
+    artifact_manifest = artifact_app_manifest or provenance_manifest
     run_dir = root / "runs" / run_id
     with (
         patch(
@@ -60,12 +109,18 @@ def create_run(root: Path, run_id: str, created_at: str) -> Path:
             return_value=runtime_environment(),
         ),
     ):
-        write_run_provenance_manifest(run_dir, {}, created_at=created_at, run_id=run_id)
+        write_run_provenance_manifest(
+            run_dir,
+            {},
+            app_manifest=provenance_manifest,
+            created_at=created_at,
+            run_id=run_id,
+        )
     (run_dir / "global_model.keras").write_bytes(f"model-{run_id}".encode())
     (run_dir / "metrics.csv").write_text(
         "round,loss,accuracy\n1,0.5,0.75\n", encoding="utf-8"
     )
-    write_server_artifact_manifest(run_dir, app_manifest=fake_app_manifest())
+    write_server_artifact_manifest(run_dir, app_manifest=artifact_manifest)
     return run_dir
 
 
@@ -312,6 +367,76 @@ class ArtifactHistoryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cannot be finalized again"):
                 publish_completed_run(root, run)
 
+    def test_publication_rejects_distinct_valid_public_manifest_bindings(self) -> None:
+        for existing_current in (False, True):
+            with (
+                self.subTest(existing_current=existing_current),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                first = create_public_snapshot(root, "public-first")
+                second = create_public_snapshot(
+                    root, "public-second", metadata="distinct"
+                )
+                if existing_current:
+                    current_run = create_run(
+                        root,
+                        RUN_IDS[0],
+                        "2026-01-01T00:00:00Z",
+                        provenance_app_manifest=first,
+                        artifact_app_manifest=first,
+                    )
+                    publish_completed_run(root, current_run)
+                    current_bytes = (root / "current.json").read_bytes()
+
+                candidate = create_run(
+                    root,
+                    RUN_IDS[1],
+                    "2026-01-02T00:00:00Z",
+                    provenance_app_manifest=first,
+                    artifact_app_manifest=second,
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "public manifest does not match"
+                ):
+                    publish_completed_run(root, candidate)
+
+                if existing_current:
+                    self.assertEqual(
+                        (root / "current.json").read_bytes(), current_bytes
+                    )
+                else:
+                    self.assertFalse((root / "current.json").exists())
+
+    def test_current_snapshot_rejects_distinct_valid_public_manifest_bindings(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            first = create_public_snapshot(root, "public-first")
+            second = create_public_snapshot(root, "public-second", metadata="distinct")
+            run = create_run(
+                root,
+                RUN_IDS[0],
+                "2026-01-01T00:00:00Z",
+                provenance_app_manifest=first,
+                artifact_app_manifest=first,
+            )
+            publish_completed_run(root, run)
+            artifact_manifest_path = run / "artifact_manifest.json"
+            artifact_manifest = json.loads(artifact_manifest_path.read_bytes())
+            artifact_manifest["binding"] = server_artifact_binding(second)
+            artifact_manifest_path.write_bytes(canonical_json_bytes(artifact_manifest))
+            current_path = root / "current.json"
+            current = json.loads(current_path.read_bytes())
+            current["artifact_manifest_checksum"] = sha256_bytes(
+                artifact_manifest_path.read_bytes()
+            )
+            current_path.write_bytes(canonical_json_bytes(current))
+
+            with self.assertRaisesRegex(ValueError, "public manifest does not match"):
+                load_current_run_snapshot(root)
+
     def test_finalization_rejects_hostile_provenance_json(self) -> None:
         for hostile_case in (
             "duplicate schema",
@@ -345,8 +470,8 @@ class ArtifactHistoryTests(unittest.TestCase):
                     )
                 elif hostile_case == "duplicate dataset identity":
                     document = valid.replace(
-                        '"identity": null,',
-                        '"identity": "attacker",\n    "identity": null,',
+                        '    "identity": ',
+                        '    "identity": "attacker",\n    "identity": ',
                         1,
                     )
                 else:

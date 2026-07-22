@@ -63,7 +63,7 @@ older and cannot be upgraded by editing a version field. Regenerate public schem
 `2`, client schema `2`, and the atomic prepared generation from the frozen source
 dataset. Server schema `1` artifacts are unbound to a public vocabulary and are
 also rejected; rerun local or federated training against the regenerated public
-artifacts to produce server schema `2`. Evaluation, run-provenance, and current-run
+artifacts to produce server schema `3`. Evaluation, run-provenance, and current-run
 schema `1` artifacts do not require a schema migration. Prepared-generation schema
 `1` did not bind the requested partition count and is no longer selectable. A
 pending schema-1 preparation is safely rolled back and its journal-owned candidate

@@ -234,6 +234,42 @@ def resolve_current_run_dir(artifact_root: str | Path) -> Path:
     return load_current_run_snapshot(root).directory
 
 
+def _validate_public_manifest_binding(
+    provenance: Mapping[str, Any], artifact_manifest: Mapping[str, Any]
+) -> None:
+    """Require run provenance and server artifacts to bind one public manifest.
+
+    Parameters
+    ----------
+    provenance : mapping of str to Any
+        Validated run provenance manifest.
+    artifact_manifest : mapping of str to Any
+        Validated server artifact manifest.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If the manifests do not bind the same public manifest checksum.
+    """
+    public_manifest = provenance["dataset"]["public_manifest"]
+    provenance_checksum = (
+        public_manifest.get("checksum")
+        if isinstance(public_manifest, Mapping)
+        else None
+    )
+    artifact_checksum = artifact_manifest["binding"]["public_manifest_checksum"]
+    if not isinstance(provenance_checksum, str) or not hmac.compare_digest(
+        provenance_checksum, artifact_checksum
+    ):
+        raise ValueError(
+            "run provenance public manifest does not match the server artifact binding"
+        )
+
+
 def load_current_run_snapshot(
     artifact_root: str | Path, *, app_manifest: AppManifest | None = None
 ) -> ServerArtifactSnapshot:
@@ -283,6 +319,7 @@ def load_current_run_snapshot(
     )
     if provenance["run_id"] != canonical_run_dir.name:
         raise ValueError("current run directory does not match its provenance run_id")
+    _validate_public_manifest_binding(provenance, snapshot.manifest)
     return snapshot
 
 
@@ -331,6 +368,7 @@ def publish_completed_run(artifact_root: str | Path, run_dir: str | Path) -> Pat
             snapshot = load_server_artifact_snapshot(
                 resolved_run_dir, manifest_bytes=manifest_bytes
             )
+            _validate_public_manifest_binding(provenance, snapshot.manifest)
             if snapshot.manifest.get("lifecycle") != "complete":
                 manifest_path = write_server_artifact_manifest(
                     resolved_run_dir,
@@ -361,6 +399,7 @@ def publish_completed_run(artifact_root: str | Path, run_dir: str | Path) -> Pat
         )
         if completed_provenance["run_id"] != resolved_run_dir.name:
             raise ValueError("run directory does not match its provenance run_id")
+        _validate_public_manifest_binding(completed_provenance, completed.manifest)
         verify_server_artifact_files(resolved_run_dir, artifact_snapshot)
         index = {
             "schema_version": ARTIFACT_SCHEMA_VERSION,
