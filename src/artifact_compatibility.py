@@ -11,11 +11,15 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
+
+if TYPE_CHECKING:
+    from src.app_manifest import AppManifest
 
 ARTIFACT_SCHEMA_VERSION = 1
 PUBLIC_ARTIFACT_SCHEMA_VERSION = 2
 CLIENT_SHARD_SCHEMA_VERSION = 2
+SERVER_ARTIFACT_SCHEMA_VERSION = 2
 SERVER_ARTIFACT_MANIFEST_FILENAME = "artifact_manifest.json"
 SERVER_ARTIFACTS: dict[str, dict[str, Any]] = {
     "model": {"filename": "global_model.keras", "format": "keras-v3"},
@@ -33,6 +37,12 @@ REQUIRED_COMPLETED_ARTIFACTS = {
     "metrics.csv",
     "run_manifest.json",
 }
+_SERVER_BINDING_FIELDS = {
+    "public_manifest_checksum",
+    "vocabulary_checksum",
+    "model_dimensions",
+}
+_MODEL_DIMENSION_FIELDS = {"vocabulary_size", "sequence_length", "embedding_dim"}
 
 
 @dataclass(frozen=True)
@@ -299,8 +309,107 @@ def validate_artifact_schema(
     return payload
 
 
+def server_artifact_binding(app_manifest: AppManifest) -> dict[str, Any]:
+    """Build the exact public-artifact and model-dimension server binding.
+
+    Parameters
+    ----------
+    app_manifest : AppManifest
+        Validated ``AppManifest`` snapshot used to construct the server model.
+
+    Returns
+    -------
+    dict of str to Any
+        Canonical binding recorded in the server artifact manifest.
+
+    Raises
+    ------
+    ValueError
+        If the supplied object is not a complete validated app-manifest snapshot.
+    """
+    try:
+        payload = app_manifest.payload
+        manifest_bytes = app_manifest.manifest_bytes
+        vocabulary_bytes = app_manifest.vocabulary_bytes
+        dimensions = {
+            name: payload[name]
+            for name in ("vocabulary_size", "sequence_length", "embedding_dim")
+        }
+    except (AttributeError, KeyError, TypeError) as error:
+        raise ValueError(
+            "server artifacts require a validated public manifest; regenerate training "
+            "artifacts with the current project version"
+        ) from error
+    if not isinstance(manifest_bytes, bytes) or not isinstance(vocabulary_bytes, bytes):
+        raise ValueError("server artifacts require immutable public artifact bytes")
+    if any(type(value) is not int or value <= 0 for value in dimensions.values()):
+        raise ValueError("server model dimensions must be positive built-in integers")
+    return {
+        "public_manifest_checksum": sha256_bytes(manifest_bytes),
+        "vocabulary_checksum": sha256_bytes(vocabulary_bytes),
+        "model_dimensions": dimensions,
+    }
+
+
+def _validate_server_binding(
+    value: object, *, app_manifest: AppManifest | None = None
+) -> Mapping[str, Any]:
+    """Validate a server binding and optionally match its public snapshot.
+
+    Parameters
+    ----------
+    value : object
+        Candidate decoded server binding.
+    app_manifest : AppManifest or None, optional
+        Public snapshot required by the consumer.
+
+    Returns
+    -------
+    mapping of str to Any
+        Validated binding.
+
+    Raises
+    ------
+    ValueError
+        If the binding is absent, malformed, or incompatible.
+    """
+    guidance = (
+        "server artifact is not bound to a compatible public manifest and vocabulary; "
+        "regenerate the server run with the current project version"
+    )
+    if not isinstance(value, Mapping) or set(value) != _SERVER_BINDING_FIELDS:
+        raise ValueError(guidance)
+    dimensions = value.get("model_dimensions")
+    if (
+        not isinstance(dimensions, Mapping)
+        or set(dimensions) != _MODEL_DIMENSION_FIELDS
+        or any(type(item) is not int or item <= 0 for item in dimensions.values())
+    ):
+        raise ValueError(guidance)
+    for field in ("public_manifest_checksum", "vocabulary_checksum"):
+        checksum = value.get(field)
+        if (
+            not isinstance(checksum, str)
+            or len(checksum) != 71
+            or not checksum.startswith("sha256:")
+            or any(character not in "0123456789abcdef" for character in checksum[7:])
+        ):
+            raise ValueError(guidance)
+    if app_manifest is not None and dict(value) != server_artifact_binding(
+        app_manifest
+    ):
+        raise ValueError(
+            "server artifact public-manifest, vocabulary, or model-dimension binding "
+            "does not match the configured public artifacts; regenerate the server run"
+        )
+    return value
+
+
 def write_server_artifact_manifest(
-    artifact_dir: Path, *, finalized: bool = False
+    artifact_dir: Path,
+    *,
+    app_manifest: AppManifest | None = None,
+    finalized: bool = False,
 ) -> Path:
     """Write the compatibility contract for one server artifact directory.
 
@@ -308,6 +417,9 @@ def write_server_artifact_manifest(
     ----------
     artifact_dir : pathlib.Path
         Server output directory.
+    app_manifest : AppManifest or None, optional
+        Validated public snapshot used to construct the model. Finalization may omit
+        it only when the existing in-progress manifest already contains the binding.
     finalized : bool, optional
         Require completed outputs and record their checksums.
 
@@ -315,25 +427,48 @@ def write_server_artifact_manifest(
     -------
     pathlib.Path
         Path to the written artifact manifest.
+
+    Raises
+    ------
+    ValueError
+        If no validated public binding is available or final artifacts are invalid.
     """
     artifact_dir.mkdir(parents=True, exist_ok=True)
     canonical_dir = artifact_dir.resolve(strict=True)
     if artifact_dir.is_symlink() or not artifact_dir.is_dir():
         raise ValueError("server artifact directory must be a regular directory")
     path = artifact_dir / SERVER_ARTIFACT_MANIFEST_FILENAME
+    existing: Mapping[str, Any] | None = None
+    if path.exists():
+        try:
+            decoded = json.loads(read_regular_file(path, parent=canonical_dir))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise ValueError("existing server artifact manifest is invalid") from error
+        existing = validate_artifact_schema(
+            decoded,
+            "server artifact manifest",
+            supported_version=SERVER_ARTIFACT_SCHEMA_VERSION,
+        )
+    binding = (
+        server_artifact_binding(app_manifest)
+        if app_manifest is not None
+        else dict(_validate_server_binding(existing.get("binding")))
+        if existing is not None
+        else None
+    )
+    if binding is None:
+        raise ValueError(
+            "server artifacts require a validated public manifest; regenerate training "
+            "artifacts with the current project version"
+        )
     payload: dict[str, Any] = {
-        "schema_version": ARTIFACT_SCHEMA_VERSION,
+        "schema_version": SERVER_ARTIFACT_SCHEMA_VERSION,
         "artifacts": SERVER_ARTIFACTS,
+        "binding": binding,
     }
     if finalized:
-        if path.exists():
-            existing = json.loads(
-                read_regular_file(path, parent=canonical_dir).decode("utf-8")
-            )
-            if (
-                isinstance(existing, Mapping)
-                and existing.get("lifecycle") == "complete"
-            ):
+        if existing is not None:
+            if existing.get("lifecycle") == "complete":
                 raise ValueError(
                     "completed artifact manifest cannot be finalized again"
                 )
@@ -362,7 +497,10 @@ def write_server_artifact_manifest(
 
 
 def load_server_artifact_snapshot(
-    artifact_dir: Path, *, manifest_bytes: bytes | None = None
+    artifact_dir: Path,
+    *,
+    manifest_bytes: bytes | None = None,
+    app_manifest: AppManifest | None = None,
 ) -> ServerArtifactSnapshot:
     """Load validated artifact bytes without reopening them after verification.
 
@@ -372,6 +510,8 @@ def load_server_artifact_snapshot(
         Directory containing ``artifact_manifest.json``.
     manifest_bytes : bytes or None, optional
         Exact manifest bytes already bound by a current-run pointer.
+    app_manifest : AppManifest or None, optional
+        Configured public snapshot that the server artifact must exactly match.
 
     Returns
     -------
@@ -397,14 +537,16 @@ def load_server_artifact_snapshot(
             ) from error
     try:
         payload = validate_artifact_schema(
-            json.loads(manifest_bytes.decode("utf-8")), "server artifact manifest"
+            json.loads(manifest_bytes.decode("utf-8")),
+            "server artifact manifest",
+            supported_version=SERVER_ARTIFACT_SCHEMA_VERSION,
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError(f"invalid server artifact manifest: {path}") from error
     artifacts = payload.get("artifacts")
     mismatch_message = (
         "server artifact manifest does not match schema_version "
-        f"{ARTIFACT_SCHEMA_VERSION}; regenerate its artifacts"
+        f"{SERVER_ARTIFACT_SCHEMA_VERSION}; regenerate its artifacts"
     )
     if not isinstance(artifacts, Mapping):
         raise ValueError(mismatch_message)
@@ -414,6 +556,7 @@ def load_server_artifact_snapshot(
             artifact.get(key) != value for key, value in layout.items()
         ):
             raise ValueError(mismatch_message)
+    _validate_server_binding(payload.get("binding"), app_manifest=app_manifest)
 
     lifecycle = payload.get("lifecycle")
     checksums = payload.get("checksums")
@@ -459,7 +602,7 @@ def load_server_artifact_snapshot(
         files[filename] = content
     return ServerArtifactSnapshot(
         directory=canonical_dir,
-        manifest=MappingProxyType(dict(payload)),
+        manifest=deep_freeze(payload),
         files=MappingProxyType(files),
     )
 

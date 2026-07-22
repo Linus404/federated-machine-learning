@@ -4,7 +4,7 @@ import tempfile
 import time
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import pandas as pd
 import streamlit as st
@@ -14,7 +14,7 @@ from src.protocol_runtime import validate_protocol_runtime
 import keras
 import tensorflow as tf
 
-from src.app_manifest import load_app_manifest
+from src.app_manifest import AppManifest, load_app_manifest
 from src.artifact_history import CURRENT_RUN_FILENAME, load_current_run_snapshot
 from src.artifact_compatibility import (
     SERVER_ARTIFACT_MANIFEST_FILENAME,
@@ -77,10 +77,36 @@ def load_model(path: Path | None = None) -> Any:
         If no trained model artifact exists.
     """
     validate_protocol_runtime()
+    app_manifest = load_app_manifest(public_artifact_dir=PUBLIC_ARTIFACT_DIR)
+    return _load_bound_model(app_manifest, path)
+
+
+def _load_bound_model(app_manifest: AppManifest, path: Path | None = None) -> Any:
+    """Load one server model bound to a validated public snapshot.
+
+    Parameters
+    ----------
+    app_manifest : AppManifest
+        Validated public app-manifest snapshot retained by the caller.
+    path : pathlib.Path or None, optional
+        Explicit server model path, or the selected current run when omitted.
+
+    Returns
+    -------
+    Any
+        Loaded dimension-validated Keras model.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the bound server snapshot contains no model.
+    ValueError
+        If the server binding or serialized model dimensions are incompatible.
+    """
     snapshot = (
-        load_current_run_snapshot(ARTIFACT_ROOT)
+        load_current_run_snapshot(ARTIFACT_ROOT, app_manifest=app_manifest)
         if path is None
-        else load_server_artifact_snapshot(path.parent)
+        else load_server_artifact_snapshot(path.parent, app_manifest=app_manifest)
     )
     model_bytes = snapshot.files.get("global_model.keras")
     if model_bytes is None:
@@ -92,7 +118,50 @@ def load_model(path: Path | None = None) -> Any:
     with tempfile.TemporaryDirectory() as tmpdir:
         model_path = Path(tmpdir) / "global_model.keras"
         model_path.write_bytes(model_bytes)
-        return keras.models.load_model(model_path)
+        model = keras.models.load_model(model_path)
+    _validate_model_dimensions(model, app_manifest.payload)
+    return model
+
+
+def _validate_model_dimensions(model: Any, public_manifest: Mapping[str, Any]) -> None:
+    """Require a loaded model to match its bound public dimensions.
+
+    Parameters
+    ----------
+    model : Any
+        Loaded Keras model candidate.
+    public_manifest : Any
+        Validated public manifest payload.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If input, output, vocabulary, or embedding dimensions differ.
+    """
+    try:
+        embedding = model.get_layer("token_embedding")
+        config = embedding.get_config()
+        dimensions = {
+            "vocabulary_size": config["input_dim"],
+            "embedding_dim": config["output_dim"],
+            "sequence_length": model.input_shape[-1],
+        }
+        output_units = model.output_shape[-1]
+    except (AttributeError, KeyError, TypeError) as error:
+        raise ValueError("server model has no compatible dimension contract") from error
+    expected = {
+        name: public_manifest[name]
+        for name in ("vocabulary_size", "embedding_dim", "sequence_length")
+    }
+    if dimensions != expected or output_units != 1:
+        raise ValueError(
+            "server model dimensions do not match its bound public artifacts; "
+            "regenerate the server run"
+        )
 
 
 @st.cache_resource
@@ -158,8 +227,30 @@ def load_metrics(
 
 
 def predict_sentiment(review_text: str) -> tuple[float, str]:
-    model = load_model()
-    vectorizer = load_vectorizer()
+    """Predict sentiment with one mutually bound model and vocabulary snapshot.
+
+    Parameters
+    ----------
+    review_text : str
+        Review text to classify.
+
+    Returns
+    -------
+    tuple of float and str
+        Positive-class probability and thresholded sentiment label.
+
+    Raises
+    ------
+    ValueError
+        If runtime or artifact compatibility validation fails.
+    """
+    validate_protocol_runtime()
+    app_manifest = load_app_manifest(public_artifact_dir=PUBLIC_ARTIFACT_DIR)
+    model = _load_bound_model(app_manifest)
+    vectorizer = create_text_vectorizer(
+        sequence_length=app_manifest.payload["sequence_length"],
+        vocabulary=app_manifest.vocabulary_terms[2:],
+    )
     inputs = tf.constant([review_text])
     token_ids = vectorizer(inputs)
     preds = model.predict(token_ids, verbose=0)

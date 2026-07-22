@@ -7,20 +7,20 @@ import json
 import os
 import shutil
 import stat
-import tempfile
 import tomllib
+import uuid
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from src.artifact_compatibility import (
+    canonical_json_bytes,
     deep_freeze,
     read_regular_file,
     sha256_bytes,
-    write_json_atomically,
 )
-from src.paths import acquire_run_artifact_lock, resolve_dir
+from src.paths import RunArtifactLock, resolve_prepared_artifact_dir
 
 EVALUATION_ARTIFACT_SCHEMA_VERSION = 1
 EVALUATION_MANIFEST_FILENAME = "manifest.json"
@@ -182,8 +182,8 @@ def _evaluation_dataset_manifest(protocol: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _validate_new_artifact_path(output_dir: str | Path) -> Path:
-    """Validate and prepare a new immutable evaluation artifact path.
+def _open_new_artifact_parent(output_dir: str | Path) -> tuple[Path, str, int]:
+    """Open a symlink-free parent chain for a new evaluation artifact.
 
     Parameters
     ----------
@@ -192,26 +192,128 @@ def _validate_new_artifact_path(output_dir: str | Path) -> Path:
 
     Returns
     -------
-    pathlib.Path
-        Canonical destination beneath a real parent directory.
+    tuple of pathlib.Path, str, and int
+        Lexical absolute parent, destination basename, and held directory descriptor.
 
     Raises
     ------
-    FileExistsError
-        If the destination already exists or is a symlink.
     ValueError
-        If the destination parent is not a regular directory.
+        If any existing component is a symlink or unsafe path type.
     """
-    output_path = resolve_dir(output_dir)
-    if output_path.exists() or output_path.is_symlink():
-        raise FileExistsError(
-            f"evaluation artifact path already exists; refusing replacement: {output_path}"
-        )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    parent = output_path.parent.resolve(strict=True)
-    if output_path.parent.is_symlink() or not parent.is_dir():
-        raise ValueError("evaluation artifact parent must be a regular directory")
-    return parent / output_path.name
+    candidate = Path(output_dir).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    output_path = Path(os.path.abspath(candidate))
+    if output_path.name in {"", ".", ".."}:
+        raise ValueError("evaluation artifact path must name a child directory")
+
+    anchor = Path(output_path.anchor)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(anchor, flags)
+    current = anchor
+    try:
+        relative_parts = output_path.parent.parts[len(anchor.parts) :]
+        for component in relative_parts:
+            try:
+                component_stat = os.stat(
+                    component, dir_fd=descriptor, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                os.mkdir(component, mode=0o755, dir_fd=descriptor)
+                component_stat = os.stat(
+                    component, dir_fd=descriptor, follow_symlinks=False
+                )
+            if not stat.S_ISDIR(component_stat.st_mode):
+                raise ValueError(
+                    "every existing evaluation artifact path component must be a "
+                    "regular directory"
+                )
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+            current /= component
+        return current, output_path.name, descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _acquire_evaluation_lock(
+    parent_descriptor: int, output_name: str
+) -> RunArtifactLock:
+    """Lock one evaluation destination through its validated parent descriptor.
+
+    Parameters
+    ----------
+    parent_descriptor : int
+        Held descriptor for the validated destination parent.
+    output_name : str
+        Direct child destination basename.
+
+    Returns
+    -------
+    RunArtifactLock
+        Exclusive nonblocking publication lock.
+
+    Raises
+    ------
+    RuntimeError
+        If another process owns the destination lock.
+    ValueError
+        If the lock entry is not a single-link regular file.
+    """
+    lock_name = f".{output_name}.run.lock"
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_name, flags, 0o600, dir_fd=parent_descriptor)
+    except OSError as error:
+        raise ValueError("evaluation artifact lock path is unsafe") from error
+    lock_stat = os.fstat(descriptor)
+    if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_nlink != 1:
+        os.close(descriptor)
+        raise ValueError("evaluation artifact lock path is unsafe")
+    file = os.fdopen(descriptor, "a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            if file.seek(0, os.SEEK_END) == 0:
+                file.write(b"\0")
+                file.flush()
+            file.seek(0)
+            msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+        else:
+            import fcntl
+
+            fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        file.close()
+        raise RuntimeError(
+            "Another evaluation artifact publication is already in progress"
+        ) from error
+    return RunArtifactLock(Path(lock_name), file)
+
+
+def _destination_exists(parent_descriptor: int, output_name: str) -> bool:
+    """Return whether a destination entry exists without following it.
+
+    Parameters
+    ----------
+    parent_descriptor : int
+        Held descriptor for the validated parent.
+    output_name : str
+        Direct child basename.
+
+    Returns
+    -------
+    bool
+        Whether any filesystem entry owns the name.
+    """
+    try:
+        os.stat(output_name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
 
 
 def _validate_row(
@@ -249,7 +351,9 @@ def _validate_row(
 
 def _publish_evaluation_artifact_unlocked(
     rows: Iterable[Mapping[str, Any]],
-    output_dir: str | Path,
+    parent: Path,
+    output_name: str,
+    parent_descriptor: int,
     *,
     protocol: Mapping[str, Any] | None = None,
 ) -> Path:
@@ -259,8 +363,12 @@ def _publish_evaluation_artifact_unlocked(
     ----------
     rows : iterable of mappings
         Official test rows in ascending source order.
-    output_dir : str or pathlib.Path
-        New dedicated artifact directory. Existing paths are never replaced.
+    parent : pathlib.Path
+        Validated lexical parent retained for the returned diagnostic path.
+    output_name : str
+        Direct child destination basename.
+    parent_descriptor : int
+        Held descriptor anchoring all mutation to the validated parent.
     protocol : mapping or None, optional
         Parsed frozen protocol, primarily for deterministic tests.
 
@@ -278,21 +386,30 @@ def _publish_evaluation_artifact_unlocked(
     """
     frozen = protocol or load_scientific_protocol()
     dataset_manifest = _evaluation_dataset_manifest(frozen)
-    output_path = _validate_new_artifact_path(output_dir)
-    staging_path = Path(
-        tempfile.mkdtemp(
-            dir=output_path.parent,
-            prefix=f".{output_path.name}.",
-            suffix=".staging",
+    output_path = parent / output_name
+    if _destination_exists(parent_descriptor, output_name):
+        raise FileExistsError(
+            f"evaluation artifact path already exists; refusing replacement: {output_path}"
         )
+    staging_name = f".{output_name}.{uuid.uuid4().hex}.staging"
+    os.mkdir(staging_name, mode=0o700, dir_fd=parent_descriptor)
+    staging_descriptor = os.open(
+        staging_name,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent_descriptor,
     )
-    records_path = staging_path / EVALUATION_RECORDS_FILENAME
     record_hash = hashlib.sha256()
     content_hash = hashlib.sha256()
     label_counts: Counter[int] = Counter()
     row_count = 0
     try:
-        with records_path.open("xb") as file:
+        records_descriptor = os.open(
+            EVALUATION_RECORDS_FILENAME,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=staging_descriptor,
+        )
+        with os.fdopen(records_descriptor, "wb") as file:
             for index, row in enumerate(rows):
                 text, label = _validate_row(
                     row.get("text"), row.get("label"), split="test", index=index
@@ -305,7 +422,12 @@ def _publish_evaluation_artifact_unlocked(
                 row_count += 1
             file.flush()
             os.fsync(file.fileno())
-        records_path.chmod(0o644)
+        os.chmod(
+            EVALUATION_RECORDS_FILENAME,
+            0o644,
+            dir_fd=staging_descriptor,
+            follow_symlinks=False,
+        )
 
         expected_counts = dataset_manifest["label_counts"]
         if row_count != dataset_manifest["rows"]:
@@ -339,16 +461,42 @@ def _publish_evaluation_artifact_unlocked(
                 EVALUATION_RECORDS_FILENAME: f"sha256:{record_hash.hexdigest()}"
             },
         }
-        write_json_atomically(
-            staging_path / EVALUATION_MANIFEST_FILENAME,
-            manifest,
-            overwrite=False,
+        manifest_descriptor = os.open(
+            EVALUATION_MANIFEST_FILENAME,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o644,
+            dir_fd=staging_descriptor,
         )
-        os.rename(staging_path, output_path)
+        with os.fdopen(manifest_descriptor, "wb") as file:
+            file.write(canonical_json_bytes(manifest))
+            file.flush()
+            os.fsync(file.fileno())
+        os.fsync(staging_descriptor)
+        staged_stat = os.stat(
+            staging_name, dir_fd=parent_descriptor, follow_symlinks=False
+        )
+        opened_stat = os.fstat(staging_descriptor)
+        if not stat.S_ISDIR(staged_stat.st_mode) or (
+            staged_stat.st_dev,
+            staged_stat.st_ino,
+        ) != (opened_stat.st_dev, opened_stat.st_ino):
+            raise ValueError("evaluation staging directory changed during publication")
+        os.rename(
+            staging_name,
+            output_name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        os.fsync(parent_descriptor)
         return output_path
     except BaseException:
-        shutil.rmtree(staging_path, ignore_errors=True)
+        try:
+            shutil.rmtree(staging_name, dir_fd=parent_descriptor)
+        except FileNotFoundError:
+            pass
         raise
+    finally:
+        os.close(staging_descriptor)
 
 
 def publish_evaluation_artifact(
@@ -382,20 +530,31 @@ def publish_evaluation_artifact(
     ValueError
         If owned residue, rows, or paths are invalid.
     """
-    output_path = resolve_dir(output_dir)
-    lock = acquire_run_artifact_lock(output_path)
+    parent, output_name, parent_descriptor = _open_new_artifact_parent(output_dir)
+    lock = _acquire_evaluation_lock(parent_descriptor, output_name)
     try:
-        prefix = f".{output_path.name}."
-        for residue in output_path.parent.glob(f"{prefix}*.staging"):
-            residue_stat = residue.lstat()
-            if residue.is_symlink() or not stat.S_ISDIR(residue_stat.st_mode):
+        prefix = f".{output_name}."
+        for residue_name in os.listdir(parent_descriptor):
+            if not residue_name.startswith(prefix) or not residue_name.endswith(
+                ".staging"
+            ):
+                continue
+            residue_stat = os.stat(
+                residue_name, dir_fd=parent_descriptor, follow_symlinks=False
+            )
+            if not stat.S_ISDIR(residue_stat.st_mode):
                 raise ValueError("evaluation staging residue is unsafe")
-            shutil.rmtree(residue)
+            shutil.rmtree(residue_name, dir_fd=parent_descriptor)
         return _publish_evaluation_artifact_unlocked(
-            rows, output_path, protocol=protocol
+            rows,
+            parent,
+            output_name,
+            parent_descriptor,
+            protocol=protocol,
         )
     finally:
         lock.release()
+        os.close(parent_descriptor)
 
 
 def _require_exact_fields(
@@ -517,7 +676,7 @@ def load_evaluation_artifact_snapshot(
     ValueError
         If any path, byte, identity, ordering, or checksum is invalid.
     """
-    directory = resolve_dir(artifact_dir)
+    directory = resolve_prepared_artifact_dir(artifact_dir, "evaluation")
     if directory.is_symlink() or not directory.is_dir():
         raise ValueError("evaluation artifact directory must be a regular directory")
     canonical_dir = directory.resolve(strict=True)

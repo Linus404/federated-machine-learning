@@ -14,7 +14,9 @@ from src.artifact_history import (
     publish_completed_run,
     resolve_current_run_dir,
 )
+from src.artifact_compatibility import write_server_artifact_manifest
 from src.run_provenance import write_run_provenance_manifest
+from tests.artifact_helpers import fake_app_manifest
 from tests.test_run_provenance import runtime_environment
 
 
@@ -58,6 +60,7 @@ def create_run(root: Path, run_id: str, created_at: str) -> Path:
     (run_dir / "metrics.csv").write_text(
         "round,loss,accuracy\n1,0.5,0.75\n", encoding="utf-8"
     )
+    write_server_artifact_manifest(run_dir, app_manifest=fake_app_manifest())
     return run_dir
 
 
@@ -204,7 +207,7 @@ class ArtifactHistoryTests(unittest.TestCase):
             except OSError as error:
                 self.skipTest(f"file symlinks are unavailable: {error}")
 
-            with self.assertRaisesRegex(ValueError, "contained regular file"):
+            with self.assertRaisesRegex(ValueError, "missing or unsafe"):
                 publish_completed_run(root, run)
 
     def test_completed_run_cannot_be_finalized_twice(self) -> None:

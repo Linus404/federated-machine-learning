@@ -16,7 +16,11 @@ from src.artifact_compatibility import (
     validate_artifact_schema,
 )
 from src.evaluation_artifact import load_scientific_protocol
-from src.paths import default_public_artifact_dir, resolve_dir
+from src.paths import (
+    default_public_artifact_dir,
+    resolve_dir,
+    resolve_prepared_artifact_dir,
+)
 
 
 @dataclass(frozen=True)
@@ -54,8 +58,28 @@ def configured_value(config, key):
 
 
 def resolve_public_artifact_dir(config=None, *, public_artifact_dir=None) -> Path:
+    """Resolve configured public artifacts through the selected data generation.
+
+    Parameters
+    ----------
+    config : mapping or None, optional
+        Flower run configuration containing ``public-artifact-dir``.
+    public_artifact_dir : str or pathlib.Path or None, optional
+        Explicit logical public artifact root.
+
+    Returns
+    -------
+    pathlib.Path
+        Selected immutable public directory, or the legacy configured directory.
+
+    Raises
+    ------
+    ValueError
+        If the prepared-generation pointer or selected public directory is unsafe.
+    """
     value = public_artifact_dir or configured_value(config, "public-artifact-dir")
-    return resolve_dir(value) if value else default_public_artifact_dir()
+    logical_dir = resolve_dir(value) if value else default_public_artifact_dir()
+    return resolve_prepared_artifact_dir(logical_dir, "public")
 
 
 def _expected_train_dataset(protocol: Mapping[str, Any]) -> dict[str, Any]:

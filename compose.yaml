@@ -1,6 +1,8 @@
 x-flower-service: &flower-service
   image: federated-machine-learning:latest
   restart: unless-stopped
+  env_file:
+    - .env.protocol
 
 x-clientapp: &clientapp
   <<: *flower-service

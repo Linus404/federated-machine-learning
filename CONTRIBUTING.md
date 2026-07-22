@@ -30,14 +30,14 @@ Follow the existing module structure and add or update tests for behavior
 changes. Before committing, run:
 
 ```bash
-uv run coverage run -m unittest discover -s tests -v
-uv run coverage report
-uv run ruff format --check .
-uv run ruff check .
-uv run mypy
+uv run --env-file .env.protocol coverage run -m unittest discover -s tests -v
+uv run --env-file .env.protocol coverage report
+uv run --env-file .env.protocol ruff format --check .
+uv run --env-file .env.protocol ruff check .
+uv run --env-file .env.protocol mypy
 ```
 
-Use `uv run ruff format .` to apply formatting. If a check cannot run in your
+Use `uv run --env-file .env.protocol ruff format .` to apply formatting. If a check cannot run in your
 environment, explain why in the pull request rather than marking it complete.
 
 Changes to experiment behavior or reported results must include enough

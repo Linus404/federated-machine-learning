@@ -20,7 +20,6 @@ from src.contracts import canonical_client_row_bytes, client_shard_metadata
 from src.data_prep import (
     _acquire_preparation_lock,
     _publish_prepared_roots,
-    _recover_owned_preparation_backup,
     build_vectorizer,
     main,
     package_raw_client_shards,
@@ -33,6 +32,7 @@ from src.local_training import (
     load_client_shard,
     load_client_shard_snapshot,
 )
+from src.paths import resolve_prepared_artifact_dir
 from src.text_preprocessing import create_text_vectorizer, protocol_standardize
 
 
@@ -387,26 +387,38 @@ def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> No
         )
 
     load_dataset.assert_called_once_with()
+    public_generation = resolve_prepared_artifact_dir(public_dir, "public")
+    client_generation = resolve_prepared_artifact_dir(client_dir, "client")
+    evaluation_generation = resolve_prepared_artifact_dir(evaluation_dir, "evaluation")
+    assert (
+        public_generation.parent
+        == client_generation.parent
+        == evaluation_generation.parent
+    )
     assert not list(tmp_path.rglob("*.npy"))
-    manifest = json.loads((public_dir / "manifest.json").read_text(encoding="utf-8"))
-    vocabulary = (public_dir / "vocab.txt").read_text(encoding="utf-8").splitlines()
+    manifest = json.loads(
+        (public_generation / "manifest.json").read_text(encoding="utf-8")
+    )
+    vocabulary = (
+        (public_generation / "vocab.txt").read_text(encoding="utf-8").splitlines()
+    )
     assert manifest["vocabulary_size"] == len(vocabulary)
     assert manifest["schema_version"] == PUBLIC_ARTIFACT_SCHEMA_VERSION
     assert "glove" not in json.dumps(manifest).lower()
     assert "embedding_matrix" not in manifest
-    assert not list(client_dir.glob("client-*.tar.gz"))
+    assert not list(client_generation.glob("client-*.tar.gz"))
     assert all(
-        (client_dir / f"client-{index}" / "reviews.jsonl").exists()
+        (client_generation / f"client-{index}" / "reviews.jsonl").exists()
         for index in range(4)
     )
     client_records = [
         json.loads(line)
-        for path in client_dir.glob("client-*/reviews.jsonl")
+        for path in client_generation.glob("client-*/reviews.jsonl")
         for line in path.read_text(encoding="utf-8").splitlines()
     ]
     evaluation_records = [
         json.loads(line)
-        for line in (evaluation_dir / "test.jsonl")
+        for line in (evaluation_generation / "test.jsonl")
         .read_text(encoding="utf-8")
         .splitlines()
     ]
@@ -417,10 +429,10 @@ def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> No
     assert all(record["row_id"].startswith("test:") for record in evaluation_records)
     untouched_texts = {row["text"] for row in test_rows}
     assert untouched_texts.isdisjoint(record["text"] for record in client_records)
-    public_bytes = b"".join(path.read_bytes() for path in public_dir.iterdir())
+    public_bytes = b"".join(path.read_bytes() for path in public_generation.iterdir())
     assert all(text.encode() not in public_bytes for text in untouched_texts)
-    assert (public_dir / "keep.txt").read_text(encoding="utf-8") == "keep"
-    assert (client_dir / "keep.txt").read_text(encoding="utf-8") == "keep"
+    assert (public_generation / "keep.txt").read_text(encoding="utf-8") == "keep"
+    assert (client_generation / "keep.txt").read_text(encoding="utf-8") == "keep"
 
 
 class ArtifactFlowTests(unittest.TestCase):
@@ -687,7 +699,18 @@ class ArtifactFlowTests(unittest.TestCase):
                 nonlocal publication_attempts
                 publication_attempts += 1
                 if publication_attempts == 1:
-                    raise RuntimeError("injected final publication failure")
+                    original_replace = os.replace
+
+                    def fail_generation_switch(source, destination):
+                        if Path(destination).name == ".prepared-current":
+                            raise RuntimeError("injected generation-switch failure")
+                        return original_replace(source, destination)
+
+                    with patch(
+                        "src.data_prep.os.replace",
+                        side_effect=fail_generation_switch,
+                    ):
+                        return _publish_prepared_roots(roots, stages)
                 return _publish_prepared_roots(roots, stages)
 
             with (
@@ -699,7 +722,7 @@ class ArtifactFlowTests(unittest.TestCase):
                     side_effect=publish_once_then_succeed,
                 ),
             ):
-                with self.assertRaisesRegex(RuntimeError, "final publication"):
+                with self.assertRaisesRegex(RuntimeError, "generation-switch"):
                     prepare_all(
                         2,
                         root / "clients",
@@ -707,6 +730,10 @@ class ArtifactFlowTests(unittest.TestCase):
                         evaluation_dir,
                     )
                 self.assertFalse(evaluation_dir.exists())
+                stale_generations = list(
+                    (root / ".prepared-generations").glob("*-*-*-*-*")
+                )
+                self.assertEqual(len(stale_generations), 1)
 
                 prepare_all(
                     2,
@@ -715,8 +742,30 @@ class ArtifactFlowTests(unittest.TestCase):
                     evaluation_dir,
                 )
 
-            self.assertTrue(evaluation_dir.is_dir())
-            self.assertEqual(publication_attempts, 2)
+                selected_before_retry = resolve_prepared_artifact_dir(
+                    root / "public", "public"
+                ).parent
+                prepare_all(
+                    2,
+                    root / "clients",
+                    root / "public",
+                    evaluation_dir,
+                )
+
+            self.assertTrue(
+                resolve_prepared_artifact_dir(evaluation_dir, "evaluation").is_dir()
+            )
+            self.assertEqual(publication_attempts, 3)
+            generations = list((root / ".prepared-generations").glob("*-*-*-*-*"))
+            self.assertEqual(len(generations), 3)
+            selected = resolve_prepared_artifact_dir(root / "public", "public").parent
+            self.assertIn(selected, generations)
+            self.assertNotEqual(selected, stale_generations[0])
+            self.assertNotEqual(selected, selected_before_retry)
+            self.assertTrue((root / ".prepared-current").is_symlink())
+            self.assertTrue((root / "public").is_symlink())
+            self.assertTrue((root / "clients").is_symlink())
+            self.assertTrue(evaluation_dir.is_symlink())
 
     def test_preparation_rejects_overlapping_artifact_boundaries_before_loading(
         self,
@@ -1008,20 +1057,6 @@ class ArtifactFlowTests(unittest.TestCase):
                 load_dataset.assert_not_called()
             finally:
                 lock.release()
-
-    def test_preparation_recovers_only_owned_interrupted_backup(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            public = root / "public"
-            public.mkdir()
-            (public / "keep.txt").write_text("keep", encoding="utf-8")
-            backup = root / ".public.deadbeef.backup"
-            public.rename(backup)
-
-            _recover_owned_preparation_backup(public)
-
-            self.assertEqual((public / "keep.txt").read_text(encoding="utf-8"), "keep")
-            self.assertFalse(backup.exists())
 
 
 if __name__ == "__main__":

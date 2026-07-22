@@ -336,7 +336,9 @@ class SentimentServer(FedProx):
         self.app_manifest = app_manifest
         self.huber_threshold = huber_threshold
         self.use_huber = use_huber
-        write_server_artifact_manifest(self.artifact_dir)
+        write_server_artifact_manifest(
+            self.artifact_dir, app_manifest=self.app_manifest
+        )
 
     @property
     def model_path(self) -> Path:

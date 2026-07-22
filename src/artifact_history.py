@@ -11,7 +11,10 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, Iterator, Mapping
+
+if TYPE_CHECKING:
+    from src.app_manifest import AppManifest
 
 from src.artifact_compatibility import (
     ARTIFACT_SCHEMA_VERSION,
@@ -218,13 +221,17 @@ def resolve_current_run_dir(artifact_root: str | Path) -> Path:
     return load_current_run_snapshot(root).directory
 
 
-def load_current_run_snapshot(artifact_root: str | Path) -> ServerArtifactSnapshot:
+def load_current_run_snapshot(
+    artifact_root: str | Path, *, app_manifest: AppManifest | None = None
+) -> ServerArtifactSnapshot:
     """Read the selected run into a checksum-verified immutable snapshot.
 
     Parameters
     ----------
     artifact_root : str or pathlib.Path
         Root containing run history or legacy flat artifacts.
+    app_manifest : AppManifest or None, optional
+        Configured public snapshot that the selected server artifact must match.
 
     Returns
     -------
@@ -234,7 +241,7 @@ def load_current_run_snapshot(artifact_root: str | Path) -> ServerArtifactSnapsh
     root, runs_root = _history_paths(artifact_root)
     index = _load_current_index(root)
     if index is None:
-        return load_server_artifact_snapshot(root)
+        return load_server_artifact_snapshot(root, app_manifest=app_manifest)
     run_dir = runs_root / str(index["run_id"])
     if run_dir.is_symlink() or not run_dir.is_dir():
         raise ValueError(f"current run directory is missing or unsafe: {run_dir}")
@@ -253,7 +260,9 @@ def load_current_run_snapshot(artifact_root: str | Path) -> ServerArtifactSnapsh
     ):
         raise ValueError("current-run artifact manifest checksum does not match")
     return load_server_artifact_snapshot(
-        canonical_run_dir, manifest_bytes=manifest_bytes
+        canonical_run_dir,
+        manifest_bytes=manifest_bytes,
+        app_manifest=app_manifest,
     )
 
 

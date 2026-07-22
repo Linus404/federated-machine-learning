@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
 import stat
+import uuid
 from pathlib import Path
 from typing import BinaryIO
+
+from src.artifact_compatibility import read_regular_file
 
 PUBLIC_ARTIFACT_DIR_ENV = "FML_PUBLIC_ARTIFACT_DIR"
 SERVER_ARTIFACT_DIR_ENV = "FML_SERVER_ARTIFACT_DIR"
@@ -11,6 +15,10 @@ EVALUATION_ARTIFACT_DIR_ENV = "FML_EVALUATION_ARTIFACT_DIR"
 DEFAULT_PUBLIC_ARTIFACT_DIR = Path("artifacts/public")
 DEFAULT_SERVER_ARTIFACT_DIR = Path("artifacts/server")
 DEFAULT_EVALUATION_ARTIFACT_DIR = Path("artifacts/evaluation")
+PREPARED_CURRENT_FILENAME = ".prepared-current"
+PREPARED_GENERATIONS_DIRECTORY = ".prepared-generations"
+PREPARED_GENERATION_SCHEMA_VERSION = 1
+PREPARED_ARTIFACT_KINDS = frozenset({"client", "public", "evaluation"})
 
 
 class RunArtifactLock:
@@ -53,6 +61,99 @@ def resolve_dir(value: str | Path) -> Path:
             return path.parent.resolve() / path.name
         return path.resolve()
     return Path.cwd() / path
+
+
+def resolve_prepared_artifact_dir(value: str | Path, artifact_kind: str) -> Path:
+    """Resolve a logical prepared-data root through one atomic generation index.
+
+    Parameters
+    ----------
+    value : str or pathlib.Path
+        Configured logical artifact root.
+    artifact_kind : str
+        One of ``client``, ``public``, or ``evaluation``.
+
+    Returns
+    -------
+    pathlib.Path
+        Immutable selected generation directory, or the legacy logical root when no
+        generation index exists.
+
+    Raises
+    ------
+    ValueError
+        If the index, configured logical name, or selected generation is unsafe.
+    """
+    if artifact_kind not in PREPARED_ARTIFACT_KINDS:
+        raise ValueError(f"unsupported prepared artifact kind: {artifact_kind}")
+    logical_root = resolve_dir(value)
+    parent = logical_root.parent
+    pointer = parent / PREPARED_CURRENT_FILENAME
+    if not pointer.exists() and not pointer.is_symlink():
+        return logical_root
+    if parent.is_symlink() or not parent.is_dir():
+        raise ValueError("prepared artifact parent must be a regular directory")
+    if not pointer.is_symlink():
+        raise ValueError("prepared generation pointer must be an atomic directory link")
+    target = Path(os.readlink(pointer))
+    if target.is_absolute() or len(target.parts) != 2:
+        raise ValueError("prepared generation pointer target is invalid")
+    generations_name, generation_id = target.parts
+    if generations_name != PREPARED_GENERATIONS_DIRECTORY:
+        raise ValueError("prepared generation pointer target is invalid")
+    generations = parent / PREPARED_GENERATIONS_DIRECTORY
+    generation = generations / generation_id
+    index_path = generation / "index.json"
+    if generations.is_symlink() or generation.is_symlink() or not generation.is_dir():
+        raise ValueError("selected prepared generation is missing or unsafe")
+    canonical_generations = generations.resolve(strict=True)
+    canonical_generation = generation.resolve(strict=True)
+    if canonical_generation.parent != canonical_generations:
+        raise ValueError("selected prepared generation escapes its artifact root")
+    try:
+        payload = json.loads(
+            read_regular_file(index_path, parent=canonical_generation).decode("utf-8")
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError("prepared generation index is invalid or unsafe") from error
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema_version",
+        "generation_id",
+        "logical_roots",
+    }:
+        raise ValueError("prepared generation index has an invalid field set")
+    if payload["schema_version"] != PREPARED_GENERATION_SCHEMA_VERSION:
+        raise ValueError("prepared generation index has an unsupported schema_version")
+    logical_roots = payload["logical_roots"]
+    if (
+        not isinstance(logical_roots, dict)
+        or set(logical_roots) != PREPARED_ARTIFACT_KINDS
+        or any(
+            not isinstance(name, str)
+            or Path(name).name != name
+            or name in {"", ".", ".."}
+            for name in logical_roots.values()
+        )
+        or logical_roots[artifact_kind] != logical_root.name
+    ):
+        raise ValueError("prepared generation index does not match configured roots")
+    generation_id = payload["generation_id"]
+    try:
+        parsed_id = uuid.UUID(generation_id) if isinstance(generation_id, str) else None
+    except ValueError as error:
+        raise ValueError(
+            "prepared generation index has an invalid generation_id"
+        ) from error
+    if parsed_id is None or parsed_id.version != 4 or str(parsed_id) != generation_id:
+        raise ValueError("prepared generation index has an invalid generation_id")
+
+    selected = generation / artifact_kind
+    if selected.is_symlink() or not selected.is_dir():
+        raise ValueError("selected prepared generation is missing or unsafe")
+    canonical_selected = selected.resolve(strict=True)
+    if canonical_selected.parent != canonical_generation:
+        raise ValueError("selected prepared generation escapes its artifact root")
+    return canonical_selected
 
 
 def default_public_artifact_dir() -> Path:

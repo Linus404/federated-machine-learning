@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from src.app_manifest import load_app_manifest
+from src.app_manifest import load_app_manifest, resolve_public_artifact_dir
 from src.artifact_compatibility import (
     ARTIFACT_SCHEMA_VERSION,
     sha256_bytes,
@@ -21,7 +21,7 @@ from src.artifact_compatibility import (
     write_json_atomically,
 )
 from src.contracts import DEFAULT_SPLIT_SEED, DEFAULT_VALIDATION_SEED
-from src.paths import resolve_dir, run_manifest_path
+from src.paths import run_manifest_path
 
 CODE_REVISION_ENV = "FML_CODE_REVISION"
 RUNTIME_PACKAGES = ("datasets", "flwr", "keras", "numpy", "tensorflow")
@@ -457,7 +457,11 @@ def _dataset_metadata(
     ValueError
         If a declared public artifact escapes its configured directory.
     """
-    public_dir = resolve_dir(public_artifact_dir) if public_artifact_dir else None
+    public_dir = (
+        resolve_public_artifact_dir(public_artifact_dir=public_artifact_dir)
+        if public_artifact_dir
+        else None
+    )
     private_status = (
         {
             "status": "available",

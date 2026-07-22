@@ -8,7 +8,11 @@ from unittest.mock import patch
 
 import dashboard
 import numpy as np
-from src.artifact_compatibility import ARTIFACT_SCHEMA_VERSION, SERVER_ARTIFACTS
+from src.artifact_compatibility import (
+    SERVER_ARTIFACT_SCHEMA_VERSION,
+    write_server_artifact_manifest,
+)
+from tests.artifact_helpers import compatible_model, fake_app_manifest
 
 
 def write_server_manifest(path: Path, version: int | None) -> None:
@@ -25,10 +29,15 @@ def write_server_manifest(path: Path, version: int | None) -> None:
     -------
     None
     """
-    payload = {"artifacts": SERVER_ARTIFACTS}
-    if version is not None:
+    manifest_path = write_server_artifact_manifest(
+        path, app_manifest=fake_app_manifest()
+    )
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if version is None:
+        payload.pop("schema_version")
+    else:
         payload["schema_version"] = version
-    (path / "artifact_manifest.json").write_text(json.dumps(payload), encoding="utf-8")
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 class DashboardArtifactTests(unittest.TestCase):
@@ -56,7 +65,11 @@ class DashboardArtifactTests(unittest.TestCase):
                 dashboard.load_metrics()
 
     def test_model_loader_checks_each_schema_version_state(self) -> None:
-        for version, error in ((None, "no valid"), (0, "older"), (2, "newer")):
+        for version, error in (
+            (None, "no valid"),
+            (SERVER_ARTIFACT_SCHEMA_VERSION - 1, "older"),
+            (SERVER_ARTIFACT_SCHEMA_VERSION + 1, "newer"),
+        ):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as tmpdir:
                 path = Path(tmpdir)
                 model_path = path / "global_model.keras"
@@ -64,6 +77,9 @@ class DashboardArtifactTests(unittest.TestCase):
                 write_server_manifest(path, version)
 
                 with (
+                    patch.object(
+                        dashboard, "load_app_manifest", return_value=fake_app_manifest()
+                    ),
                     patch.object(dashboard.keras.models, "load_model") as load_model,
                     self.assertRaisesRegex(ValueError, error),
                 ):
@@ -74,9 +90,12 @@ class DashboardArtifactTests(unittest.TestCase):
             path = Path(tmpdir)
             model_path = path / "global_model.keras"
             model_path.touch()
-            write_server_manifest(path, ARTIFACT_SCHEMA_VERSION)
-            sentinel = object()
+            write_server_manifest(path, SERVER_ARTIFACT_SCHEMA_VERSION)
+            sentinel = compatible_model()
             with (
+                patch.object(
+                    dashboard, "load_app_manifest", return_value=fake_app_manifest()
+                ),
                 patch.object(
                     dashboard.keras.models, "load_model", return_value=sentinel
                 ),
@@ -84,7 +103,11 @@ class DashboardArtifactTests(unittest.TestCase):
                 self.assertIs(dashboard.load_model(model_path), sentinel)
 
     def test_metrics_loader_checks_each_schema_version_state(self) -> None:
-        for version, error in ((None, "no valid"), (0, "older"), (2, "newer")):
+        for version, error in (
+            (None, "no valid"),
+            (SERVER_ARTIFACT_SCHEMA_VERSION - 1, "older"),
+            (SERVER_ARTIFACT_SCHEMA_VERSION + 1, "newer"),
+        ):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as tmpdir:
                 path = Path(tmpdir)
                 metrics_path = path / "metrics.csv"
@@ -102,7 +125,7 @@ class DashboardArtifactTests(unittest.TestCase):
             metrics_path.write_text(
                 "round,loss,accuracy\n1,0.5,0.75\n", encoding="utf-8"
             )
-            write_server_manifest(path, ARTIFACT_SCHEMA_VERSION)
+            write_server_manifest(path, SERVER_ARTIFACT_SCHEMA_VERSION)
 
             metrics = dashboard.load_metrics(metrics_path)
 
@@ -124,15 +147,62 @@ class DashboardArtifactTests(unittest.TestCase):
             path = Path(tmpdir)
             model_path = path / "global_model.keras"
             model_path.write_bytes(b"verified-model")
-            write_server_manifest(path, ARTIFACT_SCHEMA_VERSION)
+            write_server_manifest(path, SERVER_ARTIFACT_SCHEMA_VERSION)
 
             def inspect_snapshot(loaded_path: Path) -> object:
                 model_path.write_bytes(b"attacker-controlled")
                 self.assertEqual(Path(loaded_path).read_bytes(), b"verified-model")
-                return object()
+                return compatible_model()
 
-            with patch.object(
-                dashboard.keras.models, "load_model", side_effect=inspect_snapshot
+            with (
+                patch.object(
+                    dashboard, "load_app_manifest", return_value=fake_app_manifest()
+                ),
+                patch.object(
+                    dashboard.keras.models,
+                    "load_model",
+                    side_effect=inspect_snapshot,
+                ),
+            ):
+                dashboard.load_model(model_path)
+
+    def test_model_loader_rejects_public_binding_mismatch_before_keras(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            model_path = path / "global_model.keras"
+            model_path.write_bytes(b"model")
+            write_server_manifest(path, SERVER_ARTIFACT_SCHEMA_VERSION)
+            incompatible = fake_app_manifest()
+            incompatible.manifest_bytes = b"different public manifest\n"
+
+            with (
+                patch.object(dashboard, "load_app_manifest", return_value=incompatible),
+                patch.object(dashboard.keras.models, "load_model") as load_model,
+                self.assertRaisesRegex(ValueError, "does not match"),
+            ):
+                dashboard.load_model(model_path)
+
+            load_model.assert_not_called()
+
+    def test_model_loader_rejects_serialized_model_dimension_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            model_path = path / "global_model.keras"
+            model_path.write_bytes(b"model")
+            write_server_manifest(path, SERVER_ARTIFACT_SCHEMA_VERSION)
+            incompatible_model = compatible_model()
+            incompatible_model.input_shape = (None, 499)
+
+            with (
+                patch.object(
+                    dashboard, "load_app_manifest", return_value=fake_app_manifest()
+                ),
+                patch.object(
+                    dashboard.keras.models,
+                    "load_model",
+                    return_value=incompatible_model,
+                ),
+                self.assertRaisesRegex(ValueError, "model dimensions"),
             ):
                 dashboard.load_model(model_path)
 
@@ -163,7 +233,7 @@ class DashboardArtifactTests(unittest.TestCase):
             patch(
                 "src.text_preprocessing.keras.layers.TextVectorization"
             ) as vectorizer,
-            self.assertRaisesRegex(ValueError, "runtime environment differs"),
+            self.assertRaisesRegex(ValueError, "startup environment differs"),
         ):
             dashboard.load_vectorizer.clear()
             dashboard.load_vectorizer()

@@ -136,6 +136,55 @@ class EvaluationArtifactTests(unittest.TestCase):
             self.assertTrue(artifact.is_dir())
             self.assertFalse(residue.exists())
 
+    def test_publication_rejects_symlinked_ancestor_before_external_cleanup(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            external = root / "external"
+            external.mkdir()
+            residue = external / ".evaluation.hostile.staging"
+            residue.mkdir()
+            marker = residue / "must-survive"
+            marker.write_text("external", encoding="utf-8")
+            linked_parent = root / "linked-parent"
+            try:
+                linked_parent.symlink_to(external, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"directory symlinks are unavailable: {error}")
+
+            with self.assertRaisesRegex(ValueError, "path component"):
+                publish_evaluation_artifact(
+                    self.rows,
+                    linked_parent / "evaluation",
+                    protocol=self.protocol,
+                )
+
+            self.assertEqual(marker.read_text(encoding="utf-8"), "external")
+            self.assertFalse((external / "evaluation").exists())
+            self.assertFalse((external / ".evaluation.run.lock").exists())
+
+    def test_publication_rejects_linked_residue_without_external_deletion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            external = root / "external"
+            external.mkdir()
+            marker = external / "must-survive"
+            marker.write_text("external", encoding="utf-8")
+            residue = root / ".evaluation.hostile.staging"
+            try:
+                residue.symlink_to(external, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"directory symlinks are unavailable: {error}")
+
+            with self.assertRaisesRegex(ValueError, "residue is unsafe"):
+                publish_evaluation_artifact(
+                    self.rows, root / "evaluation", protocol=self.protocol
+                )
+
+            self.assertEqual(marker.read_text(encoding="utf-8"), "external")
+            self.assertTrue(residue.is_symlink())
+
     def test_loader_rejects_tampering_noncanonical_rows_and_unsafe_files(self) -> None:
         mutations = {
             "checksum": lambda path: path.write_bytes(path.read_bytes() + b"x"),

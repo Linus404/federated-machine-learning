@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import os
+import sys
 from typing import Any, Mapping
+
+_DETERMINISM_REGISTERED = False
 
 
 def _runtime_protocol(protocol: Mapping[str, Any] | None) -> Mapping[str, Any]:
@@ -26,10 +30,10 @@ def _runtime_protocol(protocol: Mapping[str, Any] | None) -> Mapping[str, Any]:
     return load_scientific_protocol()
 
 
-def configure_protocol_environment(
+def validate_protocol_startup_environment(
     protocol: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
-    """Set absent pre-import values and reject conflicting environment values.
+    """Require frozen environment values that must exist before Python starts.
 
     Parameters
     ----------
@@ -44,21 +48,42 @@ def configure_protocol_environment(
     Raises
     ------
     ValueError
-        If a required environment value was explicitly set to another value.
+        If a required value is missing, conflicting, or was applied after startup.
     """
     frozen = _runtime_protocol(protocol)
     required = frozen["framework"]["execution_environment_before_import"]
-    mismatches = []
+    mismatches: list[str] = []
     for name, expected in required.items():
-        actual = os.environ.setdefault(name, expected)
+        actual = os.environ.get(name)
         if actual != expected:
-            mismatches.append(f"{name}: expected {expected}, got {actual}")
+            mismatches.append(
+                f"{name}: expected {expected}, got {actual if actual is not None else '<missing>'}"
+            )
+    if required.get("PYTHONHASHSEED") == "0" and sys.flags.hash_randomization != 0:
+        mismatches.append("PYTHONHASHSEED was not applied before interpreter startup")
     if mismatches:
         raise ValueError(
-            "runtime environment differs from the frozen protocol: "
+            "startup environment differs from the frozen protocol: "
             + "; ".join(mismatches)
         )
     return frozen
+
+
+def _register_tensorflow_determinism() -> Any:
+    """Enable deterministic TensorFlow operations once before application imports.
+
+    Returns
+    -------
+    Any
+        Imported TensorFlow module.
+    """
+    global _DETERMINISM_REGISTERED
+    import tensorflow as tf
+
+    if not _DETERMINISM_REGISTERED:
+        tf.config.experimental.enable_op_determinism()
+        _DETERMINISM_REGISTERED = True
+    return tf
 
 
 def validate_protocol_runtime(
@@ -81,19 +106,22 @@ def validate_protocol_runtime(
     ValueError
         If required environment values or runtime versions differ.
     """
-    frozen = configure_protocol_environment(protocol)
+    frozen = validate_protocol_startup_environment(protocol)
 
     import keras
     import numpy as np
-    import tensorflow as tf
+
+    tf = _register_tensorflow_determinism()
 
     framework = frozen["framework"]
     installed = {
+        "flower": importlib.metadata.version("flwr"),
         "tensorflow": tf.__version__,
         "keras": keras.__version__,
         "numpy": np.__version__,
     }
     expected = {
+        "flower": frozen["aggregation"]["flower_version"],
         "tensorflow": framework["tensorflow_version"],
         "keras": framework["keras_version"],
         "numpy": framework["numpy_version"],
@@ -111,4 +139,5 @@ def validate_protocol_runtime(
     return frozen
 
 
-configure_protocol_environment()
+validate_protocol_startup_environment()
+_register_tensorflow_determinism()

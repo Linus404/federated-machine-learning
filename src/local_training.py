@@ -39,6 +39,7 @@ from src.paths import (
     acquire_run_artifact_lock,
     default_public_artifact_dir,
     resolve_dir,
+    resolve_prepared_artifact_dir,
 )
 from src.text_preprocessing import create_text_vectorizer
 
@@ -175,7 +176,9 @@ def load_client_shard_snapshot(
     """
     if type(expected_client_id) is not int or expected_client_id < 0:
         raise ValueError("expected client ID must be a non-negative integer")
-    directory = resolve_dir(client_data_dir)
+    logical_directory = resolve_dir(client_data_dir)
+    client_root = resolve_prepared_artifact_dir(logical_directory.parent, "client")
+    directory = client_root / logical_directory.name
     if directory.is_symlink() or not directory.is_dir():
         raise ValueError("client shard directory must be a regular directory")
     canonical_dir = directory.resolve(strict=True)
@@ -519,7 +522,7 @@ def train(args: argparse.Namespace) -> tuple[Any, Any]:
             client_shard=shard_snapshot.provenance(),
         )
         prune_run_history(artifact_root, retention_runs, active_run_dir=run_dir)
-        write_server_artifact_manifest(run_dir)
+        write_server_artifact_manifest(run_dir, app_manifest=manifest)
         train_data, val_data = _tokenize_client_shard(
             shard_snapshot, manifest, args.validation_split
         )

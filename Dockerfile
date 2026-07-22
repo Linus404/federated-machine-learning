@@ -3,7 +3,9 @@ FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_PROJECT_ENVIRONMENT=/opt/fml-venv \
+    PYTHONHASHSEED=0 \
     TF_ENABLE_ONEDNN_OPTS=0 \
+    TF_DETERMINISTIC_OPS=1 \
     TF_CPP_MIN_LOG_LEVEL=3 \
     KERAS_BACKEND=tensorflow \
     FML_PUBLIC_ARTIFACT_DIR=/app/artifacts/public \

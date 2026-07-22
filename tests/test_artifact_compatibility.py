@@ -9,15 +9,28 @@ from src.app_manifest import load_app_manifest
 from src.artifact_compatibility import (
     ARTIFACT_SCHEMA_VERSION,
     PUBLIC_ARTIFACT_SCHEMA_VERSION,
+    SERVER_ARTIFACT_SCHEMA_VERSION,
     SERVER_ARTIFACTS,
     canonical_json_bytes,
     load_server_artifact_manifest,
+    load_server_artifact_snapshot,
     validate_artifact_schema,
     write_server_artifact_manifest,
 )
+from tests.artifact_helpers import fake_app_manifest
 
 
 class ArtifactCompatibilityTests(unittest.TestCase):
+    def test_compatibility_policy_records_client_schema_two_migration(self) -> None:
+        policy = (
+            Path(__file__).resolve().parent.parent / "COMPATIBILITY.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("client-N/client_metadata.json` uses `schema_version: 2`", policy)
+        self.assertIn("client schema `1` shards", policy)
+        self.assertIn("Regenerate public schema\n`2`, client schema `2`", policy)
+        self.assertNotIn("all other persisted contracts remain schema `1`", policy)
+
     def test_current_schema_is_supported(self) -> None:
         payload = {"schema_version": ARTIFACT_SCHEMA_VERSION}
 
@@ -169,31 +182,41 @@ class ArtifactCompatibilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir)
 
-            manifest_path = write_server_artifact_manifest(path)
+            manifest_path = write_server_artifact_manifest(
+                path, app_manifest=fake_app_manifest()
+            )
 
             self.assertEqual(
-                load_server_artifact_manifest(path)["artifacts"], SERVER_ARTIFACTS
+                canonical_json_bytes(
+                    {"artifacts": load_server_artifact_manifest(path)["artifacts"]}
+                ),
+                canonical_json_bytes({"artifacts": SERVER_ARTIFACTS}),
             )
             self.assertEqual(manifest_path.parent, path)
 
     def test_server_artifact_manifest_accepts_additive_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir)
-            manifest_path = write_server_artifact_manifest(path)
+            manifest_path = write_server_artifact_manifest(
+                path, app_manifest=fake_app_manifest()
+            )
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
             payload["producer"] = "test"
             payload["artifacts"]["model"]["description"] = "global model"
             payload["artifacts"]["diagnostics"] = {"filename": "debug.json"}
             manifest_path.write_text(json.dumps(payload), encoding="utf-8")
 
-            self.assertEqual(load_server_artifact_manifest(path), payload)
+            self.assertEqual(
+                canonical_json_bytes(load_server_artifact_manifest(path)),
+                canonical_json_bytes(payload),
+            )
 
     def test_server_artifact_manifest_rejects_changed_layout_without_version(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir)
-            write_server_artifact_manifest(path)
+            write_server_artifact_manifest(path, app_manifest=fake_app_manifest())
             manifest_path = path / "artifact_manifest.json"
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
             payload["artifacts"]["metrics"]["columns"].append("unsupported")
@@ -202,16 +225,62 @@ class ArtifactCompatibilityTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "does not match.*regenerate"):
                 load_server_artifact_manifest(path)
 
+    def test_server_snapshot_binding_is_exact_and_deeply_immutable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            app_manifest = fake_app_manifest()
+            manifest_path = write_server_artifact_manifest(
+                path, app_manifest=app_manifest
+            )
+            snapshot = load_server_artifact_snapshot(path, app_manifest=app_manifest)
+
+            with self.assertRaises(TypeError):
+                snapshot.manifest["binding"]["model_dimensions"]["sequence_length"] = 1
+            with self.assertRaises(TypeError):
+                snapshot.manifest["artifacts"]["metrics"]["columns"][0] = "epoch"
+
+            for field, value in (
+                ("public_manifest_checksum", "sha256:" + "0" * 64),
+                ("vocabulary_checksum", "sha256:" + "1" * 64),
+                ("model_dimensions", {"vocabulary_size": 1}),
+            ):
+                with self.subTest(field=field):
+                    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    payload["binding"][field] = value
+                    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "bound|binding"):
+                        load_server_artifact_snapshot(path, app_manifest=app_manifest)
+                    write_server_artifact_manifest(path, app_manifest=app_manifest)
+
+    def test_schema_one_server_artifact_requires_regeneration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            manifest_path = write_server_artifact_manifest(
+                path, app_manifest=fake_app_manifest()
+            )
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            payload["schema_version"] = 1
+            payload.pop("binding")
+            manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "older.*regenerate"):
+                load_server_artifact_snapshot(path)
+
     def test_unversioned_server_artifact_directory_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             with self.assertRaisesRegex(ValueError, "schema_version.*regenerate"):
                 load_server_artifact_manifest(Path(tmpdir))
 
     def test_server_artifact_manifest_rejects_older_and_newer_schemas(self) -> None:
-        for version, direction in ((0, "older"), (2, "newer")):
+        for version, direction in (
+            (SERVER_ARTIFACT_SCHEMA_VERSION - 1, "older"),
+            (SERVER_ARTIFACT_SCHEMA_VERSION + 1, "newer"),
+        ):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as tmpdir:
                 path = Path(tmpdir)
-                manifest_path = write_server_artifact_manifest(path)
+                manifest_path = write_server_artifact_manifest(
+                    path, app_manifest=fake_app_manifest()
+                )
                 payload = json.loads(manifest_path.read_text(encoding="utf-8"))
                 payload["schema_version"] = version
                 manifest_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -228,7 +297,9 @@ class ArtifactCompatibilityTests(unittest.TestCase):
             os.mkfifo(path / "unexpected.pipe")
 
             with self.assertRaisesRegex(ValueError, "contained regular file"):
-                write_server_artifact_manifest(path, finalized=True)
+                write_server_artifact_manifest(
+                    path, app_manifest=fake_app_manifest(), finalized=True
+                )
 
     def test_finalization_rejects_hard_linked_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -241,7 +312,9 @@ class ArtifactCompatibilityTests(unittest.TestCase):
                 (path / name).touch()
 
             with self.assertRaisesRegex(ValueError, "contained regular file"):
-                write_server_artifact_manifest(path, finalized=True)
+                write_server_artifact_manifest(
+                    path, app_manifest=fake_app_manifest(), finalized=True
+                )
 
 
 if __name__ == "__main__":

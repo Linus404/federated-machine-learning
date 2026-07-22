@@ -221,7 +221,9 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         readme = Path("README.md").read_text(encoding="utf-8")
 
         self.assertNotIn("[tool.flwr.federations.local-docker]", pyproject)
-        self.assertIn("uv run python -m src.flower_config", readme)
+        self.assertIn(
+            "uv run --env-file .env.protocol python -m src.flower_config", readme
+        )
         self.assertNotIn("grep -q", readme)
 
     def test_regeneration_uses_matching_non_destructive_artifact_paths(self) -> None:

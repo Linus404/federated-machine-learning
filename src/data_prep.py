@@ -38,16 +38,24 @@ from src.evaluation_artifact import (
     publish_evaluation_artifact,
 )
 from src.paths import (
+    PREPARED_CURRENT_FILENAME,
+    PREPARED_GENERATIONS_DIRECTORY,
+    PREPARED_GENERATION_SCHEMA_VERSION,
     RunArtifactLock,
     default_evaluation_artifact_dir,
     default_public_artifact_dir,
     resolve_dir,
+    resolve_prepared_artifact_dir,
 )
 from src.text_preprocessing import create_text_vectorizer
 
 
 def _preflight_output_root(
-    output_dir: str | Path, artifact_name: str, *, reusable: bool
+    output_dir: str | Path,
+    artifact_name: str,
+    *,
+    reusable: bool,
+    allow_prepared_alias: bool = False,
 ) -> Path:
     """Validate an artifact root without creating or following it.
 
@@ -59,6 +67,8 @@ def _preflight_output_root(
         Human-readable artifact kind used in errors.
     reusable : bool
         Permit an existing real directory for retryable outputs.
+    allow_prepared_alias : bool, optional
+        Permit the controlled logical link used by atomic prepared generations.
 
     Returns
     -------
@@ -74,7 +84,14 @@ def _preflight_output_root(
     """
     output_path = resolve_dir(output_dir)
     if output_path.is_symlink():
-        raise ValueError(f"{artifact_name} artifact root must not be a symlink")
+        expected = Path(PREPARED_CURRENT_FILENAME) / artifact_name
+        if not (
+            allow_prepared_alias
+            and reusable
+            and Path(os.readlink(output_path)) == expected
+        ):
+            raise ValueError(f"{artifact_name} artifact root must not be a symlink")
+        return output_path
     if output_path.exists():
         if not output_path.is_dir():
             raise ValueError(
@@ -290,64 +307,6 @@ def _copy_preserved_children(source: Path, staging: Path, owned: set[str]) -> No
         )
 
 
-def _cleanup_owned_preparation_staging(root: Path) -> None:
-    """Remove only incomplete staging directories owned by this preparation root.
-
-    Parameters
-    ----------
-    root : pathlib.Path
-        Final artifact root whose sibling staging names are reserved.
-
-    Returns
-    -------
-    None
-
-    Raises
-    ------
-    ValueError
-        If a reserved residue name is linked or not a real directory.
-    """
-    for residue in root.parent.glob(f".{root.name}.prepare-*.staging"):
-        residue_stat = residue.lstat()
-        if residue.is_symlink() or not stat.S_ISDIR(residue_stat.st_mode):
-            raise ValueError(f"owned preparation residue is unsafe: {residue.name}")
-        shutil.rmtree(residue)
-
-
-def _recover_owned_preparation_backup(root: Path) -> None:
-    """Restore or discard one owned backup left by an interrupted publication.
-
-    Parameters
-    ----------
-    root : pathlib.Path
-        Final reusable artifact root.
-
-    Returns
-    -------
-    None
-
-    Raises
-    ------
-    ValueError
-        If backup state is ambiguous, linked, or not a real directory.
-    """
-    backups = list(root.parent.glob(f".{root.name}.*.backup"))
-    if len(backups) > 1:
-        raise ValueError(f"multiple owned preparation backups exist for {root.name}")
-    if not backups:
-        return
-    backup = backups[0]
-    backup_stat = backup.lstat()
-    if backup.is_symlink() or not stat.S_ISDIR(backup_stat.st_mode):
-        raise ValueError(f"owned preparation backup is unsafe: {backup.name}")
-    if root.exists() or root.is_symlink():
-        if root.is_symlink() or not root.is_dir():
-            raise ValueError(f"artifact root is unsafe during recovery: {root.name}")
-        shutil.rmtree(backup)
-    else:
-        os.rename(backup, root)
-
-
 def _fsync_directory(path: Path) -> None:
     """Flush one directory entry set on platforms that support it.
 
@@ -393,14 +352,14 @@ def _fsync_directory_tree(root: Path) -> None:
 def _publish_prepared_roots(
     roots: Mapping[str, Path], stages: Mapping[str, Path]
 ) -> None:
-    """Publish validated staged roots and roll back any ordinary failure.
+    """Publish one immutable generation through a single atomic index update.
 
     Parameters
     ----------
     roots : mapping of str to pathlib.Path
-        Final client, public, and immutable evaluation roots.
+        Logical client, public, and evaluation roots sharing one parent.
     stages : mapping of str to pathlib.Path
-        Complete owned staging directories.
+        Complete artifact directories within one owned generation staging root.
 
     Returns
     -------
@@ -408,42 +367,61 @@ def _publish_prepared_roots(
 
     Raises
     ------
+    ValueError
+        If roots or stages do not form one contained generation.
     OSError
-        If a final rename cannot be completed; reusable roots are restored.
+        If immutable publication or the atomic index update fails.
     """
-    transaction_id = uuid.uuid4().hex
-    backups: dict[str, Path] = {}
-    published: list[str] = []
+    if set(roots) != {"client", "public", "evaluation"} or set(stages) != set(roots):
+        raise ValueError("prepared publication requires all three artifact kinds")
+    parents = {root.parent for root in roots.values()}
+    stage_parents = {stage.parent for stage in stages.values()}
+    if len(parents) != 1 or len(stage_parents) != 1:
+        raise ValueError("prepared roots and stages must each share one parent")
+    parent = next(iter(parents))
+    generation_stage = next(iter(stage_parents))
+    generations = parent / PREPARED_GENERATIONS_DIRECTORY
+    if generation_stage.parent != generations:
+        raise ValueError("prepared generation staging directory escapes its root")
+
+    generation_id = str(uuid.uuid4())
+    generation = generations / generation_id
+    write_json_atomically(
+        generation_stage / "index.json",
+        {
+            "schema_version": PREPARED_GENERATION_SCHEMA_VERSION,
+            "generation_id": generation_id,
+            "logical_roots": {name: roots[name].name for name in sorted(roots)},
+        },
+        overwrite=False,
+    )
+    _fsync_directory_tree(generation_stage)
+    os.rename(generation_stage, generation)
+    _fsync_directory(generations)
+    pointer = parent / PREPARED_CURRENT_FILENAME
+    if pointer.exists() and not pointer.is_symlink():
+        raise ValueError("prepared generation pointer is unsafe")
+    aliases_created: list[Path] = []
+    temporary_pointer = parent / f".{PREPARED_CURRENT_FILENAME}.{uuid.uuid4().hex}.tmp"
     try:
-        for name in ("public", "client"):
-            root = roots[name]
-            if root.exists():
-                backup = root.parent / f".{root.name}.{transaction_id}.backup"
-                os.rename(root, backup)
-                backups[name] = backup
-            os.rename(stages[name], root)
-            published.append(name)
-        os.rename(stages["evaluation"], roots["evaluation"])
-        published.append("evaluation")
-        for parent in {root.parent for root in roots.values()}:
-            _fsync_directory(parent)
+        for name, root in roots.items():
+            if not root.exists() and not root.is_symlink():
+                root.symlink_to(
+                    Path(PREPARED_CURRENT_FILENAME) / name,
+                    target_is_directory=True,
+                )
+                aliases_created.append(root)
+        temporary_pointer.symlink_to(
+            Path(PREPARED_GENERATIONS_DIRECTORY) / generation_id,
+            target_is_directory=True,
+        )
+        os.replace(temporary_pointer, pointer)
     except BaseException:
-        if "evaluation" in published:
-            shutil.rmtree(roots["evaluation"], ignore_errors=True)
-        for name in reversed(published):
-            if name == "evaluation":
-                continue
-            shutil.rmtree(roots[name], ignore_errors=True)
-        for name, backup in backups.items():
-            if backup.exists() and not roots[name].exists():
-                os.rename(backup, roots[name])
-        for parent in {root.parent for root in roots.values()}:
-            _fsync_directory(parent)
+        temporary_pointer.unlink(missing_ok=True)
+        for alias in aliases_created:
+            alias.unlink(missing_ok=True)
         raise
-    for backup in backups.values():
-        shutil.rmtree(backup)
-    for parent in {root.parent for root in roots.values()}:
-        _fsync_directory(parent)
+    _fsync_directory(parent)
 
 
 def _raw_split_path(
@@ -884,13 +862,22 @@ def prepare_all(
     -------
     None
     """
-    client_dir = _preflight_output_root(client_shard_dir, "client", reusable=True)
-    public_dir = _preflight_output_root(public_artifact_dir, "public", reusable=True)
-    evaluation_dir = resolve_dir(evaluation_artifact_dir)
+    client_dir = _preflight_output_root(
+        client_shard_dir, "client", reusable=True, allow_prepared_alias=True
+    )
+    public_dir = _preflight_output_root(
+        public_artifact_dir, "public", reusable=True, allow_prepared_alias=True
+    )
+    evaluation_dir = _preflight_output_root(
+        evaluation_artifact_dir,
+        "evaluation",
+        reusable=True,
+        allow_prepared_alias=True,
+    )
     roots = {
-        "client": client_dir.resolve(strict=False),
-        "public": public_dir.resolve(strict=False),
-        "evaluation": evaluation_dir.resolve(strict=False),
+        "client": client_dir,
+        "public": public_dir,
+        "evaluation": evaluation_dir,
     }
     for first_name, first in roots.items():
         for second_name, second in roots.items():
@@ -906,32 +893,38 @@ def prepare_all(
                 )
     for root in roots.values():
         root.parent.mkdir(parents=True, exist_ok=True)
+    if len({root.parent for root in roots.values()}) != 1:
+        raise ValueError(
+            "client, public, and evaluation artifact roots must share one parent for "
+            "atomic generation publication"
+        )
     lock = _acquire_preparation_lock(roots)
     stages: dict[str, Path] = {}
     try:
-        for root in (public_dir, client_dir):
-            _recover_owned_preparation_backup(root)
-        for root in roots.values():
-            _cleanup_owned_preparation_staging(root)
-        _preflight_output_root(evaluation_dir, "evaluation", reusable=False)
-        stages = {
-            name: Path(
-                tempfile.mkdtemp(
-                    dir=root.parent,
-                    prefix=f".{root.name}.prepare-",
-                    suffix=".staging",
-                )
-            )
-            for name, root in roots.items()
-            if name != "evaluation"
-        }
-        stages["evaluation"] = evaluation_dir.parent / (
-            f".{evaluation_dir.name}.prepare-{uuid.uuid4().hex}.staging"
+        parent = next(iter({root.parent for root in roots.values()}))
+        generations = parent / PREPARED_GENERATIONS_DIRECTORY
+        if generations.is_symlink() or (
+            generations.exists() and not generations.is_dir()
+        ):
+            raise ValueError("prepared generations root must be a regular directory")
+        generations.mkdir(mode=0o755, exist_ok=True)
+        for residue in generations.glob(".prepare-*.staging"):
+            residue_stat = residue.lstat()
+            if residue.is_symlink() or not stat.S_ISDIR(residue_stat.st_mode):
+                raise ValueError(f"owned preparation residue is unsafe: {residue.name}")
+            shutil.rmtree(residue)
+        generation_stage = Path(
+            tempfile.mkdtemp(dir=generations, prefix=".prepare-", suffix=".staging")
         )
+        stages = {name: generation_stage / name for name in roots}
+        stages["public"].mkdir()
+        stages["client"].mkdir()
+        public_source = resolve_prepared_artifact_dir(public_dir, "public")
+        client_source = resolve_prepared_artifact_dir(client_dir, "client")
         _copy_preserved_children(
-            public_dir, stages["public"], {"manifest.json", "vocab.txt"}
+            public_source, stages["public"], {"manifest.json", "vocab.txt"}
         )
-        _copy_preserved_children(client_dir, stages["client"], {"client-*"})
+        _copy_preserved_children(client_source, stages["client"], {"client-*"})
 
         _validated_frameworks()
         dataset = load_verified_imdb_dataset()
@@ -981,8 +974,8 @@ def prepare_all(
         _publish_prepared_roots(roots, stages)
         stages = {}
     finally:
-        for stage in stages.values():
-            shutil.rmtree(stage, ignore_errors=True)
+        if stages:
+            shutil.rmtree(next(iter(stages.values())).parent, ignore_errors=True)
         lock.release()
 
 

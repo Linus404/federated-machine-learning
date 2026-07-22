@@ -30,21 +30,29 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync
 ```
 
+Every documented local Python entry point uses `--env-file .env.protocol` so the
+frozen hash seed, Keras backend, and TensorFlow determinism settings exist before
+the interpreter starts. Missing or conflicting startup values are rejected; do
+not set them later from Python code.
+
 ## Artifact preparation
 
 Prepare the raw client shards, shared public vocabulary, and immutable untouched
 evaluation dataset:
 
 ```bash
-uv run python -m src.data_prep --partitions 4 --client-shard-dir artifacts/clients --public-artifact-dir artifacts/public --evaluation-artifact-dir artifacts/evaluation
+uv run --env-file .env.protocol python -m src.data_prep --partitions 4 --client-shard-dir artifacts/clients --public-artifact-dir artifacts/public --evaluation-artifact-dir artifacts/evaluation
 ```
 
 This command loads `stanfordnlp/imdb` configuration `plain_text` at the frozen
 revision, verifies every official split and raw/content SHA-256, creates every raw
 review/label shard from the training split only, and publishes a vocabulary
 adapted on that same split. It writes the official test split in ascending source
-order to `artifacts/evaluation`, with stable `test:<row-index>` identities and a
-strict checksum manifest. The unsupervised split is verified and excluded. The
+order to the selected prepared generation, with stable `test:<row-index>`
+identities and a strict checksum manifest. One atomic `.prepared-current`
+switch selects the matching client, public, and evaluation directories together;
+an interruption leaves the prior generation selected. The unsupervised split is
+verified and excluded. The
 generated directories simulate client-scoped
 storage only after this centralized preparation; they are not evidence that data
 originated at or remained hidden within independent organizations. Clients
@@ -63,7 +71,7 @@ trainable embedding, not pretrained GloVe vectors or an embedding matrix.
 Train one client locally from its raw shard:
 
 ```bash
-uv run python -m src.local_training --client-data-dir artifacts/clients/client-0 --public-artifact-dir artifacts/public --run-artifact-dir artifacts/local-runs
+uv run --env-file .env.protocol python -m src.local_training --client-data-dir artifacts/clients/client-0 --public-artifact-dir artifacts/public --run-artifact-dir artifacts/local-runs
 ```
 
 The local command treats `--run-artifact-dir` as a reusable history root. Every
@@ -76,20 +84,20 @@ Run the Flower app directly using the per-partition raw directories generated
 above. This is the fast local development path and does not use Docker:
 
 ```bash
-uv run flwr run . --stream --federation-config "num-supernodes=4"
+uv run --env-file .env.protocol flwr run . --stream --federation-config "num-supernodes=4"
 ```
 
 Run the dashboard against the selected server artifact directory:
 
 ```bash
-FML_SERVER_ARTIFACT_DIR=artifacts/server uv run streamlit run dashboard.py
+FML_SERVER_ARTIFACT_DIR=artifacts/server uv run --env-file .env.protocol streamlit run dashboard.py
 ```
 
 On PowerShell:
 
 ```powershell
 $env:FML_SERVER_ARTIFACT_DIR = "artifacts/server"
-uv run streamlit run dashboard.py
+uv run --env-file .env.protocol streamlit run dashboard.py
 ```
 
 ### Runtime paths
@@ -102,7 +110,7 @@ path `artifacts/evaluation`, overridable with `--evaluation-artifact-dir` or
 config, for example:
 
 ```bash
-uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "client-data-dir='artifacts/clients/client-{partition}' server-artifact-dir='artifacts/server' public-artifact-dir='artifacts/public'"
+uv run --env-file .env.protocol flwr run . --stream --federation-config "num-supernodes=4" --run-config "client-data-dir='artifacts/clients/client-{partition}' server-artifact-dir='artifacts/server' public-artifact-dir='artifacts/public'"
 ```
 
 The dashboard reads the completed run selected by the atomic `current.json` index
@@ -116,9 +124,9 @@ metrics, provenance, and verified SHA-256 checksums. Existing completed runs rem
 available for comparison:
 
 ```powershell
-uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "use-update-noise=false use-huber=false"
-uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "use-update-noise=false use-huber=true huber-threshold=10.0"
-uv run flwr run . --stream --federation-config "num-supernodes=4" --run-config "use-update-noise=true use-huber=false"
+uv run --env-file .env.protocol flwr run . --stream --federation-config "num-supernodes=4" --run-config "use-update-noise=false use-huber=false"
+uv run --env-file .env.protocol flwr run . --stream --federation-config "num-supernodes=4" --run-config "use-update-noise=false use-huber=true huber-threshold=10.0"
+uv run --env-file .env.protocol flwr run . --stream --federation-config "num-supernodes=4" --run-config "use-update-noise=true use-huber=false"
 ```
 
 `use-huber` enables an experimental robust aggregation path for outlier-resistance
@@ -151,7 +159,7 @@ Prepare the four client shards, public artifacts, and host-only evaluation
 artifact before starting the runtime:
 
 ```bash
-uv run python -m src.data_prep --partitions 4 --client-shard-dir artifacts/clients --public-artifact-dir artifacts/public --evaluation-artifact-dir artifacts/evaluation
+uv run --env-file .env.protocol python -m src.data_prep --partitions 4 --client-shard-dir artifacts/clients --public-artifact-dir artifacts/public --evaluation-artifact-dir artifacts/evaluation
 ```
 
 Build the single application image and start the separate SuperLink, ServerApp,
@@ -167,8 +175,8 @@ ClientApp without adding repository metadata to the image.
 Submit the Flower app to the running local federation:
 
 ```bash
-uv run python -m src.flower_config
-uv run flwr run . local-docker --stream
+uv run --env-file .env.protocol python -m src.flower_config
+uv run --env-file .env.protocol flwr run . local-docker --stream
 ```
 
 Flower 1.32.1 reads SuperLink connection profiles from `~/.flwr/config.toml` rather
@@ -221,8 +229,8 @@ uv lock --upgrade
 Before committing, format and check the codebase:
 
 ```bash
-uv run ruff format .
-uv run ruff check .
+uv run --env-file .env.protocol ruff format .
+uv run --env-file .env.protocol ruff check .
 ```
 
 See [COMPATIBILITY.md](COMPATIBILITY.md) for the application and artifact
