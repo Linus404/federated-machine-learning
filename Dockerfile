@@ -24,6 +24,7 @@ COPY pyproject.toml uv.lock dashboard.py ./
 RUN uv sync --frozen --no-dev
 
 COPY src ./src
+COPY docs/scientific-protocol-v1.toml ./docs/
 
 RUN mkdir -p /app/artifacts/public /app/artifacts/server
 

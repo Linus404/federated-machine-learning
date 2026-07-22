@@ -146,6 +146,11 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         self.assertIn(".git", dockerignore)
         self.assertNotIn("COPY .git", dockerfile)
 
+    def test_image_includes_runtime_scientific_protocol(self) -> None:
+        dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+
+        self.assertIn("COPY docs/scientific-protocol-v1.toml ./docs/", dockerfile)
+
     def test_contract_helpers_follow_project_docstring_conventions(self) -> None:
         docstring = service_block.__doc__ or ""
 
