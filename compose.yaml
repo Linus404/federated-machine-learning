@@ -70,7 +70,7 @@ services:
       superlink:
         condition: service_healthy
     volumes:
-      - ./artifacts/public:/app/artifacts/public:ro
+      - ./artifacts/.prepared-current/public:/app/artifacts/public:ro
       - ./artifacts/server:/app/artifacts/server
 
   supernode-0:
@@ -99,9 +99,9 @@ services:
       supernode-0:
         condition: service_healthy
     volumes:
-      - ./artifacts/public:/app/artifacts/public:ro
+      - ./artifacts/.prepared-current/public:/app/artifacts/public:ro
       - type: bind
-        source: ./artifacts/clients/client-0
+        source: ./artifacts/.prepared-current/client/client-0
         target: /app/client-data
         read_only: true
 
@@ -131,9 +131,9 @@ services:
       supernode-1:
         condition: service_healthy
     volumes:
-      - ./artifacts/public:/app/artifacts/public:ro
+      - ./artifacts/.prepared-current/public:/app/artifacts/public:ro
       - type: bind
-        source: ./artifacts/clients/client-1
+        source: ./artifacts/.prepared-current/client/client-1
         target: /app/client-data
         read_only: true
 
@@ -163,9 +163,9 @@ services:
       supernode-2:
         condition: service_healthy
     volumes:
-      - ./artifacts/public:/app/artifacts/public:ro
+      - ./artifacts/.prepared-current/public:/app/artifacts/public:ro
       - type: bind
-        source: ./artifacts/clients/client-2
+        source: ./artifacts/.prepared-current/client/client-2
         target: /app/client-data
         read_only: true
 
@@ -195,9 +195,9 @@ services:
       supernode-3:
         condition: service_healthy
     volumes:
-      - ./artifacts/public:/app/artifacts/public:ro
+      - ./artifacts/.prepared-current/public:/app/artifacts/public:ro
       - type: bind
-        source: ./artifacts/clients/client-3
+        source: ./artifacts/.prepared-current/client/client-3
         target: /app/client-data
         read_only: true
 
@@ -214,7 +214,7 @@ services:
     ports:
       - "127.0.0.1:8501:8501"
     volumes:
-      - ./artifacts/public:/app/artifacts/public:ro
+      - ./artifacts/.prepared-current/public:/app/artifacts/public:ro
       - ./artifacts/server:/app/artifacts/server:ro
 
 volumes:

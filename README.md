@@ -10,19 +10,14 @@ This project uses [uv](https://docs.astral.sh/uv/) to manage Python versions and
 
 ### Install uv
 
-**Windows (PowerShell)**
-
-```powershell
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
-
-If execution is blocked, run `Set-ExecutionPolicy RemoteSigned -Scope CurrentUser` first.
-
 **macOS / Linux**
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
+
+The project requires POSIX filesystem semantics. On Windows, use WSL 2 rather
+than native PowerShell.
 
 ### Install dependencies
 
@@ -93,13 +88,6 @@ Run the dashboard against the selected server artifact directory:
 FML_SERVER_ARTIFACT_DIR=artifacts/server uv run --env-file .env.protocol streamlit run dashboard.py
 ```
 
-On PowerShell:
-
-```powershell
-$env:FML_SERVER_ARTIFACT_DIR = "artifacts/server"
-uv run --env-file .env.protocol streamlit run dashboard.py
-```
-
 ### Runtime paths
 
 The Flower configuration uses separate paths for public artifacts, server output,
@@ -123,7 +111,7 @@ The server never clears its configured artifact root. It writes each experiment 
 metrics, provenance, and verified SHA-256 checksums. Existing completed runs remain
 available for comparison:
 
-```powershell
+```bash
 uv run --env-file .env.protocol flwr run . --stream --federation-config "num-supernodes=4" --run-config "use-update-noise=false use-huber=false"
 uv run --env-file .env.protocol flwr run . --stream --federation-config "num-supernodes=4" --run-config "use-update-noise=false use-huber=true huber-threshold=10.0"
 uv run --env-file .env.protocol flwr run . --stream --federation-config "num-supernodes=4" --run-config "use-update-noise=true use-huber=false"
@@ -188,8 +176,9 @@ only for this loopback-only local runtime; do not use it for a remote or public
 SuperLink.
 
 The dashboard is available at <http://127.0.0.1:8501>. Each ClientApp receives
-only its matching `artifacts/clients/client-N` shard as a read-only mount. Public
-artifacts are read-only in every consuming service; only ServerApp can write
+only its matching shard from the selected prepared generation as a read-only
+mount. Public artifacts from that same generation are read-only in every
+consuming service; only ServerApp can write
 `artifacts/server`, which the dashboard mounts read-only. The untouched
 `artifacts/evaluation` directory is not mounted into this PR13 runtime. Stop the
 runtime with `docker compose down`.

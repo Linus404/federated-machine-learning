@@ -156,9 +156,10 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         for index in range(4):
             clientapp = service_block(self.compose, f"clientapp-{index}")
             with self.subTest(index=index):
-                self.assertIn(f"source: ./artifacts/clients/client-{index}", clientapp)
+                source = f"source: ./artifacts/.prepared-current/client/client-{index}"
+                self.assertIn(source, clientapp)
                 self.assertEqual(
-                    self.compose.count(f"source: ./artifacts/clients/client-{index}"),
+                    self.compose.count(source),
                     1,
                 )
                 self.assertIn("target: /app/client-data", clientapp)
@@ -191,7 +192,7 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         for service in consumers:
             with self.subTest(service=service):
                 self.assertIn(
-                    "./artifacts/public:/app/artifacts/public:ro",
+                    "./artifacts/.prepared-current/public:/app/artifacts/public:ro",
                     service_block(self.compose, service),
                 )
         for service in ["superlink"] + [f"supernode-{index}" for index in range(4)]:
@@ -200,10 +201,15 @@ class DistributedDeploymentContractTests(unittest.TestCase):
                     "/app/artifacts/public", service_block(self.compose, service)
                 )
 
+    def test_runtime_mounts_selected_generation_not_legacy_artifact_roots(self) -> None:
+        self.assertNotIn("./artifacts/public:", self.compose)
+        self.assertNotIn("source: ./artifacts/clients/", self.compose)
+
     def test_untouched_evaluation_artifact_is_not_exposed_to_runtime_services(
         self,
     ) -> None:
         self.assertNotIn("artifacts/evaluation", self.compose)
+        self.assertNotIn(".prepared-current/evaluation", self.compose)
         self.assertNotIn("FML_EVALUATION_ARTIFACT_DIR", self.compose)
 
     def test_server_outputs_have_one_writer_and_read_only_dashboard(self) -> None:
