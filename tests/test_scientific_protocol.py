@@ -1627,12 +1627,10 @@ print(json.dumps({
             "not divided or multiplied by batch size", fedprox["local_objective"]
         )
         self.assertIn("fitted training rows", fedprox["aggregation_sample_weight"])
-        self.assertIn("ascending client_id order", fedprox["aggregation"])
         self.assertIn("complete post-fit", fedprox["client_update"])
         self.assertIn("does not submit a delta", fedprox["client_update"])
-        self.assertIn("aggregate_inplace", fedprox["aggregation"])
-        self.assertIn("native float32", fedprox["aggregation"])
-        self.assertIn("do not reconstruct or aggregate deltas", fedprox["aggregation"])
+        self.assertIn("Exactly strategies.fedavg", fedprox["aggregation"])
+        self.assertIn("does not change aggregation", fedprox["aggregation"])
         fedprox_golden = fedprox["golden_probe"]
         data_loss = float(np.mean(fedprox_golden["batch_example_losses"]))
         squared_distance = sum(

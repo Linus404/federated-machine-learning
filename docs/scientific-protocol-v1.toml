@@ -291,6 +291,30 @@ epsilon = 1e-7
 amsgrad = false
 update_noise = false
 
+[aggregation]
+flower_version = "1.32.1"
+numpy_version = "2.4.4"
+result_set = "A registered round contains exactly one successful FitRes for every registered client and no failures. Zero successful results, any failure, or a missing registered client hard-fails the cell; partial-round aggregation is forbidden."
+client_validation = "Before parameters are decoded, require every FitRes.metrics client_id to have Python type int but not bool, to be in the inclusive range 0 through client_scale-1, and to be unique; require the resulting ID set to equal range(client_scale), then sort FitRes objects by ascending client_id."
+sample_count_validation = "Require every FitRes.num_examples to have Python type int but not bool, to be positive, and to equal that client's registered fitted-row count."
+model_validation = "Decode every FitRes.parameters with flwr.common.parameters_to_ndarrays. Require a nonempty model-weight list; require every array to have dtype exactly numpy.float32, contain only finite values, and match the corresponding round-start model.weights shape; require every client to have the same weight count and shapes. Scalars and zero-element arrays are forbidden."
+submitted_value = "The aggregation input is each client's complete post-fit model.weights list after the threat transformation below, never a pre-aggregated update or delta. Honest clients retain their decoded post-fit arrays bit-for-bit."
+threat_order = "First complete the honest local epoch and decode the complete honest post-fit weights. Second validate client IDs, sample counts, round-start weights, and every honest post-fit array. Third, only for selected malicious clients and independently for each model.weights tensor in model.weights order, execute the registered threat transformation. Fourth, aggregate the resulting complete submitted weights. Never aggregate honest weights before applying a threat."
+threat_transformation = "For each selected malicious client's corresponding float32 honest post-fit tensor H and common float32 round-start tensor G, execute D=numpy.subtract(H,G), T=numpy.multiply(D,numpy.float32(threat_scale)), and S=numpy.add(G,T), using NumPy 2.4.4 defaults with no dtype argument or out argument. D, T, and S remain float32. Use threat_scale=10.0 for outlier and -10.0 for sign_flip. S replaces H as that client's complete submitted tensor. Hard-fail if D, T, or S is non-finite."
+coordinate_layout = "For mathematical indexing and golden probes only, flatten every submitted tensor separately with numpy.ndarray.flatten(order='C'), concatenate those vectors in model.weights order, and number coordinates from zero. Reconstruct by splitting at the original tensor element counts and applying numpy.reshape(part, original_shape, order='C') with no dtype cast. The executable Flower calls operate tensor-by-tensor and are bitwise equivalent to this coordinate layout; coordinates never mix."
+common_invalid_inputs = "Hard-fail the cell before aggregation for any result-set, client-ID, sample-count, model, threat-intermediate, flattening, or reconstruction violation above. Also hard-fail if the selected strategy returns a different tensor count or shape, a non-float32 dtype, or any non-finite value. No invalid registered cell may be skipped, repaired, clipped, cast, partially aggregated, or assigned a fallback result."
+
+[aggregation.golden_probe]
+tensor_shapes = [[2], [2]]
+client_ids = [0, 1, 2, 3]
+sample_counts = [1, 2, 3, 4]
+round_start_vector = [10.0, -10.0, 1.0, -1.0]
+honest_post_fit_vectors = [[11.0, -8.0, 4.0, 3.0], [12.0, -13.0, -1.0, 4.0], [14.0, -9.0, 7.0, -7.0], [9.0, -6.0, 5.0, 1.0]]
+malicious_client_ids = [1]
+threat = "sign_flip"
+threat_scale = -10.0
+submitted_post_fit_vectors = [[11.0, -8.0, 4.0, 3.0], [-10.0, 20.0, 21.0, -51.0], [14.0, -9.0, 7.0, -7.0], [9.0, -6.0, 5.0, 1.0]]
+
 [strategies.centralized]
 kind = "centralized"
 training_epochs = 20
@@ -318,6 +342,17 @@ convergence_round_reporting = "not_applicable_and_must_not_be_reported"
 
 [strategies.fedavg]
 kind = "sample_weighted_mean"
+aggregation_input = "Exactly aggregation.submitted_value and aggregation.coordinate_layout."
+sample_weighting = "Use FitRes.num_examples after aggregation.sample_count_validation; no other weight is permitted."
+executable = "Call flwr.server.strategy.aggregate.aggregate_inplace from Flower 1.32.1 once with the ascending-client-ID list of (ClientProxy, FitRes) pairs."
+scaling_factors = "Inside aggregate_inplace, compute num_examples_total with Python sum over ascending-client-ID FitRes.num_examples, then construct numpy.asarray([fit_res.num_examples / num_examples_total for each result]) with no dtype argument. Python true division produces binary64 Python floats and numpy.asarray produces a float64 vector."
+reduction = "For each tensor, multiply every client's submitted float32 array by its numpy.float64 scaling-factor scalar in ascending client_id order through Flower 1.32.1 _try_inplace. NumPy 2.4.4 numpy.can_cast(factor,numpy.float32,casting='same_kind') is true, so execute numpy.multiply(array,factor,out=array) without constructing a float32 factor; the ufunc computes the float64 product and stores its cast result in the float32 array. Use the scaled client 0 array as the accumulator and, for clients 1 through client_scale-1, execute numpy.add(accumulator,scaled_client_array,out=accumulator) as a strict float32 left fold."
+result = "The float32 accumulator tensors, reconstructed in unchanged model.weights order and shapes, are the next round-start global weights. Do not aggregate deltas and do not add the previous global weights after reduction."
+invalid_inputs = "Exactly aggregation.common_invalid_inputs. Flower warnings, implicit casts, broadcasting, unequal zip truncation, zero-division, or NaN/Inf propagation are not accepted alternatives."
+
+[strategies.fedavg.golden_probe]
+aggregate_vector = [6.899999618530273, -1.9000000953674316, 8.699999809265137, -11.600000381469727]
+aggregate_float32_uint32 = [1088212172, 3220386612, 1091253043, 3241777562]
 
 [strategies.fedprox]
 kind = "sample_weighted_mean_with_proximal_objective"
@@ -328,7 +363,7 @@ proximal_term = "In TensorFlow float32 and model.trainable_weights order, form o
 local_objective = "data_loss + proximal_term; differentiate this scalar once with respect to model.trainable_variables and apply one Adam update per batch. The proximal term is one batch-level scalar and is not divided or multiplied by batch size."
 client_update = "After the local epoch, each client submits its complete post-fit trainable and non-trainable model weights in model.weights order, plus its zero-based integer client_id in FitRes.metrics; it does not submit a delta."
 aggregation_sample_weight = "The integer number of that client's fitted training rows supplied to the optimizer, excluding validation rows; retries do not change this weight."
-aggregation = "Hard-fail if any successful FitRes lacks a unique non-negative integer client_id, then sort successful results by ascending client_id. Apply Flower 1.32.1 aggregate_inplace to the submitted post-fit weights: compute every client scaling factor as float64(client_sample_weight / sum(client_sample_weights)); for every weight tensor independently in its native float32 shape, cast each scaling factor to float32, multiply each submitted post-fit tensor by its factor, and left-fold numpy.add over those products in ascending client_id order. The resulting float32 tensors are the next global model; do not reconstruct or aggregate deltas."
+aggregation = "Exactly strategies.fedavg aggregation_input, sample_weighting, executable, scaling_factors, reduction, result, and invalid_inputs. FedProx changes only the local objective; it does not change aggregation."
 
 [strategies.fedprox.golden_probe]
 batch_example_losses = [0.2, 0.8]
@@ -345,7 +380,7 @@ threshold = 10.0
 iterations = 10
 epsilon = 1e-8
 local_objective = "Exactly strategies.fedprox, including its immutable round-start reference, float32 proximal sum reduction, batch-level placement, and Adam update."
-client_vector = "Hard-fail if any successful FitRes lacks a unique non-negative integer client_id, then sort successful results by ascending client_id. For each client in that order, apply any registered threat to its model delta, add the threatened delta to the common round-start global model, flatten each resulting complete post-fit model weight with numpy.ndarray.flatten() in default C order, and concatenate weights in model.weights order. Convert the stacked vectors to float32. All clients must have identical nonempty finite vector lengths or the cell hard-fails."
+client_vector = "Apply aggregation result-set, client, sample-count, model, and threat validation and ordering. Flatten each resulting complete submitted model in model.weights order with aggregation.coordinate_layout, stack vectors in ascending client_id order with numpy.stack, and call numpy.ndarray.astype(numpy.float32, copy=False). All registered input arrays are already float32; the call performs no information-losing cast."
 sample_weight = "Convert each positive integer strategies.fedprox aggregation_sample_weight to float64, divide the vector of weights by its float64 sum once, and retain these normalized base weights for every iteration."
 initialization = "Set estimate_0 = numpy.average(client_vectors, axis=0, weights=normalized_base_weights). Float32 client vectors and float64 weights produce a float64 estimate."
 residual_norm = "At iteration t, residual_i = numpy.linalg.norm(estimate_t - client_vector_i) with no ord argument, the float64 Euclidean norm over the complete flattened vector."
@@ -362,13 +397,32 @@ estimate_after_10_updates = [4.335034175752573, 4.163210734443747]
 
 [strategies.fedmedian]
 kind = "coordinate_wise_median"
+aggregation_input = "Exactly aggregation.submitted_value and aggregation.coordinate_layout."
+sample_weighting = "None. Validate FitRes.num_examples through aggregation.sample_count_validation, then ignore every sample count during parameter aggregation. Every client contributes one value per coordinate."
+executable = "Build (parameters_to_ndarrays(FitRes.parameters), FitRes.num_examples) pairs in ascending client_id order and call flwr.server.strategy.aggregate.aggregate_median from Flower 1.32.1 once. For each model.weights tensor position, Flower executes numpy.median(numpy.asarray(client_tensors), axis=0) with NumPy 2.4.4 defaults."
+even_client_rule = "All registered client scales are even. For each coordinate, numpy.median selects the two central order statistics at zero-based positions client_scale/2-1 and client_scale/2 and passes those float32 values to its NumPy 2.4.4 axis-0 mean reduction; sample counts and client order do not select the middle values."
+reduction = "The reduction tree is exactly the one executed by NumPy 2.4.4 numpy.median(numpy.asarray(client_tensors),axis=0), including its partition and even-middle float32 mean implementation. No cross-coordinate reduction and no client-ID-order sum occur; reproductions must call this exact function rather than substitute a sort or custom mean. Preserve the returned float32 tensor dtype, tensor order, and shapes without a cast."
+invalid_inputs = "Exactly aggregation.common_invalid_inputs. Broadcasting, dtype promotion, masked values, NaN behavior, or unequal zip truncation are not accepted alternatives."
 assumption = "Requires fewer than 50 percent Byzantine values at each coordinate."
+
+[strategies.fedmedian.golden_probe]
+aggregate_vector = [10.0, -7.0, 6.0, -3.0]
+aggregate_float32_uint32 = [1092616192, 3235905536, 1086324736, 3225419776]
 
 [strategies.fedtrimmedavg]
 kind = "coordinate_wise_trimmed_mean"
 beta = 0.25
-trim_count_rule = "floor(beta_times_client_count)_per_side"
+aggregation_input = "Exactly aggregation.submitted_value and aggregation.coordinate_layout."
+sample_weighting = "None. Validate FitRes.num_examples through aggregation.sample_count_validation, then ignore every sample count during parameter aggregation. Every retained client value contributes equally per coordinate."
+executable = "Build (parameters_to_ndarrays(FitRes.parameters), FitRes.num_examples) pairs in ascending client_id order and call flwr.server.strategy.aggregate.aggregate_trimmed_avg from Flower 1.32.1 once with proportiontocut=0.25. For each model.weights tensor position, Flower stacks client tensors with numpy.asarray, then its _trim_mean executes numpy.partition(array, (lowercut, uppercut-1), axis=0), slices partitioned[lowercut:uppercut] on axis 0, and executes numpy.mean(slice, axis=0), all with NumPy 2.4.4 defaults."
+trim_count_rule = "For client_count n, compute lowercut=int(0.25*n) and uppercut=n-lowercut; because n is a positive registered integer, lowercut=floor(0.25*n). Remove exactly lowercut lowest and lowercut highest order statistics independently at every coordinate. Registered counts 4, 16, and 64 therefore trim 1, 4, and 16 values per side and retain 2, 8, and 32 values."
+reduction = "For every coordinate, the reduction tree is exactly the one executed by NumPy 2.4.4 numpy.mean(partitioned[lowercut:uppercut],axis=0), using NumPy's float32 sum accumulator and division over the axis-0 slice returned by numpy.partition. Reproductions must call these exact functions; do not sort the retained values, substitute a client-ID-order left fold, use float64 accumulation, or average client deltas. Preserve the returned float32 tensor dtype, tensor order, and shapes without a cast."
+invalid_inputs = "Exactly aggregation.common_invalid_inputs, plus hard-fail unless 0.0 <= beta < 0.5 and client_count-2*floor(beta*client_count) is positive. Broadcasting, dtype promotion, masked values, NaN behavior, or unequal zip truncation are not accepted alternatives."
 assumption = "Robustness requires Byzantine values to occupy the trimmed extremes; no guarantee is claimed at 50 percent malicious clients."
+
+[strategies.fedtrimmedavg.golden_probe]
+aggregate_vector = [10.0, -7.0, 6.0, -3.0]
+aggregate_float32_uint32 = [1092616192, 3235905536, 1086324736, 3225419776]
 
 [threats]
 client_scale = 4

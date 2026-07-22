@@ -277,6 +277,49 @@ class MetricAggregationTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     server_app._sorted_fit_results(results)
 
+    def test_fit_failure_rejection_precedes_client_id_validation(self) -> None:
+        invalid_results = [(Mock(), SimpleNamespace(metrics={}))]
+
+        for use_huber in (False, True):
+            with self.subTest(use_huber=use_huber):
+                strategy = server_app.SentimentServer.__new__(
+                    server_app.SentimentServer
+                )
+                strategy.use_huber = use_huber
+                strategy.accept_failures = False
+
+                self.assertEqual(
+                    strategy.aggregate_fit(
+                        1, invalid_results, [RuntimeError("failed")]
+                    ),
+                    (None, {}),
+                )
+
+    def test_huber_fit_aggregation_rejects_mismatched_model_shapes(self) -> None:
+        strategy = server_app.SentimentServer.__new__(server_app.SentimentServer)
+        strategy.use_huber = True
+        strategy.accept_failures = True
+        strategy.huber_threshold = 1.0
+        results = [
+            (
+                Mock(),
+                SimpleNamespace(
+                    parameters=ndarrays_to_parameters(weights),
+                    num_examples=1,
+                    metrics={"client_id": client_id},
+                ),
+            )
+            for client_id, weights in enumerate(
+                (
+                    [np.array([1.0, 2.0], dtype=np.float32)],
+                    [np.array([[1.0, 2.0]], dtype=np.float32)],
+                )
+            )
+        ]
+
+        with self.assertRaisesRegex(ValueError, "weight shapes must match"):
+            strategy.aggregate_fit(1, results, [])
+
     def test_client_evaluation_metrics_are_written_per_round(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             strategy = server_app.SentimentServer.__new__(server_app.SentimentServer)

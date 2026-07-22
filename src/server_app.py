@@ -151,16 +151,24 @@ class SentimentServer(FedProx):
 
     def aggregate_fit(self, server_round, results, failures):
         parameters: Parameters | None
+        if failures and not self.accept_failures:
+            return None, {}
+
         ordered_results = _sorted_fit_results(results)
         if self.use_huber and ordered_results:
-            if failures and not self.accept_failures:
-                return None, {}
             # Robust Huber aggregation instead of plain FedProx averaging
-            reference = parameters_to_ndarrays(ordered_results[0][1].parameters)
-            vectors = [
-                _flatten(parameters_to_ndarrays(result.parameters))
+            client_weights = [
+                parameters_to_ndarrays(result.parameters)
                 for _, result in ordered_results
             ]
+            reference = client_weights[0]
+            reference_shapes = [weight.shape for weight in reference]
+            if any(
+                [weight.shape for weight in weights] != reference_shapes
+                for weights in client_weights[1:]
+            ):
+                raise ValueError("Huber client model weight shapes must match")
+            vectors = [_flatten(weights) for weights in client_weights]
             counts = [result.num_examples for _, result in ordered_results]
             aggregated = huber_aggregate(vectors, counts, self.huber_threshold)
             parameters = ndarrays_to_parameters(_unflatten(aggregated, reference))
