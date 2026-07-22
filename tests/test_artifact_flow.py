@@ -97,8 +97,17 @@ def write_public_artifacts(path: Path, sequence_length: int = 4) -> AppManifest:
     )
 
 
-def public_protocol(sequence_length: int = 4) -> dict[str, object]:
+def public_protocol(
+    sequence_length: int = 4, *, duplicate_split_content: bool = False
+) -> dict[str, object]:
     """Return the small frozen public-artifact protocol used by flow tests.
+
+    Parameters
+    ----------
+    sequence_length : int, optional
+        Frozen model input length.
+    duplicate_split_content : bool, optional
+        Give one official test row the same content as an official train row.
 
     Returns
     -------
@@ -106,8 +115,9 @@ def public_protocol(sequence_length: int = 4) -> dict[str, object]:
         Dataset and vocabulary identity matching ``write_public_artifacts``.
     """
     vocabulary = b"\n[UNK]\ngood\nbad\nmovie\n"
+    negative_test_text = "bad" if duplicate_split_content else "untouched negative"
     evaluation_rows = [
-        {"text": "untouched negative", "label": 0},
+        {"text": negative_test_text, "label": 0},
         {"text": "untouched positive", "label": 1},
     ]
     evaluation_content = b"".join(
@@ -176,7 +186,7 @@ def preparation_request(partitions: int = 1) -> dict[str, int]:
 
 
 def write_complete_prepared_stage(
-    path: Path, *, partitions: int = 1
+    path: Path, *, partitions: int = 1, duplicate_split_content: bool = False
 ) -> dict[str, object]:
     """Write one complete prepared generation candidate for recovery tests.
 
@@ -186,13 +196,16 @@ def write_complete_prepared_stage(
         New generation staging or final directory.
     partitions : int, optional
         Exact number of non-empty client shards to write.
+    duplicate_split_content : bool, optional
+        Give one official test row the same content as an official train row.
 
     Returns
     -------
     dict of str to object
         Frozen-protocol fixture matching every generated artifact.
     """
-    protocol = public_protocol()
+    protocol = public_protocol(duplicate_split_content=duplicate_split_content)
+    negative_test_text = "bad" if duplicate_split_content else "untouched negative"
     public = path / "public"
     public.mkdir(parents=True)
     manifest = write_public_artifacts(public)
@@ -217,7 +230,7 @@ def write_complete_prepared_stage(
         )
     publish_evaluation_artifact(
         [
-            {"text": "untouched negative", "label": 0},
+            {"text": negative_test_text, "label": 0},
             {"text": "untouched positive", "label": 1},
         ],
         path / "evaluation",
@@ -232,6 +245,7 @@ def write_pending_prepared_recovery(
     final: bool,
     legacy_schema: bool = False,
     partitions: int = 1,
+    duplicate_split_content: bool = False,
 ) -> tuple[dict[str, Path], Path, dict[str, object]]:
     """Create one journaled stage or final generation recovery fixture.
 
@@ -245,6 +259,8 @@ def write_pending_prepared_recovery(
         Write schema 1 metadata without a durable preparation request.
     partitions : int, optional
         Exact number of client shards bound by the candidate request.
+    duplicate_split_content : bool, optional
+        Give one official test row the same content as an official train row.
 
     Returns
     -------
@@ -263,7 +279,11 @@ def write_pending_prepared_recovery(
     stage_name = ".prepare-recovery.staging"
     generations = root / ".prepared-generations"
     candidate = generations / (generation_id if final else stage_name)
-    protocol = write_complete_prepared_stage(candidate, partitions=partitions)
+    protocol = write_complete_prepared_stage(
+        candidate,
+        partitions=partitions,
+        duplicate_split_content=duplicate_split_content,
+    )
     schema_version = 1 if legacy_schema else PREPARED_GENERATION_SCHEMA_VERSION
     index = {
         "schema_version": schema_version,
@@ -662,6 +682,44 @@ def check_cli_prepares_all_artifacts_with_one_dataset_load(tmp_path: Path) -> No
 
 
 class ArtifactFlowTests(unittest.TestCase):
+    def test_recovery_accepts_equal_content_with_distinct_split_identities(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            roots, candidate, protocol = write_pending_prepared_recovery(
+                root, final=False, duplicate_split_content=True
+            )
+            train_record = next(
+                row
+                for row in (candidate / "client" / "client-0" / "reviews.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if json.loads(row)["text"] == "bad"
+            )
+            evaluation_record = next(
+                row
+                for row in (candidate / "evaluation" / "test.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if json.loads(row)["text"] == "bad"
+            )
+            train_row = json.loads(train_record)
+            evaluation_row = json.loads(evaluation_record)
+            self.assertEqual(
+                (train_row["text"], train_row["label"]),
+                (evaluation_row["text"], evaluation_row["label"]),
+            )
+            self.assertTrue(train_row["row_id"].startswith("train:"))
+            self.assertTrue(evaluation_row["row_id"].startswith("test:"))
+
+            with patch("src.data_prep.load_scientific_protocol", return_value=protocol):
+                self.assertTrue(
+                    _recover_prepared_migration(roots, preparation_request())
+                )
+
+            self.assertTrue((root / ".prepared-current").is_symlink())
+
     def test_recovery_rejects_invalid_stage_and_final_without_visible_mutation(
         self,
     ) -> None:

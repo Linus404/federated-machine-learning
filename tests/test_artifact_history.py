@@ -408,6 +408,47 @@ class ArtifactHistoryTests(unittest.TestCase):
                 else:
                     self.assertFalse((root / "current.json").exists())
 
+    def test_publication_rejects_vocabulary_checksum_binding_mismatch(self) -> None:
+        for existing_current in (False, True):
+            with (
+                self.subTest(existing_current=existing_current),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                public = create_public_snapshot(root, "public")
+                if existing_current:
+                    current_run = create_run(
+                        root,
+                        RUN_IDS[0],
+                        "2026-01-01T00:00:00Z",
+                        provenance_app_manifest=public,
+                        artifact_app_manifest=public,
+                    )
+                    publish_completed_run(root, current_run)
+                    current_bytes = (root / "current.json").read_bytes()
+
+                candidate = create_run(
+                    root,
+                    RUN_IDS[1],
+                    "2026-01-02T00:00:00Z",
+                    provenance_app_manifest=public,
+                    artifact_app_manifest=public,
+                )
+                provenance_path = candidate / "run_manifest.json"
+                provenance = json.loads(provenance_path.read_bytes())
+                provenance["dataset"]["checksums"]["vocab.txt"] = "sha256:" + "0" * 64
+                provenance_path.write_bytes(canonical_json_bytes(provenance))
+
+                with self.assertRaisesRegex(ValueError, "vocabulary does not match"):
+                    publish_completed_run(root, candidate)
+
+                if existing_current:
+                    self.assertEqual(
+                        (root / "current.json").read_bytes(), current_bytes
+                    )
+                else:
+                    self.assertFalse((root / "current.json").exists())
+
     def test_current_snapshot_rejects_distinct_valid_public_manifest_bindings(
         self,
     ) -> None:
@@ -435,6 +476,33 @@ class ArtifactHistoryTests(unittest.TestCase):
             current_path.write_bytes(canonical_json_bytes(current))
 
             with self.assertRaisesRegex(ValueError, "public manifest does not match"):
+                load_current_run_snapshot(root)
+
+    def test_current_snapshot_rejects_vocabulary_checksum_binding_mismatch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            run = create_run(root, RUN_IDS[0], "2026-01-01T00:00:00Z")
+            publish_completed_run(root, run)
+            provenance_path = run / "run_manifest.json"
+            provenance = json.loads(provenance_path.read_bytes())
+            provenance["dataset"]["checksums"]["vocab.txt"] = "sha256:" + "0" * 64
+            provenance_path.write_bytes(canonical_json_bytes(provenance))
+            artifact_manifest_path = run / "artifact_manifest.json"
+            artifact_manifest = json.loads(artifact_manifest_path.read_bytes())
+            artifact_manifest["checksums"]["run_manifest.json"] = sha256_bytes(
+                provenance_path.read_bytes()
+            )
+            artifact_manifest_path.write_bytes(canonical_json_bytes(artifact_manifest))
+            current_path = root / "current.json"
+            current = json.loads(current_path.read_bytes())
+            current["artifact_manifest_checksum"] = sha256_bytes(
+                artifact_manifest_path.read_bytes()
+            )
+            current_path.write_bytes(canonical_json_bytes(current))
+
+            with self.assertRaisesRegex(ValueError, "vocabulary does not match"):
                 load_current_run_snapshot(root)
 
     def test_finalization_rejects_hostile_provenance_json(self) -> None:
@@ -546,7 +614,10 @@ class ArtifactHistoryTests(unittest.TestCase):
                     separators=(",", ":"),
                     allow_nan=False,
                 ),
-                "checksums": {"manifest.json": public_manifest["checksum"]},
+                "checksums": {
+                    "manifest.json": public_manifest["checksum"],
+                    "vocab.txt": "sha256:" + "4" * 64,
+                },
                 "public_manifest": public_manifest,
                 "status": "available",
                 "private_client_shards": {

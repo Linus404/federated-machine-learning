@@ -67,6 +67,8 @@ class ArtifactCompatibilityTests(unittest.TestCase):
         self.assertIn("client-N/client_metadata.json` uses `schema_version: 2`", policy)
         self.assertIn("client schema `1` shards", policy)
         self.assertIn("Regenerate public schema\n`2`, client schema `2`", policy)
+        self.assertIn("schema-3 generation atomically supersedes it", policy)
+        self.assertNotIn("schema-2 generation atomically supersedes it", policy)
         self.assertNotIn("all other persisted contracts remain schema `1`", policy)
 
     def test_current_schema_is_supported(self) -> None:

@@ -757,14 +757,12 @@ def _validate_recovery_generation(
             )
         train_content = hashlib.sha256()
         train_labels: Counter[int] = Counter()
-        train_rows: set[bytes] = set()
         for row in ordered_rows:
             assert row is not None
             text, label = row
             source_bytes = canonical_source_row_bytes(text, label)
             train_content.update(source_bytes)
             train_labels[label] += 1
-            train_rows.add(source_bytes)
         if train_content.hexdigest() != train_spec["content_sha256"]:
             raise ValueError(
                 "prepared migration train content differs from frozen data"
@@ -777,16 +775,7 @@ def _validate_recovery_generation(
         ):
             raise ValueError("prepared migration train labels differ from frozen data")
 
-        evaluation = load_evaluation_artifact_snapshot(
-            generation / "evaluation", protocol=protocol
-        )
-        evaluation_rows = {
-            canonical_source_row_bytes(str(row["text"]), int(row["label"]))
-            for line in evaluation.records.splitlines()
-            for row in [strict_json_loads(line, source="evaluation record")]
-        }
-        if train_rows & evaluation_rows:
-            raise ValueError("prepared migration train content overlaps evaluation")
+        load_evaluation_artifact_snapshot(generation / "evaluation", protocol=protocol)
     except _PreparedGenerationValidationError:
         raise
     except Exception as error:

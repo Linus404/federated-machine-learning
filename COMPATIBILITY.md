@@ -68,7 +68,7 @@ schema `1` artifacts do not require a schema migration. Prepared-generation sche
 `1` did not bind the requested partition count and is no longer selectable. A
 pending schema-1 preparation is safely rolled back and its journal-owned candidate
 discarded before regeneration; an already selected schema-1 generation remains
-immutable until a schema-2 generation atomically supersedes it.
+immutable until a schema-3 generation atomically supersedes it.
 
 Prepared-generation schema `2` did not independently bind the selected file
 inventory. Pending schema-2 preparations are rolled back rather than recovered;

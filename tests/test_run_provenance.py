@@ -342,6 +342,50 @@ class RunProvenanceTests(unittest.TestCase):
         )
         self.assertEqual(json.loads(metadata["identity"])["rows"], 25000)
 
+    def test_loader_requires_exact_public_checksum_inventory(self) -> None:
+        from src.app_manifest import load_app_manifest
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            public_dir = root / "public"
+            public_dir.mkdir()
+            protocol = write_public_dataset_contract(public_dir)
+            snapshot = load_app_manifest(
+                public_artifact_dir=public_dir, protocol=protocol
+            )
+            with (
+                patch(
+                    "src.run_provenance._code_revision",
+                    return_value={
+                        "commit": None,
+                        "dirty": None,
+                        "source": "unavailable",
+                    },
+                ),
+                patch(
+                    "src.run_provenance._environment_metadata",
+                    return_value=runtime_environment(),
+                ),
+            ):
+                valid_path = write_run_provenance_manifest(
+                    root / "run", {}, app_manifest=snapshot
+                )
+            valid = json.loads(valid_path.read_bytes())
+
+            for mutation in ("missing", "extra"):
+                with self.subTest(mutation=mutation):
+                    payload = json.loads(json.dumps(valid))
+                    if mutation == "missing":
+                        del payload["dataset"]["checksums"]["vocab.txt"]
+                    else:
+                        payload["dataset"]["checksums"]["extra.txt"] = (
+                            "sha256:" + "0" * 64
+                        )
+                    path = root / f"{mutation}.json"
+                    path.write_bytes(canonical_json_bytes(payload))
+                    with self.assertRaisesRegex(ValueError, "dataset.checksums"):
+                        load_run_provenance_manifest(path)
+
     def test_linux_environment_uses_tensorflow_cpu_distribution_version(self) -> None:
         versions = {
             "datasets": "4.8.5",
@@ -723,7 +767,10 @@ class RunProvenanceTests(unittest.TestCase):
             base["dataset"] = {
                 **base["dataset"],
                 "identity": canonical_identity,
-                "checksums": {"manifest.json": "sha256:" + "3" * 64},
+                "checksums": {
+                    "manifest.json": "sha256:" + "3" * 64,
+                    "vocab.txt": "sha256:" + "4" * 64,
+                },
                 "public_manifest": {
                     "filename": "manifest.json",
                     "size_bytes": 1,

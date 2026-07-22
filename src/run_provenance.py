@@ -15,6 +15,7 @@ from typing import Any, Mapping
 
 from src.app_manifest import (
     AppManifest,
+    PUBLIC_ARTIFACT_FILENAMES,
     expected_train_dataset,
     load_app_manifest,
     resolve_public_artifact_dir,
@@ -301,6 +302,8 @@ def _validate_dataset(dataset: Mapping[str, Any]) -> None:
         raise ValueError("run provenance manifest has an invalid dataset.status")
     if status == "available" and (identity is None or not checksums):
         raise ValueError("run provenance manifest has inconsistent dataset metadata")
+    if status == "available" and set(checksums) != PUBLIC_ARTIFACT_FILENAMES:
+        raise ValueError("run provenance manifest has an invalid dataset.checksums")
     if status == "unavailable" and (
         identity is not None or checksums or authoritative_public_manifest is not None
     ):

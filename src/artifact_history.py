@@ -237,7 +237,7 @@ def resolve_current_run_dir(artifact_root: str | Path) -> Path:
 def _validate_public_manifest_binding(
     provenance: Mapping[str, Any], artifact_manifest: Mapping[str, Any]
 ) -> None:
-    """Require run provenance and server artifacts to bind one public manifest.
+    """Require run provenance and server artifacts to bind one public snapshot.
 
     Parameters
     ----------
@@ -253,7 +253,7 @@ def _validate_public_manifest_binding(
     Raises
     ------
     ValueError
-        If the manifests do not bind the same public manifest checksum.
+        If the manifests do not bind the same public manifest and vocabulary.
     """
     public_manifest = provenance["dataset"]["public_manifest"]
     provenance_checksum = (
@@ -267,6 +267,14 @@ def _validate_public_manifest_binding(
     ):
         raise ValueError(
             "run provenance public manifest does not match the server artifact binding"
+        )
+    vocabulary_checksum = provenance["dataset"]["checksums"].get("vocab.txt")
+    artifact_vocabulary_checksum = artifact_manifest["binding"]["vocabulary_checksum"]
+    if not isinstance(vocabulary_checksum, str) or not hmac.compare_digest(
+        vocabulary_checksum, artifact_vocabulary_checksum
+    ):
+        raise ValueError(
+            "run provenance vocabulary does not match the server artifact binding"
         )
 
 
