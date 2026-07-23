@@ -42,6 +42,13 @@ class LocalTrainingTests(unittest.TestCase):
             embedding_dim=4,
             dropout_seed=67,
         )
+        model.train_on_batch(
+            np.array(
+                [[1, 2, 3, 0, 0, 0, 0, 0], [4, 5, 6, 7, 0, 0, 0, 0]],
+                dtype=np.int32,
+            ),
+            np.array([[1.0], [0.0]], dtype=np.float32),
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "model.keras"
