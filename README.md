@@ -8,30 +8,7 @@ centralized, FedAvg, FedProx, and robust aggregation strategies while preserving
 an untouched test set and verifiable experiment artifacts.
 
 This project began as a university assignment. Its goal is a credible local
-demonstration and a compact scientific comparison—not a production federated
-learning platform.
-
-## Scope and status
-
-The project assumes a trusted single-user operator, a local POSIX filesystem,
-and centrally prepared demo data.
-
-| Capability | Status |
-| --- | --- |
-| Frozen IMDB dataset revision and deterministic preparation | Complete |
-| Untouched, checksum-verified test artifact | Complete |
-| Centralized and local-only baselines | Complete |
-| Single-cell IID strategy runner | Complete |
-| FedAvg, FedProx, Huber, median, and trimmed-mean aggregation | Complete |
-| Canonical metrics and raw prediction artifacts | Complete |
-| Local Flower and Docker demonstrations | Complete |
-| Compact multi-seed IID/non-IID comparison | Next |
-| Published comparative results | Pending the completed matrix |
-| Production deployment and operational hardening | Out of scope |
-
-Smoke runs and isolated strategy runs are not presented as benchmark results.
-Comparative values will be published only after the compact matrix has been
-executed against the frozen protocol.
+demonstration and a compact scientific comparison.
 
 ## Architecture
 
