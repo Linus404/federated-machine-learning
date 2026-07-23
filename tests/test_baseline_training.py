@@ -14,6 +14,7 @@ import numpy as np
 from src.baseline_training import (
     _derive_seed,
     _registered_iid_splits,
+    _registered_partition_splits,
     _training_orders,
     parse_args,
     run,
@@ -199,6 +200,33 @@ class BaselineTrainingTests(unittest.TestCase):
             ],
             [[4, 20], [14, 34], [11, 33], [1, 25]],
         )
+
+    def test_registered_dirichlet_retry_matches_frozen_attempt(self) -> None:
+        rows = tuple(
+            (
+                f"train:{index}",
+                f"review {index}",
+                0 if index < 12_500 else 1,
+            )
+            for index in range(25_000)
+        )
+
+        attempt, splits = _registered_partition_splits(
+            [SimpleNamespace(rows=rows)],
+            self.protocol,
+            101,
+            4,
+            0.2,
+            "dirichlet_0.1",
+        )
+
+        self.assertEqual(attempt, 1)
+        assigned = sorted(
+            int(row[0].removeprefix("train:"))
+            for fitted, validation in splits
+            for row in (*fitted, *validation)
+        )
+        self.assertEqual(assigned, list(range(25_000)))
 
     def test_registered_seed_and_training_orders_match_golden_values(self) -> None:
         self.assertEqual(

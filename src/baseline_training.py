@@ -315,23 +315,123 @@ def _registered_iid_splits(
     list of tuple
         Ascending fitted and validation row tuples for every client.
     """
+    _, splits = _registered_partition_splits(
+        snapshots,
+        protocol,
+        master_seed,
+        client_count,
+        validation_split,
+        REGISTERED_PARTITION,
+    )
+    return splits
+
+
+def _registered_partition_splits(
+    snapshots: list[ClientShardSnapshot],
+    protocol: Mapping[str, Any],
+    master_seed: int,
+    client_count: int,
+    validation_split: float,
+    partition_name: str,
+) -> tuple[int, list[RowSplit]]:
+    """Repartition the validated train union using one frozen policy.
+
+    Parameters
+    ----------
+    snapshots : list of ClientShardSnapshot
+        Prepared shards whose union is the complete official train split.
+    protocol : mapping of str to Any
+        Frozen scientific protocol.
+    master_seed : int
+        Experiment master seed.
+    client_count : int
+        Number of client partitions.
+    validation_split : float
+        Per-label validation fraction.
+    partition_name : str
+        Registered IID or Dirichlet partition name.
+
+    Returns
+    -------
+    tuple of int and list
+        Accepted partition attempt and ascending fitted/validation row tuples.
+
+    Raises
+    ------
+    ValueError
+        If the partition is not registered or no Dirichlet attempt is accepted.
+    """
+    partitioning = protocol["partitioning"]
+    if partition_name not in partitioning["registered"]:
+        raise ValueError(f"unsupported registered partition: {partition_name}")
     rows_by_index = {
         int(row[0].removeprefix("train:")): row
         for snapshot in snapshots
         for row in snapshot.rows
     }
-    labels = protocol["partitioning"]["labels"]
-    iid_template = protocol["seeding"]["namespaces"]["partition_iid"]
-    allocations: list[list[int]] = [[] for _ in range(client_count)]
-    for label in labels:
-        indices = np.asarray(
+    labels = partitioning["labels"]
+    rows_by_label = {
+        label: np.asarray(
             sorted(index for index, row in rows_by_index.items() if row[2] == label),
             dtype=np.int64,
         )
-        namespace = iid_template.format(client_scale=client_count, label=label)
-        shuffled = _generator(master_seed, namespace).permutation(indices)
-        for client_id, part in enumerate(np.array_split(shuffled, client_count)):
-            allocations[client_id].extend(int(index) for index in part)
+        for label in labels
+    }
+    allocations: list[list[int]]
+    if partition_name == REGISTERED_PARTITION:
+        allocations = [[] for _ in range(client_count)]
+        template = protocol["seeding"]["namespaces"]["partition_iid"]
+        for label in labels:
+            namespace = template.format(client_scale=client_count, label=label)
+            shuffled = _generator(master_seed, namespace).permutation(
+                rows_by_label[label]
+            )
+            for client_id, part in enumerate(np.array_split(shuffled, client_count)):
+                allocations[client_id].extend(int(index) for index in part)
+        accepted_attempt = 0
+    else:
+        alpha = float(partition_name.removeprefix("dirichlet_"))
+        template = protocol["seeding"]["namespaces"]["partition_dirichlet"]
+        for accepted_attempt in range(
+            partitioning["first_attempt"], partitioning["last_attempt"] + 1
+        ):
+            allocations = [[] for _ in range(client_count)]
+            client_sizes = np.zeros(client_count, dtype=np.int64)
+            label_allocations: list[tuple[np.ndarray, np.ndarray]] = []
+            for label in labels:
+                namespace = template.format(
+                    partition_name=partition_name,
+                    client_scale=client_count,
+                    label=label,
+                )
+                rng = np.random.Generator(
+                    np.random.PCG64(
+                        _derive_seed(master_seed, namespace, accepted_attempt)
+                    )
+                )
+                shuffled = rng.permutation(rows_by_label[label])
+                counts = rng.multinomial(
+                    len(shuffled), rng.dirichlet(np.full(client_count, alpha))
+                )
+                label_allocations.append((shuffled, counts))
+                client_sizes += counts
+            if client_sizes.min() < partitioning["minimum_samples_per_client"]:
+                continue
+            for shuffled, counts in label_allocations:
+                boundaries = np.concatenate(([0], np.cumsum(counts)))
+                for client_id in range(client_count):
+                    allocations[client_id].extend(
+                        int(index)
+                        for index in shuffled[
+                            boundaries[client_id] : boundaries[client_id + 1]
+                        ]
+                    )
+            break
+        else:
+            raise ValueError(
+                f"no accepted {partition_name}/{client_count} partition "
+                f"for seed {master_seed}"
+            )
 
     validation_template = protocol["seeding"]["namespaces"]["validation"]
     splits: list[RowSplit] = []
@@ -346,7 +446,7 @@ def _registered_iid_splits(
                 dtype=np.int64,
             )
             namespace = validation_template.format(
-                partition_name=REGISTERED_PARTITION,
+                partition_name=partition_name,
                 client_scale=client_count,
                 client_id=client_id,
                 label=label,
@@ -361,7 +461,7 @@ def _registered_iid_splits(
                 tuple(rows_by_index[index] for index in sorted(validation)),
             )
         )
-    return splits
+    return accepted_attempt, splits
 
 
 def _tokenize_split(

@@ -32,7 +32,7 @@ from src.baseline_training import (
     _derive_seed,
     _load_client_snapshots,
     _model_seeds,
-    _registered_iid_splits,
+    _registered_partition_splits,
     _tensorflow_seed,
     _tokenize_split,
     _training_orders,
@@ -215,8 +215,13 @@ def aggregate_model_weights(
     return _validate_aggregated_weights(aggregated, client_weights[0])
 
 
-def _cell_id(strategy: str, seed: int) -> str:
-    """Return the canonical identifier for one IID strategy contract run.
+def _cell_id(
+    strategy: str,
+    seed: int,
+    partition: str = REGISTERED_PARTITION,
+    client_count: int = DEFAULT_BASELINE_CLIENTS,
+) -> str:
+    """Return the canonical identifier for one strategy contract run.
 
     Parameters
     ----------
@@ -224,6 +229,10 @@ def _cell_id(strategy: str, seed: int) -> str:
         Registered strategy identifier.
     seed : int
         Registered master seed.
+    partition : str, optional
+        Registered partition name.
+    client_count : int, optional
+        Registered client scale.
 
     Returns
     -------
@@ -232,12 +241,16 @@ def _cell_id(strategy: str, seed: int) -> str:
     """
     return json.dumps(
         {
-            "alpha": None,
-            "client_scale": DEFAULT_BASELINE_CLIENTS,
+            "alpha": (
+                None
+                if partition == REGISTERED_PARTITION
+                else float(partition.removeprefix("dirichlet_"))
+            ),
+            "client_scale": client_count,
             "matrix_kind": (
                 "local_only" if strategy == "local_only" else "primary_federated"
             ),
-            "partition": REGISTERED_PARTITION,
+            "partition": partition,
             "seed": seed,
             "strategy": strategy,
             "threat": None,
@@ -536,7 +549,12 @@ def _run_local_only(
     tuple of dict and list
         Result payload and trained models.
     """
-    cell_id = _cell_id(args.strategy, args.seed)
+    cell_id = _cell_id(
+        args.strategy,
+        args.seed,
+        args.partition,
+        args.client_count,
+    )
     models: list[Any] = []
     clients: list[dict[str, Any]] = []
     for client_id, split in enumerate(splits):
@@ -650,7 +668,12 @@ def _run_federated(
     tuple of dict and list
         Result payload and final global model list.
     """
-    cell_id = _cell_id(args.strategy, args.seed)
+    cell_id = _cell_id(
+        args.strategy,
+        args.seed,
+        args.partition,
+        args.client_count,
+    )
     global_seed = _federated_model_seed(protocol, args.seed, cell_id, -1)
     keras.utils.set_random_seed(global_seed)
     global_model = build_model_from_manifest(
@@ -769,7 +792,7 @@ def _result_config(args: argparse.Namespace) -> dict[str, Any]:
         "batch_size": args.batch_size,
         "client_count": args.client_count,
         "epochs": args.epochs,
-        "partition": REGISTERED_PARTITION,
+        "partition": args.partition,
         "seed": args.seed,
         "validation_split": args.validation_split,
     }
@@ -792,7 +815,7 @@ def _validate_args(args: argparse.Namespace, protocol: Mapping[str, Any]) -> Non
     Raises
     ------
     ValueError
-        If a setting differs from the registered IID four-client contract.
+        If a setting differs from the registered four-client contract.
     """
     if args.strategy not in REGISTERED_STRATEGIES:
         raise ValueError(f"unsupported registered strategy: {args.strategy}")
@@ -809,11 +832,13 @@ def _validate_args(args: argparse.Namespace, protocol: Mapping[str, Any]) -> Non
             )
     if type(args.seed) is not int or args.seed not in protocol["seeding"]["seeds"]:
         raise ValueError("seed must be one of the frozen registered seeds")
+    if args.partition not in protocol["partitioning"]["registered"]:
+        raise ValueError("partition must be registered by the frozen protocol")
     _validate_client_data_template(args.client_data_dir)
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
-    """Execute and persist one registered IID strategy contract run.
+    """Execute and persist one registered strategy contract run.
 
     Parameters
     ----------
@@ -832,18 +857,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     try:
         manifest = load_app_manifest(public_artifact_dir=args.public_artifact_dir)
         snapshots = _load_client_snapshots(args, manifest)
-        splits = _registered_iid_splits(
+        accepted_attempt, splits = _registered_partition_splits(
             snapshots,
             protocol,
             args.seed,
             args.client_count,
             args.validation_split,
+            args.partition,
         )
         result, models = (
             _run_local_only(args, manifest, protocol, splits, output_dir)
             if args.strategy == "local_only"
             else _run_federated(args, manifest, protocol, splits, output_dir)
         )
+        result["config"]["partition_attempt"] = accepted_attempt
         for filename, model in zip(result["models"], models, strict=True):
             model.save(str(output_dir / filename))
         (output_dir / "results.json").write_bytes(canonical_json_bytes(result))
@@ -868,7 +895,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         Parsed registered strategy options.
     """
     parser = argparse.ArgumentParser(
-        description="Run one registered four-client IID strategy contract."
+        description="Run one registered four-client strategy contract."
     )
     parser.add_argument("strategy", choices=REGISTERED_STRATEGIES)
     parser.add_argument(
@@ -886,6 +913,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=DEFAULT_BASELINE_SEED)
+    parser.add_argument(
+        "--partition",
+        choices=(
+            "iid_stratified",
+            "dirichlet_1.0",
+            "dirichlet_0.5",
+            "dirichlet_0.1",
+        ),
+        default=REGISTERED_PARTITION,
+    )
     parser.add_argument("--quiet", action="store_true")
     parser.set_defaults(
         batch_size=64,

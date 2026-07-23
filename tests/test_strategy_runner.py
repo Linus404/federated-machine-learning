@@ -41,6 +41,7 @@ def runner_args(root: Path, strategy: str) -> argparse.Namespace:
         epochs=20,
         evaluation_artifact_dir=root / "evaluation",
         output_dir=root,
+        partition="iid_stratified",
         public_artifact_dir=root / "public",
         quiet=True,
         seed=67,
