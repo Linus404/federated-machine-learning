@@ -58,8 +58,8 @@ federated learning system.
 - [ ] Add a containerized end-to-end smoke test.
 - [ ] Make the required client count configurable throughout server and deployment code.
 - [ ] Test partial client participation, disconnects, timeouts, and failed rounds.
-- [ ] Test malformed, missing, incompatible, and corrupted manifests and artifacts.
-- [ ] Test invalid model updates, incompatible tensor shapes, NaN values, and empty aggregation inputs.
+- [x] Test malformed, missing, incompatible, and corrupted manifests and artifacts.
+- [x] Test invalid model updates, incompatible tensor shapes, NaN values, and empty aggregation inputs.
 - [ ] Add dashboard tests for metric loading, inference errors, and missing artifacts.
 - [x] Test model save/load compatibility.
 - [ ] Add a supported Python and operating-system test matrix.
