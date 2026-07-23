@@ -3,6 +3,44 @@
 These procedures cover the supported single-host Compose demonstration. They do
 not establish production disaster recovery.
 
+## Secure Flower transport and SuperNode authentication
+
+The default Compose file is loopback-only and intentionally insecure. The
+secure override encrypts the Fleet, Control, ServerAppIo, and ClientAppIo
+channels and requires a registered P-384 identity for every SuperNode.
+
+Generate disposable local-development credentials:
+
+```bash
+./scripts/generate-dev-flower-credentials.sh
+docker compose -f compose.yaml -f compose.secure.yaml up -d superlink
+```
+
+Add this profile to `~/.flwr/config.toml` using an absolute CA path:
+
+```toml
+[superlink.local-secure]
+address = "127.0.0.1:9093"
+root-certificates = "/absolute/path/to/secrets/flower/ca.crt"
+```
+
+Register each public identity before starting its SuperNode:
+
+```bash
+for id in 0 1 2 3; do
+  uv run flwr supernode register "secrets/flower/supernode-${id}.pub" local-secure
+done
+docker compose -f compose.yaml -f compose.secure.yaml up --build -d
+```
+
+The generator is for local development only. Production deployments must use a
+managed CA, distinct leaf keys, restricted secret delivery, expiry monitoring,
+and audited rotation. Flower 1.32.1 does not document certificate hot reload or
+revocation. Rotate by first distributing a CA bundle that trusts old and new
+CAs, replace and restart each endpoint, validate peers, and remove the old CA
+only after migration. Never commit `secrets/`; private keys are mounted
+read-only at runtime.
+
 ## Backup
 
 Stop writers and archive both persistent volumes:

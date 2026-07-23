@@ -305,5 +305,33 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         self.assertIn(f"server-artifact-dir='{root}/server'", compatibility)
 
 
+class SecureDeploymentContractTests(unittest.TestCase):
+    def test_secure_overlay_encrypts_every_flower_channel_and_authenticates_nodes(
+        self,
+    ) -> None:
+        compose = Path("compose.secure.yaml").read_text(encoding="utf-8")
+
+        self.assertNotIn("--insecure", compose)
+        superlink = service_block(compose, "superlink")
+        for flag in (
+            "--ssl-ca-certfile",
+            "--ssl-certfile",
+            "--ssl-keyfile",
+            "--appio-ssl-ca-certfile",
+            "--appio-ssl-certfile",
+            "--appio-ssl-keyfile",
+            "--enable-supernode-auth",
+        ):
+            self.assertIn(flag, superlink)
+        for index in range(4):
+            with self.subTest(index=index):
+                supernode = service_block(compose, f"supernode-{index}")
+                clientapp = service_block(compose, f"clientapp-{index}")
+                self.assertIn("--root-certificates", supernode)
+                self.assertIn("--auth-supernode-private-key", supernode)
+                self.assertIn("--appio-ssl-certfile", supernode)
+                self.assertIn("--root-certificates", clientapp)
+
+
 if __name__ == "__main__":
     unittest.main()

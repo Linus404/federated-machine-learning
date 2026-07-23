@@ -1,0 +1,192 @@
+services:
+  superlink:
+    command: >
+      uv run --no-sync
+      flower-superlink
+      --ssl-ca-certfile /run/secrets/flower_ca
+      --ssl-certfile /run/secrets/fleet_control_cert
+      --ssl-keyfile /run/secrets/fleet_control_key
+      --appio-ssl-ca-certfile /run/secrets/flower_ca
+      --appio-ssl-certfile /run/secrets/serverappio_cert
+      --appio-ssl-keyfile /run/secrets/serverappio_key
+      --enable-supernode-auth
+      --isolation process
+      --database /app/state/state.db
+      --health-server-address 0.0.0.0:9099
+    secrets:
+      - flower_ca
+      - fleet_control_cert
+      - fleet_control_key
+      - serverappio_cert
+      - serverappio_key
+
+  serverapp:
+    command: >
+      uv run --no-sync
+      flower-superexec
+      --root-certificates /run/secrets/flower_ca
+      --plugin-type serverapp
+      --appio-api-address superlink:9091
+      --health-server-address 0.0.0.0:9095
+    secrets:
+      - flower_ca
+
+  supernode-0:
+    command: >
+      uv run --no-sync
+      flower-supernode
+      --root-certificates /run/secrets/flower_ca
+      --superlink superlink:9092
+      --auth-supernode-private-key /run/secrets/supernode_0_identity
+      --node-config partition-id=0
+      --clientappio-api-address 0.0.0.0:9094
+      --appio-ssl-ca-certfile /run/secrets/flower_ca
+      --appio-ssl-certfile /run/secrets/supernode_0_appio_cert
+      --appio-ssl-keyfile /run/secrets/supernode_0_appio_key
+      --health-server-address 0.0.0.0:9095
+      --isolation process
+    secrets:
+      - flower_ca
+      - supernode_0_identity
+      - supernode_0_appio_cert
+      - supernode_0_appio_key
+
+  clientapp-0:
+    command: >
+      uv run --no-sync
+      flower-superexec
+      --root-certificates /run/secrets/flower_ca
+      --plugin-type clientapp
+      --appio-api-address supernode-0:9094
+      --health-server-address 0.0.0.0:9095
+    secrets:
+      - flower_ca
+
+  supernode-1:
+    command: >
+      uv run --no-sync
+      flower-supernode
+      --root-certificates /run/secrets/flower_ca
+      --superlink superlink:9092
+      --auth-supernode-private-key /run/secrets/supernode_1_identity
+      --node-config partition-id=1
+      --clientappio-api-address 0.0.0.0:9094
+      --appio-ssl-ca-certfile /run/secrets/flower_ca
+      --appio-ssl-certfile /run/secrets/supernode_1_appio_cert
+      --appio-ssl-keyfile /run/secrets/supernode_1_appio_key
+      --health-server-address 0.0.0.0:9095
+      --isolation process
+    secrets:
+      - flower_ca
+      - supernode_1_identity
+      - supernode_1_appio_cert
+      - supernode_1_appio_key
+
+  clientapp-1:
+    command: >
+      uv run --no-sync
+      flower-superexec
+      --root-certificates /run/secrets/flower_ca
+      --plugin-type clientapp
+      --appio-api-address supernode-1:9094
+      --health-server-address 0.0.0.0:9095
+    secrets:
+      - flower_ca
+
+  supernode-2:
+    command: >
+      uv run --no-sync
+      flower-supernode
+      --root-certificates /run/secrets/flower_ca
+      --superlink superlink:9092
+      --auth-supernode-private-key /run/secrets/supernode_2_identity
+      --node-config partition-id=2
+      --clientappio-api-address 0.0.0.0:9094
+      --appio-ssl-ca-certfile /run/secrets/flower_ca
+      --appio-ssl-certfile /run/secrets/supernode_2_appio_cert
+      --appio-ssl-keyfile /run/secrets/supernode_2_appio_key
+      --health-server-address 0.0.0.0:9095
+      --isolation process
+    secrets:
+      - flower_ca
+      - supernode_2_identity
+      - supernode_2_appio_cert
+      - supernode_2_appio_key
+
+  clientapp-2:
+    command: >
+      uv run --no-sync
+      flower-superexec
+      --root-certificates /run/secrets/flower_ca
+      --plugin-type clientapp
+      --appio-api-address supernode-2:9094
+      --health-server-address 0.0.0.0:9095
+    secrets:
+      - flower_ca
+
+  supernode-3:
+    command: >
+      uv run --no-sync
+      flower-supernode
+      --root-certificates /run/secrets/flower_ca
+      --superlink superlink:9092
+      --auth-supernode-private-key /run/secrets/supernode_3_identity
+      --node-config partition-id=3
+      --clientappio-api-address 0.0.0.0:9094
+      --appio-ssl-ca-certfile /run/secrets/flower_ca
+      --appio-ssl-certfile /run/secrets/supernode_3_appio_cert
+      --appio-ssl-keyfile /run/secrets/supernode_3_appio_key
+      --health-server-address 0.0.0.0:9095
+      --isolation process
+    secrets:
+      - flower_ca
+      - supernode_3_identity
+      - supernode_3_appio_cert
+      - supernode_3_appio_key
+
+  clientapp-3:
+    command: >
+      uv run --no-sync
+      flower-superexec
+      --root-certificates /run/secrets/flower_ca
+      --plugin-type clientapp
+      --appio-api-address supernode-3:9094
+      --health-server-address 0.0.0.0:9095
+    secrets:
+      - flower_ca
+
+secrets:
+  flower_ca:
+    file: ./secrets/flower/ca.crt
+  fleet_control_cert:
+    file: ./secrets/flower/fleet-control.pem
+  fleet_control_key:
+    file: ./secrets/flower/fleet-control.key
+  serverappio_cert:
+    file: ./secrets/flower/serverappio.pem
+  serverappio_key:
+    file: ./secrets/flower/serverappio.key
+  supernode_0_identity:
+    file: ./secrets/flower/supernode-0
+  supernode_0_appio_cert:
+    file: ./secrets/flower/supernode-0-appio.pem
+  supernode_0_appio_key:
+    file: ./secrets/flower/supernode-0-appio.key
+  supernode_1_identity:
+    file: ./secrets/flower/supernode-1
+  supernode_1_appio_cert:
+    file: ./secrets/flower/supernode-1-appio.pem
+  supernode_1_appio_key:
+    file: ./secrets/flower/supernode-1-appio.key
+  supernode_2_identity:
+    file: ./secrets/flower/supernode-2
+  supernode_2_appio_cert:
+    file: ./secrets/flower/supernode-2-appio.pem
+  supernode_2_appio_key:
+    file: ./secrets/flower/supernode-2-appio.key
+  supernode_3_identity:
+    file: ./secrets/flower/supernode-3
+  supernode_3_appio_cert:
+    file: ./secrets/flower/supernode-3-appio.pem
+  supernode_3_appio_key:
+    file: ./secrets/flower/supernode-3-appio.key

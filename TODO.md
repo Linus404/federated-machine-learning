@@ -39,8 +39,8 @@ federated learning system.
 - [x] Write an explicit threat model covering trusted and untrusted components.
 - [x] Clearly distinguish the simulated demo's centralized shard preparation from real client-owned data.
 - [x] Document what information model updates can leak.
-- [ ] Add TLS for Flower communication.
-- [ ] Add SuperNode/client authentication and certificate lifecycle documentation.
+- [x] Add TLS for Flower communication.
+- [x] Add SuperNode/client authentication and certificate lifecycle documentation.
 - [x] Evaluate secure aggregation.
   - Decision: defer Flower 1.32.1 SecAgg+ until its documented integration,
     incompatibilities, and end-to-end prerequisites are resolved; see
