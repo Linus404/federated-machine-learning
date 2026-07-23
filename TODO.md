@@ -102,7 +102,7 @@ federated learning system.
 - [ ] Add a quick-start path that produces a small result in a few minutes.
 - [ ] Explain key design decisions and rejected alternatives.
 - [ ] Add a limitations and responsible-use section.
-- [ ] Add a model card and dataset card.
+- [x] Add a model card and dataset card.
 - [x] Standardize all dashboard text to one language.
 - [ ] Remove stale branch instructions and clean up the research notebook.
 - [ ] Add a roadmap and a resume-ready project summary.

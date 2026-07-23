@@ -238,6 +238,10 @@ See [`THREAT_MODEL.md`](THREAT_MODEL.md),
 [secure-aggregation decision](docs/adr/0001-secure-aggregation.md) for the
 detailed boundaries.
 
+The [`MODEL_CARD.md`](MODEL_CARD.md) and [`DATASET_CARD.md`](DATASET_CARD.md)
+summarize intended use, evaluation status, data handling, and responsible-use
+limits.
+
 ## Development
 
 Run the same local quality gates used by CI:
