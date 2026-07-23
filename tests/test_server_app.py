@@ -470,9 +470,27 @@ class MetricAggregationTests(unittest.TestCase):
             ),
         )
         cases = {
+            "partial_participation": (
+                [valid_result],
+                [],
+                None,
+                None,
+            ),
             "reported_client_failure": (
                 [],
                 [RuntimeError("client failed")],
+                None,
+                None,
+            ),
+            "client_disconnect": (
+                [],
+                [ConnectionError("client disconnected")],
+                None,
+                None,
+            ),
+            "client_timeout": (
+                [],
+                [TimeoutError("client timed out")],
                 None,
                 None,
             ),
@@ -512,7 +530,11 @@ class MetricAggregationTests(unittest.TestCase):
                 strategy.accept_failures = False
                 strategy.inplace = True
                 strategy.fit_metrics_aggregation_fn = None
-                strategy.expected_client_ids = frozenset({0})
+                strategy.expected_client_ids = (
+                    frozenset({0, 1})
+                    if name == "partial_participation"
+                    else frozenset({0})
+                )
                 strategy.expected_weight_shapes = ((1,),)
                 strategy.artifact_dir = run_dir
                 strategy.artifact_root = root

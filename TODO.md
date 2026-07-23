@@ -52,7 +52,7 @@ federated learning system.
 - [ ] Add a real end-to-end Flower test with multiple clients and at least one training round.
 - [ ] Add a containerized end-to-end smoke test.
 - [x] Make the required client count configurable throughout server and deployment code.
-- [ ] Test partial client participation, disconnects, timeouts, and failed rounds.
+- [x] Test partial client participation, disconnects, timeouts, and failed rounds.
 - [x] Test malformed, missing, incompatible, and corrupted manifests and artifacts.
 - [x] Test invalid model updates, incompatible tensor shapes, NaN values, and empty aggregation inputs.
 - [x] Add dashboard tests for metric loading, inference errors, and missing artifacts.
@@ -65,7 +65,7 @@ federated learning system.
 - [x] Assign a unique ID to every training run.
 - [x] Persist the complete run configuration and environment metadata with each run.
 - [x] Add structured application logs with consistent levels and context.
-- [ ] Record client availability, failures, round duration, and communication metrics.
+- [x] Record client availability, failures, round duration, and communication metrics.
 - [x] Add model checkpoints and documented resume behavior.
 - [x] Introduce model and artifact versioning with retention rules.
 - [x] Preserve experiment history instead of relying on manually selected artifact directories.
