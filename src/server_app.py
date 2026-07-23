@@ -79,6 +79,7 @@ def _sorted_fit_results(
     results: list[Any],
     expected_client_ids: frozenset[int],
     result_kind: str = "fit",
+    minimum_results: int | None = None,
 ) -> list[Any]:
     """Validate and order fit results by numeric client identifier.
 
@@ -90,6 +91,9 @@ def _sorted_fit_results(
         Exact client-ID set required for the round.
     result_kind : str, optional
         Result label used in validation errors.
+    minimum_results : int or None, optional
+        Minimum registered-client results accepted for sampled fit rounds. ``None``
+        requires the complete registered set.
 
     Returns
     -------
@@ -126,12 +130,28 @@ def _sorted_fit_results(
     if len(set(client_ids)) != len(client_ids):
         raise ValueError(f"{result_kind} result client_id values must be unique")
     actual_client_ids = frozenset(client_ids)
-    if actual_client_ids != expected_client_ids:
+    if minimum_results is None and actual_client_ids != expected_client_ids:
         missing = sorted(expected_client_ids - actual_client_ids)
         unexpected = sorted(actual_client_ids - expected_client_ids)
         raise ValueError(
             f"{result_kind} result client IDs must equal the expected set; "
             f"missing={missing}, unexpected={unexpected}"
+        )
+    if minimum_results is not None and (
+        type(minimum_results) is not int
+        or minimum_results <= 0
+        or minimum_results > len(expected_client_ids)
+    ):
+        raise ValueError("minimum results must fit within the expected client set")
+    if minimum_results is not None and (
+        len(actual_client_ids) < minimum_results
+        or not actual_client_ids.issubset(expected_client_ids)
+    ):
+        unexpected = sorted(actual_client_ids - expected_client_ids)
+        raise ValueError(
+            f"{result_kind} results must contain at least {minimum_results} "
+            f"registered clients; actual={len(actual_client_ids)}, "
+            f"unexpected={unexpected}"
         )
     return [result for _, result in sorted(identified_results)]
 
@@ -235,6 +255,7 @@ def _validate_fit_results(
     results: list[Any],
     expected_client_ids: frozenset[int],
     expected_weight_shapes: tuple[tuple[int, ...], ...],
+    minimum_results: int | None = None,
 ) -> tuple[list[Any], list[list[np.ndarray]]]:
     """Validate one complete round against the runtime aggregation contract.
 
@@ -246,6 +267,9 @@ def _validate_fit_results(
         Exact client-ID set required for the round.
     expected_weight_shapes : tuple[tuple[int, ...], ...]
         Round-start model-weight shapes in model order.
+    minimum_results : int or None, optional
+        Minimum registered-client results accepted for a sampled round. ``None``
+        requires every expected client.
 
     Returns
     -------
@@ -263,7 +287,9 @@ def _validate_fit_results(
     ):
         raise ValueError("expected model weights must have non-scalar nonempty shapes")
 
-    ordered_results = _sorted_fit_results(results, expected_client_ids)
+    ordered_results = _sorted_fit_results(
+        results, expected_client_ids, minimum_results=minimum_results
+    )
     decoded_weights: list[list[np.ndarray]] = []
     for _, fit_result in ordered_results:
         if type(fit_result.num_examples) is not int or fit_result.num_examples <= 0:
@@ -298,6 +324,99 @@ def _validate_fit_results(
                 )
         decoded_weights.append(weights)
     return ordered_results, decoded_weights
+
+
+def model_update_anomaly_report(
+    client_weights: list[list[np.ndarray]],
+    reference_weights: list[np.ndarray],
+    client_ids: list[int],
+    threshold_multiplier: float = 3.0,
+) -> dict[str, Any]:
+    """Report unusually large model updates without rejecting them.
+
+    Parameters
+    ----------
+    client_weights : list of list of numpy.ndarray
+        Validated client model weights in client-ID order.
+    reference_weights : list of numpy.ndarray
+        Validated round-start global weights.
+    client_ids : list of int
+        Registered client IDs corresponding to ``client_weights``.
+    threshold_multiplier : float, optional
+        Positive multiplier applied to the scaled median absolute deviation.
+
+    Returns
+    -------
+    dict of str to Any
+        JSON-compatible norms, robust threshold, and flagged client IDs.
+
+    Raises
+    ------
+    ValueError
+        If inputs do not share the validated model shape or the multiplier is
+        invalid.
+    """
+    if (
+        isinstance(threshold_multiplier, bool)
+        or not isinstance(threshold_multiplier, Real)
+        or not math.isfinite(threshold_multiplier)
+        or threshold_multiplier <= 0.0
+    ):
+        raise ValueError("anomaly threshold multiplier must be positive and finite")
+    if not client_weights or len(client_weights) != len(client_ids):
+        raise ValueError("anomaly reporting requires one client ID per model")
+    reference_shapes = tuple(weight.shape for weight in reference_weights)
+    if (
+        not reference_shapes
+        or len(set(client_ids)) != len(client_ids)
+        or any(type(client_id) is not int or client_id < 0 for client_id in client_ids)
+        or any(
+            tuple(weight.shape for weight in weights) != reference_shapes
+            or any(
+                weight.dtype != _PROTOCOL_DTYPE
+                or weight.ndim == 0
+                or weight.size == 0
+                or not np.all(np.isfinite(weight))
+                for weight in weights
+            )
+            for weights in [reference_weights, *client_weights]
+        )
+    ):
+        raise ValueError(
+            "anomaly reporting requires unique client IDs and matching finite "
+            "float32 model weights"
+        )
+
+    norms = []
+    for weights in client_weights:
+        squared_norm = 0.0
+        for weight, reference in zip(weights, reference_weights, strict=True):
+            delta = weight.astype(np.float64) - reference.astype(np.float64)
+            squared_norm += float(np.vdot(delta, delta))
+        norms.append(math.sqrt(squared_norm))
+    median = float(np.median(norms))
+    median_absolute_deviation = float(np.median(np.abs(np.asarray(norms) - median)))
+    threshold = (
+        median + float(threshold_multiplier) * 1.4826 * median_absolute_deviation
+    )
+    flagged = [
+        client_id
+        for client_id, norm in zip(client_ids, norms, strict=True)
+        if norm > threshold
+    ]
+    return {
+        "validation": "finite_float32_shape_match",
+        "method": "l2_norm_median_absolute_deviation",
+        "threshold_multiplier": float(threshold_multiplier),
+        "median_l2_norm": median,
+        "median_absolute_deviation": median_absolute_deviation,
+        "threshold_l2_norm": threshold,
+        "flagged_client_ids": flagged,
+        "clients": [
+            {"client_id": client_id, "l2_norm": norm}
+            for client_id, norm in zip(client_ids, norms, strict=True)
+        ],
+    }
 
 
 def _validate_aggregated_parameters(
@@ -433,6 +552,7 @@ class SentimentServer(FedProx):
     expected_client_ids: frozenset[int]
     expected_weight_shapes: tuple[tuple[int, ...], ...]
     experiment_seed: int
+    minimum_fit_clients: int
     logger: logging.Logger | None = None
 
     def __init__(
@@ -443,6 +563,7 @@ class SentimentServer(FedProx):
         artifact_root: str | Path | None = None,
         artifact_retention_runs: int = DEFAULT_ARTIFACT_RETENTION_RUNS,
         final_round: int | None = None,
+        anomaly_threshold_multiplier: float = 3.0,
         huber_threshold: float = DEFAULT_HUBER_THRESHOLD,
         use_huber: bool = False,
         *args,
@@ -455,9 +576,11 @@ class SentimentServer(FedProx):
         self.artifact_retention_runs = artifact_retention_runs
         self.final_round = final_round
         self.app_manifest = app_manifest
+        self.anomaly_threshold_multiplier = anomaly_threshold_multiplier
         self.huber_threshold = huber_threshold
         self.use_huber = use_huber
         self._round_started_at_ns: dict[int, int] = {}
+        self._round_reference_weights: dict[int, list[np.ndarray]] = {}
         write_server_artifact_manifest(
             self.artifact_dir, app_manifest=self.app_manifest
         )
@@ -533,6 +656,10 @@ class SentimentServer(FedProx):
         round_starts = getattr(self, "_round_started_at_ns", {})
         self._round_started_at_ns = round_starts
         round_starts[server_round] = perf_counter_ns()
+        _validate_aggregated_parameters(parameters, self.expected_weight_shapes)
+        references = getattr(self, "_round_reference_weights", {})
+        self._round_reference_weights = references
+        references[server_round] = parameters_to_ndarrays(parameters)
         configured = super().configure_fit(server_round, parameters, client_manager)
         for _, fit_instructions in configured:
             fit_instructions.config["server_round"] = server_round
@@ -583,7 +710,23 @@ class SentimentServer(FedProx):
                 )
 
             ordered_results, client_weights = _validate_fit_results(
-                results, self.expected_client_ids, self.expected_weight_shapes
+                results,
+                self.expected_client_ids,
+                self.expected_weight_shapes,
+                getattr(self, "minimum_fit_clients", None),
+            )
+            reference_weights = getattr(self, "_round_reference_weights", {}).pop(
+                server_round, None
+            )
+            anomaly_report = (
+                model_update_anomaly_report(
+                    client_weights,
+                    reference_weights,
+                    [result.metrics["client_id"] for _, result in ordered_results],
+                    self.anomaly_threshold_multiplier,
+                )
+                if reference_weights is not None
+                else None
             )
             if self.use_huber:
                 # Robust Huber aggregation instead of plain FedProx averaging
@@ -609,6 +752,18 @@ class SentimentServer(FedProx):
             if parameters is None:
                 raise RuntimeError(f"fit round {server_round} produced no aggregate")
             _validate_aggregated_parameters(parameters, self.expected_weight_shapes)
+            metrics = dict(metrics)
+            if anomaly_report is not None:
+                metrics.update(
+                    {
+                        "update_anomaly_count": len(
+                            anomaly_report["flagged_client_ids"]
+                        ),
+                        "max_update_l2_norm": max(
+                            client["l2_norm"] for client in anomaly_report["clients"]
+                        ),
+                    }
+                )
 
             # Artifact saving
             self.artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -644,6 +799,7 @@ class SentimentServer(FedProx):
                 training_time_ns=telemetry["training_time_ns"],
                 request_parameter_bytes=telemetry["request_parameter_bytes"],
                 response_parameter_bytes=telemetry["response_parameter_bytes"],
+                update_anomaly_report=anomaly_report,
             )
         except BaseException:
             log_event(
@@ -754,6 +910,8 @@ class SentimentServer(FedProx):
 
 def create_strategy(
     min_clients: int = DEFAULT_EXPECTED_CLIENTS,
+    fit_participation_fraction: float = 1.0,
+    minimum_fit_clients: int | None = None,
     artifact_dir: str | Path | None = None,
     artifact_lock: RunArtifactLock | None = None,
     artifact_root: str | Path | None = None,
@@ -763,6 +921,7 @@ def create_strategy(
     proximal_mu: float = 0.1,
     use_huber: bool = False,
     huber_threshold: float = DEFAULT_HUBER_THRESHOLD,
+    anomaly_threshold_multiplier: float = 3.0,
     resume_from_checkpoint: str | Path | None = None,
     seed: int = 67,
 ) -> SentimentServer:
@@ -771,7 +930,12 @@ def create_strategy(
     Parameters
     ----------
     min_clients : int, optional
-        Exact number of clients required in every fit round.
+        Total registered clients required to be available.
+    fit_participation_fraction : float, optional
+        Fraction of registered clients sampled for each fit round.
+    minimum_fit_clients : int or None, optional
+        Minimum sampled clients per fit round. Defaults to the ceiling implied by
+        ``fit_participation_fraction``.
     artifact_dir : str or pathlib.Path, optional
         Directory for this run's server artifacts.
     artifact_lock : RunArtifactLock, optional
@@ -790,6 +954,8 @@ def create_strategy(
         Whether to replace sample-weighted averaging with Huber aggregation.
     huber_threshold : float, optional
         Positive Huber residual threshold.
+    anomaly_threshold_multiplier : float, optional
+        Positive scaled-MAD multiplier for model-update anomaly reporting.
     resume_from_checkpoint : str or pathlib.Path or None, optional
         Explicit checkpoint from an earlier run. Resume starts a new immutable run,
         uses these weights as round-zero parameters, and executes ``final_round`` new
@@ -809,6 +975,30 @@ def create_strategy(
     """
     if type(min_clients) is not int or min_clients <= 0:
         raise ValueError("min_clients must be a positive built-in integer")
+    if (
+        isinstance(fit_participation_fraction, bool)
+        or not isinstance(fit_participation_fraction, Real)
+        or not math.isfinite(fit_participation_fraction)
+        or not 0.0 < fit_participation_fraction <= 1.0
+    ):
+        raise ValueError("fit participation fraction must be finite and in (0, 1]")
+    if minimum_fit_clients is None:
+        minimum_fit_clients = max(
+            1, math.ceil(min_clients * float(fit_participation_fraction))
+        )
+    if (
+        type(minimum_fit_clients) is not int
+        or minimum_fit_clients <= 0
+        or minimum_fit_clients > min_clients
+    ):
+        raise ValueError("minimum fit clients must be within the registered clients")
+    if (
+        isinstance(anomaly_threshold_multiplier, bool)
+        or not isinstance(anomaly_threshold_multiplier, Real)
+        or not math.isfinite(anomaly_threshold_multiplier)
+        or anomaly_threshold_multiplier <= 0.0
+    ):
+        raise ValueError("anomaly threshold multiplier must be positive and finite")
     if type(seed) is not int:
         raise ValueError("seed must be a built-in integer")
     resolved_artifact_dir = resolve_dir(artifact_dir or default_server_artifact_dir())
@@ -834,11 +1024,12 @@ def create_strategy(
         artifact_retention_runs=artifact_retention_runs,
         final_round=final_round,
         app_manifest=app_manifest,
+        anomaly_threshold_multiplier=float(anomaly_threshold_multiplier),
         huber_threshold=huber_threshold,
         use_huber=use_huber,
-        fraction_fit=1.0,
+        fraction_fit=float(fit_participation_fraction),
         fraction_evaluate=1.0,
-        min_fit_clients=min_clients,
+        min_fit_clients=minimum_fit_clients,
         min_evaluate_clients=min_clients,
         min_available_clients=min_clients,
         initial_parameters=ndarrays_to_parameters(initial_weights),
@@ -848,6 +1039,7 @@ def create_strategy(
     strategy.expected_client_ids = frozenset(range(min_clients))
     strategy.expected_weight_shapes = expected_weight_shapes
     strategy.experiment_seed = seed
+    strategy.minimum_fit_clients = minimum_fit_clients
     return strategy
 
 
@@ -885,6 +1077,11 @@ def server_fn(context: Context) -> ServerAppComponents:
         run_config.get("artifact-retention-runs", DEFAULT_ARTIFACT_RETENTION_RUNS)
     )
     expected_clients = run_config.get("expected-client-count", DEFAULT_EXPECTED_CLIENTS)
+    fit_participation_fraction = run_config.get("fit-participation-fraction", 1.0)
+    minimum_fit_clients = run_config.get("minimum-fit-client-count")
+    anomaly_threshold_multiplier = run_config.get(
+        "update-anomaly-threshold-multiplier", 3.0
+    )
     if num_rounds < 1:
         raise ValueError("num-server-rounds must be a positive integer")
     if retention_runs < 1:
@@ -910,6 +1107,8 @@ def server_fn(context: Context) -> ServerAppComponents:
         )
         strategy = create_strategy(
             min_clients=expected_clients,
+            fit_participation_fraction=fit_participation_fraction,
+            minimum_fit_clients=minimum_fit_clients,
             artifact_dir=run_dir,
             artifact_lock=artifact_lock,
             artifact_root=artifact_root,
@@ -921,6 +1120,7 @@ def server_fn(context: Context) -> ServerAppComponents:
             huber_threshold=float(
                 run_config.get("huber-threshold", DEFAULT_HUBER_THRESHOLD)
             ),
+            anomaly_threshold_multiplier=anomaly_threshold_multiplier,
             resume_from_checkpoint=run_config.get("resume-from-checkpoint"),
             seed=int(run_config.get("experiment-seed", 67)),
         )
@@ -934,6 +1134,12 @@ def server_fn(context: Context) -> ServerAppComponents:
             run_id=run_dir.name,
             rounds=num_rounds,
             expected_clients=expected_clients,
+            fit_participation_fraction=fit_participation_fraction,
+            minimum_fit_clients=(
+                minimum_fit_clients
+                if type(minimum_fit_clients) is int
+                else math.ceil(expected_clients * float(fit_participation_fraction))
+            ),
             artifact_directory=str(run_dir),
         )
         return ServerAppComponents(

@@ -34,9 +34,12 @@ class ServerStartupArtifactHistoryTests(unittest.TestCase):
                         "server-artifact-dir": artifact_dir,
                         "num-server-rounds": 1,
                         "expected-client-count": 16,
+                        "fit-participation-fraction": 0.5,
+                        "minimum-fit-client-count": 6,
                         "proximal-mu": 0.25,
                         "use-huber": "true",
                         "huber-threshold": 3.5,
+                        "update-anomaly-threshold-multiplier": 4.0,
                     }
                 ),
             )
@@ -63,8 +66,15 @@ class ServerStartupArtifactHistoryTests(unittest.TestCase):
             self.assertEqual(run_dir.parent, artifact_dir.resolve() / "runs")
             self.assertEqual(captured_strategy_kwargs["proximal_mu"], 0.25)
             self.assertEqual(captured_strategy_kwargs["min_clients"], 16)
+            self.assertEqual(
+                captured_strategy_kwargs["fit_participation_fraction"], 0.5
+            )
+            self.assertEqual(captured_strategy_kwargs["minimum_fit_clients"], 6)
             self.assertTrue(captured_strategy_kwargs["use_huber"])
             self.assertEqual(captured_strategy_kwargs["huber_threshold"], 3.5)
+            self.assertEqual(
+                captured_strategy_kwargs["anomaly_threshold_multiplier"], 4.0
+            )
             self.assertEqual(components["config"].num_rounds, 1)
             provenance = json.loads(
                 (run_dir / "run_manifest.json").read_text(encoding="utf-8")
@@ -197,15 +207,36 @@ class MetricAggregationTests(unittest.TestCase):
                 server_app, "SentimentServer", return_value=strategy
             ) as server_type,
         ):
-            actual = server_app.create_strategy(min_clients=16)
+            actual = server_app.create_strategy(
+                min_clients=16,
+                fit_participation_fraction=0.5,
+                minimum_fit_clients=6,
+            )
 
         self.assertIs(actual, strategy)
         self.assertEqual(strategy.expected_client_ids, frozenset(range(16)))
         self.assertEqual(strategy.expected_weight_shapes, ((2,),))
         strategy_kwargs = server_type.call_args.kwargs
         self.assertFalse(strategy_kwargs["accept_failures"])
-        self.assertEqual(strategy_kwargs["min_fit_clients"], 16)
+        self.assertEqual(strategy_kwargs["fraction_fit"], 0.5)
+        self.assertEqual(strategy_kwargs["min_fit_clients"], 6)
         self.assertEqual(strategy_kwargs["min_available_clients"], 16)
+        self.assertEqual(strategy.minimum_fit_clients, 6)
+
+    def test_create_strategy_rejects_invalid_participation_policy(self) -> None:
+        invalid: tuple[dict[str, Any], ...] = (
+            {"fit_participation_fraction": 0.0},
+            {"fit_participation_fraction": 1.1},
+            {"fit_participation_fraction": True},
+            {"minimum_fit_clients": 0},
+            {"minimum_fit_clients": 5},
+            {"minimum_fit_clients": True},
+            {"anomaly_threshold_multiplier": 0.0},
+            {"anomaly_threshold_multiplier": float("nan")},
+        )
+        for kwargs in invalid:
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                server_app.create_strategy(min_clients=4, **kwargs)
 
     def test_strategy_publishes_server_artifact_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -336,6 +367,95 @@ class MetricAggregationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "contiguous from zero"):
             server_app._sorted_fit_results(out_of_range, frozenset({0, 2}))
+
+    def test_sampled_fit_validation_accepts_only_registered_minimum(self) -> None:
+        weights = [np.array([1.0], dtype=np.float32)]
+        results = [
+            (
+                Mock(),
+                SimpleNamespace(
+                    parameters=ndarrays_to_parameters(weights),
+                    num_examples=1,
+                    metrics={"client_id": client_id},
+                ),
+            )
+            for client_id in (1, 3)
+        ]
+
+        ordered, _ = server_app._validate_fit_results(
+            results, frozenset(range(4)), ((1,),), minimum_results=2
+        )
+        self.assertEqual([result.metrics["client_id"] for _, result in ordered], [1, 3])
+        with self.assertRaisesRegex(ValueError, "at least 3 registered clients"):
+            server_app._validate_fit_results(
+                results, frozenset(range(4)), ((1,),), minimum_results=3
+            )
+
+    def test_model_update_anomaly_report_flags_without_modifying_updates(self) -> None:
+        client_weights = [
+            [np.array([value], dtype=np.float32)] for value in (1.0, 1.0, 10.0)
+        ]
+        originals = [
+            [weight.copy() for weight in weights] for weights in client_weights
+        ]
+
+        report = server_app.model_update_anomaly_report(
+            client_weights,
+            [np.array([0.0], dtype=np.float32)],
+            [0, 1, 2],
+        )
+
+        self.assertEqual(report["flagged_client_ids"], [2])
+        self.assertEqual(report["validation"], "finite_float32_shape_match")
+        for actual, expected in zip(client_weights, originals, strict=True):
+            np.testing.assert_array_equal(actual[0], expected[0])
+
+    def test_fit_aggregation_reports_but_keeps_anomalous_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            strategy = server_app.SentimentServer.__new__(server_app.SentimentServer)
+            strategy.use_huber = False
+            strategy.accept_failures = False
+            strategy.fit_metrics_aggregation_fn = None
+            strategy.expected_client_ids = frozenset(range(3))
+            strategy.minimum_fit_clients = 3
+            strategy.expected_weight_shapes = ((1,),)
+            strategy.anomaly_threshold_multiplier = 3.0
+            strategy._round_reference_weights = {1: [np.array([0.0], dtype=np.float32)]}
+            strategy.artifact_dir = Path(tmpdir)
+            strategy.app_manifest = object()
+            results = [
+                (
+                    Mock(),
+                    SimpleNamespace(
+                        parameters=ndarrays_to_parameters(
+                            [np.array([value], dtype=np.float32)]
+                        ),
+                        num_examples=1,
+                        metrics={"client_id": client_id},
+                    ),
+                )
+                for client_id, value in enumerate((1.0, 1.0, 10.0))
+            ]
+            aggregate = ndarrays_to_parameters([np.array([4.0], dtype=np.float32)])
+
+            with (
+                patch.object(
+                    server_app.FedProx,
+                    "aggregate_fit",
+                    return_value=(aggregate, {}),
+                ),
+                patch.object(
+                    server_app, "build_model_from_manifest", return_value=Mock()
+                ),
+            ):
+                parameters, metrics = strategy.aggregate_fit(1, results, [])
+
+            np.testing.assert_array_equal(
+                parameters_to_ndarrays(parameters)[0],
+                np.array([4.0], dtype=np.float32),
+            )
+            self.assertEqual(metrics["update_anomaly_count"], 1)
+            self.assertEqual(metrics["max_update_l2_norm"], 10.0)
 
     def test_fit_failure_hard_fails_before_client_id_validation(self) -> None:
         invalid_results = [(Mock(), SimpleNamespace(metrics={}))]
