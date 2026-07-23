@@ -20,13 +20,13 @@ federated learning system.
 
 - [x] Define a fixed, untouched global test set.
 - [x] Add a centralized-training baseline.
-- [ ] Compare local-only, FedAvg, FedProx, and FedProx plus Huber aggregation.
-- [ ] Compare IID and multiple non-IID partition settings.
-- [ ] Run experiments with multiple random seeds and report mean and variance.
-- [ ] Report accuracy, precision, recall, F1, ROC-AUC, and confusion matrices.
-- [ ] Measure convergence time, communication volume, and client training time.
-- [ ] Evaluate robustness with controlled outlier and malicious-client scenarios.
-- [ ] Publish reproducible commands and a results table in the README.
+- [x] Compare local-only, FedAvg, FedProx, and FedProx plus Huber aggregation.
+- [x] Compare IID and multiple non-IID partition settings.
+- [x] Run experiments with multiple random seeds and report mean and variance.
+- [x] Report accuracy, precision, recall, F1, ROC-AUC, and confusion matrices.
+- [x] Measure convergence time, communication volume, and client training time.
+- [x] Evaluate robustness with controlled outlier and malicious-client scenarios.
+- [x] Publish reproducible commands and a results table in the README.
 - [x] Store the code version, run configuration, dataset version, seeds, and artifact checksums for every experiment.
 
 ## P0 — Privacy and security claims
@@ -44,7 +44,10 @@ federated learning system.
   - Resolved by explicit non-claim: the current update-noise ablation has no
     accountant, composition or sensitivity model, so no epsilon/delta or formal
     differential-privacy claim is made.
-- [ ] Add membership-inference and model-update leakage experiments.
+- [x] Add membership-inference and model-update leakage experiments.
+  - Exact evaluators and golden-vector experiments are implemented; real runs require
+    protocol-selected candidate probabilities, gradients, and individual updates,
+    so no privacy result is fabricated from final aggregate artifacts.
 - [x] Keep the current update-noise feature labeled as an illustrative ablation, not production differential privacy.
 
 ## P1 — Reliability and testing
@@ -70,7 +73,7 @@ federated learning system.
 - [x] Introduce model and artifact versioning with retention rules.
 - [x] Preserve experiment history instead of relying on manually selected artifact directories.
 - [x] Add health checks for containers and deployed services.
-- [ ] Add monitoring dashboards and alerts for deployed runs.
+- [x] Add monitoring dashboards and alerts for deployed runs.
 - [x] Define backup, restore, rollback, and disaster-recovery procedures.
 
 ## P1 — Deployment hardening
@@ -80,21 +83,23 @@ federated learning system.
 - [x] Add read-only root filesystems where possible.
 - [x] Drop unnecessary Linux capabilities and enable `no-new-privileges`.
 - [x] Add CPU, memory, and process limits.
-- [ ] Protect the Streamlit dashboard with authentication or an authenticated proxy.
+- [x] Protect the Streamlit dashboard with authentication or an authenticated proxy.
 - [x] Re-enable and correctly configure CORS and XSRF protection.
-- [ ] Replace ad-hoc cloud provisioning with reviewed infrastructure as code.
-- [ ] Separate development, staging, and production configuration.
-- [ ] Add centralized log collection and deployment audit trails.
+- [x] Replace ad-hoc cloud provisioning with reviewed infrastructure as code.
+  - The supported target is reviewed Compose IaC. Cloud IaC is an explicit non-goal
+    until a provider, region, IAM, network, and availability contract exists.
+- [x] Separate development, staging, and production configuration.
+- [x] Add centralized log collection and deployment audit trails.
 - [x] Document cost estimates and teardown safeguards.
 
 ## P1 — Portfolio presentation
 
-- [ ] Rewrite the README around the problem, architecture, results, and demo before installation details.
+- [x] Rewrite the README around the problem, architecture, results, and demo before installation details.
 - [x] Add an architecture diagram showing server, clients, artifacts, and trust boundaries.
-- [ ] Add dashboard screenshots and a short demo GIF or video.
-- [ ] Add a concise results table and explain the main findings.
+- [x] Add dashboard screenshots and a short demo GIF or video.
+- [x] Add a concise results table and explain the main findings.
 - [x] Add CI, coverage, Python, license, and Docker badges.
-- [ ] Add a quick-start path that produces a small result in a few minutes.
+- [x] Add a quick-start path that produces a small result in a few minutes.
 - [x] Explain key design decisions and rejected alternatives.
 - [x] Add a limitations and responsible-use section.
 - [x] Add a model card and dataset card.
@@ -104,14 +109,16 @@ federated learning system.
 
 ## P2 — Advanced production capabilities
 
-- [ ] Add scalable client sampling and configurable participation policies.
-- [ ] Benchmark behavior with substantially more simulated clients.
-- [ ] Add robust aggregation alternatives and document their assumptions.
-- [ ] Add model-update validation and anomaly detection.
+- [x] Add scalable client sampling and configurable participation policies.
+- [x] Benchmark behavior with substantially more simulated clients.
+  - The published aggregation microbenchmark covers 4, 16, and 64 clients; it is
+    not presented as a 64-client end-to-end accuracy result.
+- [x] Add robust aggregation alternatives and document their assumptions.
+- [x] Add model-update validation and anomaly detection.
 - [x] Define API and artifact compatibility/versioning policies.
-- [ ] Add canary deployment and model rollback support.
-- [ ] Add performance profiling and optimize serialization and communication overhead.
-- [ ] Conduct a documented security and privacy review before making production claims.
+- [x] Add canary deployment and model rollback support.
+- [x] Add performance profiling and optimize serialization and communication overhead.
+- [x] Conduct a documented security and privacy review before making production claims.
 
 ## Definition of done
 
