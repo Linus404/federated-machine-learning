@@ -32,20 +32,20 @@ def baseline_args(root: Path, baseline: str) -> argparse.Namespace:
     Returns
     -------
     argparse.Namespace
-        Complete command arguments for two prepared clients.
+        Complete command arguments for four prepared clients.
     """
     return argparse.Namespace(
         baseline=baseline,
-        batch_size=4,
-        client_count=2,
+        batch_size=64,
+        client_count=4,
         client_data_dir=str(root / "client-{partition}"),
-        epochs=1,
+        epochs=20,
         evaluation_artifact_dir=root / "evaluation",
         output_dir=root / "output",
         public_artifact_dir=root / "public",
         quiet=True,
         seed=67,
-        validation_split=0.25,
+        validation_split=0.2,
     )
 
 
@@ -95,34 +95,44 @@ class BaselineTrainingTests(unittest.TestCase):
     def setUp(self) -> None:
         """Create shared validated artifact and array fixtures."""
         self.protocol = load_scientific_protocol()
-        self.manifest = SimpleNamespace(payload={"dataset": {"rows": 4}})
-        self.snapshots = [training_snapshot(0, 2), training_snapshot(1, 3)]
+        self.manifest = SimpleNamespace(payload={"dataset": {"rows": 8}})
+        self.snapshots = [
+            training_snapshot(0, 4),
+            training_snapshot(1, 5),
+            training_snapshot(2, 6),
+            training_snapshot(3, 7),
+        ]
         self.row_splits = [
             ((self.snapshots[0].rows[0],), (self.snapshots[0].rows[1],)),
             ((self.snapshots[1].rows[0],), (self.snapshots[1].rows[1],)),
+            ((self.snapshots[2].rows[0],), (self.snapshots[2].rows[1],)),
+            ((self.snapshots[3].rows[0],), (self.snapshots[3].rows[1],)),
         ]
         self.array_splits = [
             (
-                (np.array([[0]], dtype=np.int32), np.array([0], dtype=np.float32)),
-                (np.array([[2]], dtype=np.int32), np.array([1], dtype=np.float32)),
-            ),
-            (
-                (np.array([[1]], dtype=np.int32), np.array([1], dtype=np.float32)),
-                (np.array([[3]], dtype=np.int32), np.array([0], dtype=np.float32)),
-            ),
+                (
+                    np.array([[client_id]], dtype=np.int32),
+                    np.array([client_id % 2], dtype=np.float32),
+                ),
+                (
+                    np.array([[client_id + 4]], dtype=np.int32),
+                    np.array([client_id % 2], dtype=np.float32),
+                ),
+            )
+            for client_id in range(4)
         ]
         self.combined_rows = (
-            (self.snapshots[0].rows[0], self.snapshots[1].rows[0]),
-            (self.snapshots[0].rows[1], self.snapshots[1].rows[1]),
+            tuple(snapshot.rows[0] for snapshot in self.snapshots),
+            tuple(snapshot.rows[1] for snapshot in self.snapshots),
         )
         self.combined_arrays = (
             (
-                np.array([[0], [1]], dtype=np.int32),
-                np.array([0, 1], dtype=np.float32),
+                np.array([[0], [1], [2], [3]], dtype=np.int32),
+                np.array([0, 1, 0, 1], dtype=np.float32),
             ),
             (
-                np.array([[2], [3]], dtype=np.int32),
-                np.array([1, 0], dtype=np.float32),
+                np.array([[4], [5], [6], [7]], dtype=np.int32),
+                np.array([0, 1, 0, 1], dtype=np.float32),
             ),
         )
         self.test_data = (
@@ -130,7 +140,7 @@ class BaselineTrainingTests(unittest.TestCase):
             np.array([0, 1], dtype=np.float32),
         )
         self.history = SimpleNamespace(
-            history={"val_loss": [0.5], "val_accuracy": [0.75]}
+            history={"val_loss": [0.5] * 20, "val_accuracy": [0.75] * 20}
         )
 
     def test_registered_iid_and_validation_assignments_match_golden_rows(self) -> None:
@@ -227,7 +237,7 @@ class BaselineTrainingTests(unittest.TestCase):
                 patch("src.baseline_training._model_seeds", return_value=(101, 202)),
                 patch(
                     "src.baseline_training._training_orders",
-                    return_value=[np.array([0, 1])],
+                    return_value=[np.arange(4)] * 20,
                 ),
                 patch(
                     "src.baseline_training.load_evaluation_artifact_snapshot",
@@ -249,6 +259,8 @@ class BaselineTrainingTests(unittest.TestCase):
                 [
                     call(str(Path(tmpdir) / "client-0"), self.manifest, 0),
                     call(str(Path(tmpdir) / "client-1"), self.manifest, 1),
+                    call(str(Path(tmpdir) / "client-2"), self.manifest, 2),
+                    call(str(Path(tmpdir) / "client-3"), self.manifest, 3),
                 ]
             )
             set_seed.assert_called_once_with(101)
@@ -258,23 +270,23 @@ class BaselineTrainingTests(unittest.TestCase):
             fit_args, fit_kwargs = trained_model.fit.call_args
             batches = fit_args[0]
             np.testing.assert_array_equal(
-                batches[0][0], np.array([[0], [1]], dtype=np.int32)
+                batches[0][0], np.array([[0], [1], [2], [3]], dtype=np.int32)
             )
             np.testing.assert_array_equal(
                 fit_kwargs["validation_data"][0],
-                np.array([[2], [3]], dtype=np.int32),
+                np.array([[4], [5], [6], [7]], dtype=np.int32),
             )
             self.assertFalse(fit_kwargs["shuffle"])
             self.assertEqual(result["test"], {"loss": 0.4, "accuracy": 0.8})
             self.assertEqual(
                 result["config"],
                 {
-                    "batch_size": 4,
-                    "client_count": 2,
-                    "epochs": 1,
+                    "batch_size": 64,
+                    "client_count": 4,
+                    "epochs": 20,
                     "partition": "iid_stratified",
                     "seed": 67,
-                    "validation_split": 0.25,
+                    "validation_split": 0.2,
                 },
             )
             self.assertTrue((args.output_dir / "centralized.keras").is_file())
@@ -288,6 +300,8 @@ class BaselineTrainingTests(unittest.TestCase):
             models = [
                 model(self.history, (0.6, 0.7)),
                 model(self.history, (0.4, 0.9)),
+                model(self.history, (0.8, 0.5)),
+                model(self.history, (0.2, 0.9)),
             ]
             events: list[str] = []
             for client_id, trained_model in enumerate(models):
@@ -303,7 +317,7 @@ class BaselineTrainingTests(unittest.TestCase):
                 trained_model.fit.side_effect = record_fit
 
             def load_test(_path: Path) -> SimpleNamespace:
-                self.assertEqual(events, ["fit-0", "fit-1"])
+                self.assertEqual(events, ["fit-0", "fit-1", "fit-2", "fit-3"])
                 events.append("test")
                 return SimpleNamespace(rows=(("test:0", "test", 0),))
 
@@ -330,11 +344,11 @@ class BaselineTrainingTests(unittest.TestCase):
                 ),
                 patch(
                     "src.baseline_training._model_seeds",
-                    side_effect=[(101, 201), (102, 202)],
+                    side_effect=[(101, 201), (102, 202), (103, 203), (104, 204)],
                 ),
                 patch(
                     "src.baseline_training._training_orders",
-                    side_effect=[[np.array([0])], [np.array([0])]],
+                    side_effect=[[np.array([0])] * 20 for _ in range(4)],
                 ),
                 patch(
                     "src.baseline_training.load_evaluation_artifact_snapshot",
@@ -351,25 +365,33 @@ class BaselineTrainingTests(unittest.TestCase):
             ):
                 result = run(args)
 
-            self.assertEqual(events, ["fit-0", "fit-1", "test"])
-            self.assertEqual(set_seed.call_args_list, [call(101), call(102)])
+            self.assertEqual(events, ["fit-0", "fit-1", "fit-2", "fit-3", "test"])
+            self.assertEqual(
+                set_seed.call_args_list, [call(101), call(102), call(103), call(104)]
+            )
             self.assertEqual(
                 build_model_from_manifest.call_args_list,
                 [
                     call(self.manifest, dropout_seed=201),
                     call(self.manifest, dropout_seed=202),
+                    call(self.manifest, dropout_seed=203),
+                    call(self.manifest, dropout_seed=204),
                 ],
             )
-            self.assertEqual(result["test_mean"], {"loss": 0.5, "accuracy": 0.8})
+            self.assertEqual(result["test_mean"], {"loss": 0.5, "accuracy": 0.75})
             self.assertEqual(
                 [client["test"] for client in result["clients"]],
                 [
                     {"loss": 0.6, "accuracy": 0.7},
                     {"loss": 0.4, "accuracy": 0.9},
+                    {"loss": 0.8, "accuracy": 0.5},
+                    {"loss": 0.2, "accuracy": 0.9},
                 ],
             )
-            self.assertTrue((args.output_dir / "client-0.keras").is_file())
-            self.assertTrue((args.output_dir / "client-1.keras").is_file())
+            for client_id in range(4):
+                self.assertTrue(
+                    (args.output_dir / f"client-{client_id}.keras").is_file()
+                )
 
     def test_save_failure_removes_owned_output_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -401,7 +423,7 @@ class BaselineTrainingTests(unittest.TestCase):
                 patch("src.baseline_training._model_seeds", return_value=(101, 202)),
                 patch(
                     "src.baseline_training._training_orders",
-                    return_value=[np.array([0, 1])],
+                    return_value=[np.arange(4)] * 20,
                 ),
                 patch(
                     "src.baseline_training.load_evaluation_artifact_snapshot",
@@ -430,6 +452,24 @@ class BaselineTrainingTests(unittest.TestCase):
                 run(args)
 
             self.assertFalse(args.output_dir.exists())
+
+    def test_nonregistered_training_overrides_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for field, value in (
+                ("batch_size", 4),
+                ("client_count", 2),
+                ("epochs", 1),
+                ("seed", 68),
+                ("validation_split", 0.25),
+            ):
+                with self.subTest(field=field):
+                    args = baseline_args(Path(tmpdir), "centralized")
+                    setattr(args, field, value)
+
+                    with self.assertRaisesRegex(ValueError, "frozen"):
+                        run(args)
+
+                    self.assertFalse(args.output_dir.exists())
 
 
 if __name__ == "__main__":

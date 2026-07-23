@@ -90,11 +90,11 @@ loss and accuracy. Both commands reconstruct the frozen `iid_stratified`
 assignment from the complete validated train-shard union, derive validation,
 model, Dropout, and per-epoch training-order seeds from the frozen namespaces,
 finish every training call before loading the evaluation artifact, and write the
-trained model files plus canonical `results.json` with the effective inputs. They
-default to four clients, 20 epochs, batch size 64, validation fraction 0.2, and
-seed 67. PR15 adds the complete frozen classification metric set; later
-experiment-matrix work adds the remaining registered seeds and non-IID
-partitions.
+trained model files plus canonical `results.json` with the effective inputs. The
+CLI enforces four clients, 20 epochs, batch size 64, validation fraction 0.2, and
+one of the five frozen seeds; seed 67 is the default. PR15 adds the complete
+frozen classification metric set; later experiment-matrix work executes the
+remaining registered seeds and non-IID partitions.
 
 ## Direct Flower simulation
 

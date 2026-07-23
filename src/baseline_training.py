@@ -174,13 +174,15 @@ def _tensorflow_seed(derived_seed: int) -> int:
     return derived_seed % 2_147_483_647 or 1
 
 
-def _validate_args(args: argparse.Namespace) -> None:
+def _validate_args(args: argparse.Namespace, protocol: Mapping[str, Any]) -> None:
     """Validate baseline command arguments before loading artifacts.
 
     Parameters
     ----------
     args : argparse.Namespace
         Parsed baseline command arguments.
+    protocol : mapping of str to Any
+        Frozen scientific protocol.
 
     Returns
     -------
@@ -189,15 +191,23 @@ def _validate_args(args: argparse.Namespace) -> None:
     Raises
     ------
     ValueError
-        If numeric arguments or the client path template are invalid.
+        If arguments differ from the registered baseline contract.
     """
     if args.baseline not in {"centralized", "local-only"}:
         raise ValueError("baseline must be centralized or local-only")
-    for name in ("batch_size", "client_count", "epochs", "seed"):
-        if type(getattr(args, name)) is not int or getattr(args, name) < 1:
-            raise ValueError(f"{name.replace('_', '-')} must be a positive integer")
-    if not 0 < args.validation_split < 1:
-        raise ValueError("validation-split must be between 0 and 1")
+    expected = {
+        "batch_size": protocol["training"]["batch_size"],
+        "client_count": protocol["strategies"]["local_only"]["client_scale"],
+        "epochs": protocol["strategies"]["centralized"]["training_epochs"],
+        "validation_split": protocol["training"]["validation_fraction"],
+    }
+    for name, value in expected.items():
+        if type(getattr(args, name)) is not type(value) or getattr(args, name) != value:
+            raise ValueError(
+                f"{name.replace('_', '-')} must equal the frozen value {value}"
+            )
+    if type(args.seed) is not int or args.seed not in protocol["seeding"]["seeds"]:
+        raise ValueError("seed must be one of the frozen registered seeds")
     template = str(args.client_data_dir)
     try:
         fields = [
@@ -818,11 +828,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     ValueError
         If arguments, artifacts, training output, or metrics are invalid.
     """
-    _validate_args(args)
+    protocol = load_scientific_protocol()
+    _validate_args(args, protocol)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=False)
     try:
-        protocol = load_scientific_protocol()
         manifest = load_app_manifest(public_artifact_dir=args.public_artifact_dir)
         snapshots = _load_client_snapshots(args, manifest)
         splits = _registered_iid_splits(
@@ -869,7 +879,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="artifacts/clients/client-{partition}",
         help="Client directory template containing {partition}.",
     )
-    parser.add_argument("--client-count", type=int, default=DEFAULT_BASELINE_CLIENTS)
     parser.add_argument(
         "--public-artifact-dir", type=Path, default=default_public_artifact_dir()
     )
@@ -879,11 +888,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=default_evaluation_artifact_dir(),
     )
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--epochs", type=int, default=DEFAULT_BASELINE_EPOCHS)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--validation-split", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=DEFAULT_BASELINE_SEED)
     parser.add_argument("--quiet", action="store_true")
+    parser.set_defaults(
+        batch_size=64,
+        client_count=DEFAULT_BASELINE_CLIENTS,
+        epochs=DEFAULT_BASELINE_EPOCHS,
+        validation_split=0.2,
+    )
     return parser.parse_args(argv)
 
 
