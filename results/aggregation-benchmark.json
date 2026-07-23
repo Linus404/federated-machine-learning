@@ -1,0 +1,273 @@
+{
+  "schema_version": 1,
+  "scope": "aggregation microbenchmark over deterministic synthetic float32 model updates; not end-to-end training",
+  "seed": 67,
+  "dimensions": 100000,
+  "repeats": 5,
+  "environment": {
+    "platform": "Linux-6.12.95+deb13-amd64-x86_64-with-glibc2.41",
+    "machine": "x86_64",
+    "python": "3.13.5 (main, Jul 15 2026, 20:25:40) [GCC 14.2.0]",
+    "logical_cpu_count": 24,
+    "packages": {
+      "flwr": "1.32.1",
+      "numpy": "2.4.4"
+    }
+  },
+  "scalability": [
+    {
+      "client_count": 4,
+      "strategy": "fedavg",
+      "mean_aggregation_time_ns": 509132.6,
+      "durations_ns": [
+        860714,
+        448005,
+        425042,
+        410264,
+        401638
+      ],
+      "fit_parameter_bytes": 3201176
+    },
+    {
+      "client_count": 4,
+      "strategy": "fedprox_huber",
+      "mean_aggregation_time_ns": 193471373.0,
+      "durations_ns": [
+        163422739,
+        151948539,
+        194072576,
+        209977981,
+        247935030
+      ],
+      "fit_parameter_bytes": 3201176
+    },
+    {
+      "client_count": 4,
+      "strategy": "fedmedian",
+      "mean_aggregation_time_ns": 9960465.8,
+      "durations_ns": [
+        10104784,
+        12922223,
+        8921510,
+        8938753,
+        8915059
+      ],
+      "fit_parameter_bytes": 3201176
+    },
+    {
+      "client_count": 4,
+      "strategy": "fedtrimmedavg",
+      "mean_aggregation_time_ns": 5539795.2,
+      "durations_ns": [
+        8320866,
+        7893892,
+        4073189,
+        3990262,
+        3420767
+      ],
+      "fit_parameter_bytes": 3201176
+    },
+    {
+      "client_count": 16,
+      "strategy": "fedavg",
+      "mean_aggregation_time_ns": 1830170.8,
+      "durations_ns": [
+        2539894,
+        1878957,
+        1598398,
+        1567268,
+        1566337
+      ],
+      "fit_parameter_bytes": 12804704
+    },
+    {
+      "client_count": 16,
+      "strategy": "fedprox_huber",
+      "mean_aggregation_time_ns": 442635788.4,
+      "durations_ns": [
+        824151950,
+        36442962,
+        72530164,
+        532962751,
+        747091115
+      ],
+      "fit_parameter_bytes": 12804704
+    },
+    {
+      "client_count": 16,
+      "strategy": "fedmedian",
+      "mean_aggregation_time_ns": 20473619.6,
+      "durations_ns": [
+        23394171,
+        21620833,
+        20914901,
+        17879420,
+        18558773
+      ],
+      "fit_parameter_bytes": 12804704
+    },
+    {
+      "client_count": 16,
+      "strategy": "fedtrimmedavg",
+      "mean_aggregation_time_ns": 20222001.0,
+      "durations_ns": [
+        19945381,
+        19852888,
+        20578646,
+        20453540,
+        20279550
+      ],
+      "fit_parameter_bytes": 12804704
+    },
+    {
+      "client_count": 64,
+      "strategy": "fedavg",
+      "mean_aggregation_time_ns": 15495043.6,
+      "durations_ns": [
+        12813688,
+        16198067,
+        16042383,
+        16409254,
+        16011826
+      ],
+      "fit_parameter_bytes": 51218816
+    },
+    {
+      "client_count": 64,
+      "strategy": "fedprox_huber",
+      "mean_aggregation_time_ns": 2855559955.8,
+      "durations_ns": [
+        3063285856,
+        2764066158,
+        2739884680,
+        2781263199,
+        2929299886
+      ],
+      "fit_parameter_bytes": 51218816
+    },
+    {
+      "client_count": 64,
+      "strategy": "fedmedian",
+      "mean_aggregation_time_ns": 75546431.2,
+      "durations_ns": [
+        80469018,
+        74244159,
+        74428136,
+        74229392,
+        74361451
+      ],
+      "fit_parameter_bytes": 51218816
+    },
+    {
+      "client_count": 64,
+      "strategy": "fedtrimmedavg",
+      "mean_aggregation_time_ns": 92124318.8,
+      "durations_ns": [
+        92147303,
+        94710372,
+        91253708,
+        89918267,
+        92591944
+      ],
+      "fit_parameter_bytes": 51218816
+    }
+  ],
+  "robustness": [
+    {
+      "strategy": "fedavg",
+      "attack": "outlier",
+      "malicious_fraction": 0.25,
+      "aggregate_error_l2": 71.05862519769032
+    },
+    {
+      "strategy": "fedprox_huber",
+      "attack": "outlier",
+      "malicious_fraction": 0.25,
+      "aggregate_error_l2": 4.2276363983070055
+    },
+    {
+      "strategy": "fedmedian",
+      "attack": "outlier",
+      "malicious_fraction": 0.25,
+      "aggregate_error_l2": 11.43300203675041
+    },
+    {
+      "strategy": "fedtrimmedavg",
+      "attack": "outlier",
+      "malicious_fraction": 0.25,
+      "aggregate_error_l2": 11.43300203675041
+    },
+    {
+      "strategy": "fedavg",
+      "attack": "outlier",
+      "malicious_fraction": 0.5,
+      "aggregate_error_l2": 100.46525811209945
+    },
+    {
+      "strategy": "fedprox_huber",
+      "attack": "outlier",
+      "malicious_fraction": 0.5,
+      "aggregate_error_l2": 13.017473822129265
+    },
+    {
+      "strategy": "fedmedian",
+      "attack": "outlier",
+      "malicious_fraction": 0.5,
+      "aggregate_error_l2": 63.67982812902479
+    },
+    {
+      "strategy": "fedtrimmedavg",
+      "attack": "outlier",
+      "malicious_fraction": 0.5,
+      "aggregate_error_l2": 63.67982812902479
+    },
+    {
+      "strategy": "fedavg",
+      "attack": "sign_flip",
+      "malicious_fraction": 0.25,
+      "aggregate_error_l2": 86.84943077337854
+    },
+    {
+      "strategy": "fedprox_huber",
+      "attack": "sign_flip",
+      "malicious_fraction": 0.25,
+      "aggregate_error_l2": 17.464221921113946
+    },
+    {
+      "strategy": "fedmedian",
+      "attack": "sign_flip",
+      "malicious_fraction": 0.25,
+      "aggregate_error_l2": 21.593575459504713
+    },
+    {
+      "strategy": "fedtrimmedavg",
+      "attack": "sign_flip",
+      "malicious_fraction": 0.25,
+      "aggregate_error_l2": 21.593575459504713
+    },
+    {
+      "strategy": "fedavg",
+      "attack": "sign_flip",
+      "malicious_fraction": 0.5,
+      "aggregate_error_l2": 122.79087100670803
+    },
+    {
+      "strategy": "fedprox_huber",
+      "attack": "sign_flip",
+      "malicious_fraction": 0.5,
+      "aggregate_error_l2": 32.78738726959051
+    },
+    {
+      "strategy": "fedmedian",
+      "attack": "sign_flip",
+      "malicious_fraction": 0.5,
+      "aggregate_error_l2": 82.33545321285638
+    },
+    {
+      "strategy": "fedtrimmedavg",
+      "attack": "sign_flip",
+      "malicious_fraction": 0.5,
+      "aggregate_error_l2": 82.33545321285638
+    }
+  ]
+}
