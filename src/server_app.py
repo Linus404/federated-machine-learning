@@ -1079,6 +1079,8 @@ def server_fn(context: Context) -> ServerAppComponents:
     expected_clients = run_config.get("expected-client-count", DEFAULT_EXPECTED_CLIENTS)
     fit_participation_fraction = run_config.get("fit-participation-fraction", 1.0)
     minimum_fit_clients = run_config.get("minimum-fit-client-count")
+    if minimum_fit_clients == 0:
+        minimum_fit_clients = None
     anomaly_threshold_multiplier = run_config.get(
         "update-anomaly-threshold-multiplier", 3.0
     )
