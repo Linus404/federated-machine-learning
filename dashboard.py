@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import time
 from io import BytesIO
@@ -226,6 +227,69 @@ def load_metrics(
     return df
 
 
+def deployment_alerts(
+    metrics: pd.DataFrame,
+    client_metrics: pd.DataFrame | None,
+    expected_clients: int,
+) -> list[str]:
+    """Return actionable integrity and client-coverage alerts for one run.
+
+    Parameters
+    ----------
+    metrics : pandas.DataFrame
+        Server round metrics.
+    client_metrics : pandas.DataFrame or None
+        Per-client evaluation metrics, when published.
+    expected_clients : int
+        Exact registered deployment client count.
+
+    Returns
+    -------
+    list of str
+        Human-readable alerts; an empty list means the persisted records satisfy
+        the dashboard's monitoring checks.
+
+    Raises
+    ------
+    ValueError
+        If ``expected_clients`` is not a positive built-in integer.
+    """
+    if type(expected_clients) is not int or expected_clients < 1:
+        raise ValueError("expected client count must be a positive integer")
+    required = {"round", "loss", "accuracy"}
+    if not required <= set(metrics.columns):
+        return ["Server metrics are missing round, loss, or accuracy."]
+    numeric = metrics[list(required)].apply(pd.to_numeric, errors="coerce")
+    alerts = []
+    if not np.isfinite(numeric.to_numpy(dtype=np.float64)).all():
+        alerts.append("Server metrics contain missing or non-finite values.")
+    if metrics["round"].duplicated().any():
+        alerts.append("Server metrics contain duplicate round records.")
+    if client_metrics is None:
+        alerts.append("Per-client evaluation metrics are unavailable.")
+        return alerts
+    client_required = {"round", "client_id", "accuracy"}
+    if not client_required <= set(client_metrics.columns):
+        alerts.append("Client metrics are missing round, client_id, or accuracy.")
+        return alerts
+    client_numeric = client_metrics[list(client_required)].apply(
+        pd.to_numeric, errors="coerce"
+    )
+    if not np.isfinite(client_numeric.to_numpy(dtype=np.float64)).all():
+        alerts.append("Client metrics contain missing or non-finite values.")
+    if client_metrics.duplicated(["round", "client_id"]).any():
+        alerts.append("Client metrics contain duplicate round/client records.")
+    expected_ids = set(range(expected_clients))
+    for round_value, rows in client_metrics.groupby("round", sort=True):
+        actual_ids = set(pd.to_numeric(rows["client_id"], errors="coerce"))
+        if actual_ids != expected_ids:
+            alerts.append(
+                f"Round {round_value} client coverage differs from registered IDs "
+                f"{sorted(expected_ids)}."
+            )
+    return alerts
+
+
 def predict_sentiment(review_text: str) -> tuple[float, str]:
     """Predict sentiment with one mutually bound model and vocabulary snapshot.
 
@@ -369,6 +433,11 @@ def main() -> None:
                 chart_data = df_metrics.sort_values("round").set_index("round")[
                     ["accuracy", "loss"]
                 ]
+                latest = chart_data.iloc[-1]
+                status_round, status_accuracy, status_loss = st.columns(3)
+                status_round.metric("Latest round", int(chart_data.index[-1]))
+                status_accuracy.metric("Accuracy", f"{latest['accuracy']:.3f}")
+                status_loss.metric("Loss", f"{latest['loss']:.3f}")
                 st.line_chart(chart_data)
             else:
                 st.warning(
@@ -394,6 +463,17 @@ def main() -> None:
                     "client_metrics.csv is missing the expected round, client_id, "
                     "or accuracy columns."
                 )
+            alerts = deployment_alerts(
+                df_metrics,
+                df_client_metrics,
+                int(os.environ.get("FML_CLIENT_COUNT", "4")),
+            )
+            if alerts:
+                st.subheader("Run alerts")
+                for alert in alerts:
+                    st.error(alert)
+            else:
+                st.success("Run health checks passed.")
 
     if st.session_state.auto_refresh:
         time.sleep(st.session_state.refresh_seconds)

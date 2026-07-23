@@ -41,6 +41,29 @@ def write_server_manifest(path: Path, version: int | None) -> None:
 
 
 class DashboardArtifactTests(unittest.TestCase):
+    def test_deployment_alerts_cover_metric_integrity_and_client_coverage(
+        self,
+    ) -> None:
+        metrics = dashboard.pd.DataFrame([{"round": 1, "loss": 0.5, "accuracy": 0.75}])
+        clients = dashboard.pd.DataFrame(
+            [
+                {"round": 1, "client_id": 0, "accuracy": 0.7},
+                {"round": 1, "client_id": 1, "accuracy": 0.8},
+            ]
+        )
+        self.assertEqual(dashboard.deployment_alerts(metrics, clients, 2), [])
+
+        clients = clients.iloc[:1]
+        alerts = dashboard.deployment_alerts(metrics, clients, 2)
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("client coverage", alerts[0])
+
+        metrics.loc[0, "loss"] = np.nan
+        self.assertIn(
+            "Server metrics contain missing or non-finite values.",
+            dashboard.deployment_alerts(metrics, clients, 2),
+        )
+
     def test_prediction_rejects_malformed_model_outputs(self) -> None:
         """Reject invalid inference outputs before rendering them.
 
