@@ -63,7 +63,7 @@ federated learning system.
 - [x] Add dashboard tests for metric loading, inference errors, and missing artifacts.
 - [x] Test model save/load compatibility.
 - [x] Add a supported Python and operating-system test matrix.
-- [ ] Add deployment-script tests or dry-run validation.
+- [x] Add deployment-script tests or dry-run validation.
 
 ## P1 — Observability and experiment lifecycle
 
@@ -104,7 +104,7 @@ federated learning system.
 - [x] Add a limitations and responsible-use section.
 - [x] Add a model card and dataset card.
 - [x] Standardize all dashboard text to one language.
-- [ ] Remove stale branch instructions and clean up the research notebook.
+- [x] Remove stale branch instructions and clean up the research notebook.
 - [x] Add a roadmap and a resume-ready project summary.
 
 ## P2 — Advanced production capabilities
