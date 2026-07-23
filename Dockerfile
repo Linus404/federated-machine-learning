@@ -20,9 +20,10 @@ WORKDIR /app
 RUN groupadd --gid 1000 app \
     && useradd --uid 1000 --gid app --home-dir /app --shell /usr/sbin/nologin app
 
-COPY --chown=app:app pyproject.toml uv.lock dashboard.py ./
+COPY --chown=app:app pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
+COPY --chown=app:app dashboard.py ./
 COPY --chown=app:app src ./src
 COPY --chown=app:app docs/scientific-protocol-v1.toml ./docs/
 
