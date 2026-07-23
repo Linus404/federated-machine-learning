@@ -137,6 +137,40 @@ class StrategyAggregationTests(unittest.TestCase):
             with self.subTest(counts=counts), self.assertRaises(ValueError):
                 aggregate_model_weights("fedavg", weights, counts)
 
+    def test_invalid_aggregation_output_fails_without_repair(self) -> None:
+        valid = [array.copy() for array in self.weights[0]]
+        invalid = [
+            valid[:1],
+            [np.asarray(1.0, dtype=np.float32), valid[1]],
+            [np.asarray([], dtype=np.float32), valid[1]],
+            [valid[0].astype(np.float64), valid[1]],
+            [np.ones(3, dtype=np.float32), valid[1]],
+            [np.asarray([np.inf, 0.0], dtype=np.float32), valid[1]],
+        ]
+
+        for aggregate in invalid:
+            with (
+                self.subTest(aggregate=aggregate),
+                patch(
+                    "src.strategy_runner.aggregate_inplace",
+                    return_value=aggregate,
+                ),
+                self.assertRaises(ValueError),
+            ):
+                aggregate_model_weights("fedavg", self.weights, self.counts)
+
+    def test_median_and_trimmed_average_reject_float32_overflow(self) -> None:
+        maximum = np.finfo(np.float32).max
+        weights = [[np.asarray([maximum], dtype=np.float32)] for _ in range(4)]
+
+        for strategy in ("fedmedian", "fedtrimmedavg"):
+            with (
+                self.subTest(strategy=strategy),
+                np.errstate(over="ignore"),
+                self.assertRaisesRegex(ValueError, "finite"),
+            ):
+                aggregate_model_weights(strategy, weights, self.counts)
+
 
 class StrategyExecutionTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -170,15 +204,35 @@ class StrategyExecutionTests(unittest.TestCase):
             np.asarray([1, 1], dtype=np.int64),
         )
         models = [MagicMock() for _ in range(4)]
-        evaluations: list[dict[str, object]] = []
+        evaluations: list[tuple[object, int, dict[str, object]]] = []
+
+        for model in models:
+
+            def fit(
+                *_args: object,
+                _model: object = model,
+                **kwargs: object,
+            ) -> None:
+                callbacks = kwargs["callbacks"]
+                epochs = kwargs["epochs"]
+                assert isinstance(callbacks, list)
+                assert isinstance(epochs, int)
+                for callback in callbacks:
+                    callback.set_model(_model)
+                for epoch in range(epochs):
+                    _model.live_epoch = epoch
+                    for callback in callbacks:
+                        callback.on_epoch_end(epoch)
+
+            model.fit.side_effect = fit
 
         def evaluate(
-            _model: object,
+            model: object,
             _tokens: np.ndarray,
             labels: np.ndarray,
             **kwargs: object,
         ) -> dict[str, object]:
-            evaluations.append(kwargs)
+            evaluations.append((model, model.live_epoch, kwargs))
             return canonical_result(labels)
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -196,7 +250,6 @@ class StrategyExecutionTests(unittest.TestCase):
                     "src.strategy_runner._training_orders",
                     return_value=[np.asarray([0])] * 20,
                 ),
-                patch("src.strategy_runner._train_one_epoch") as train_epoch,
                 patch(
                     "src.strategy_runner.build_model_from_manifest",
                     side_effect=models,
@@ -220,13 +273,20 @@ class StrategyExecutionTests(unittest.TestCase):
                 )
 
         self.assertEqual(actual_models, models)
-        self.assertEqual(train_epoch.call_count, 80)
+        self.assertTrue(all(model.fit.call_count == 1 for model in models))
+        self.assertTrue(
+            all(model.fit.call_args.kwargs["epochs"] == 20 for model in models)
+        )
         self.assertEqual(len(evaluations), 84)
         self.assertEqual(
-            evaluations[:20],
+            [evaluation[2] for evaluation in evaluations[:20]],
             [{"evaluation_scope": "local_only_validation_only"}] * 20,
         )
-        self.assertEqual(evaluations[20:], [{}] * 64)
+        self.assertEqual([evaluation[2] for evaluation in evaluations[20:]], [{}] * 64)
+        self.assertEqual(
+            [evaluation[1] for evaluation in evaluations[:80]],
+            list(range(20)) * 4,
+        )
         self.assertTrue(
             all(len(client["validation"]) == 20 for client in result["clients"])
         )

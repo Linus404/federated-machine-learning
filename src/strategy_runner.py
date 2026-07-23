@@ -28,6 +28,7 @@ from src.baseline_training import (
     REGISTERED_PARTITION,
     RowSet,
     RowSplit,
+    _EpochOrderedBatches,
     _derive_seed,
     _load_client_snapshots,
     _model_seeds,
@@ -103,6 +104,44 @@ def _validate_client_weights(
             )
 
 
+def _validate_aggregated_weights(aggregate: NDArrays, reference: NDArrays) -> NDArrays:
+    """Validate aggregated model weights against the reference model.
+
+    Parameters
+    ----------
+    aggregate : list of numpy.ndarray
+        Candidate aggregate in model-weight order.
+    reference : list of numpy.ndarray
+        Validated reference model weights.
+
+    Returns
+    -------
+    list of numpy.ndarray
+        The validated aggregate unchanged.
+
+    Raises
+    ------
+    ValueError
+        If the aggregate has an invalid count, shape, dtype, size, or value.
+    """
+    if len(aggregate) != len(reference):
+        raise ValueError("aggregate model weight count must match the reference model")
+    for array, expected in zip(aggregate, reference, strict=True):
+        if not isinstance(array, np.ndarray):
+            raise ValueError("aggregate model weights must be numpy arrays")
+        if array.shape != expected.shape:
+            raise ValueError(
+                "aggregate model weight shapes must match the reference model"
+            )
+        if array.dtype != np.dtype(np.float32):
+            raise ValueError("aggregate model weights must use exactly float32")
+        if array.ndim == 0 or array.size == 0:
+            raise ValueError("aggregate model weights must be non-scalar and nonempty")
+        if not np.all(np.isfinite(array)):
+            raise ValueError("aggregate model weights must contain finite values")
+    return aggregate
+
+
 def aggregate_model_weights(
     strategy: str,
     client_weights: list[NDArrays],
@@ -141,34 +180,39 @@ def aggregate_model_weights(
     _validate_client_weights(client_weights, sample_counts)
 
     if strategy == "fedprox_huber":
-        aggregate = huber_aggregate(
-            [_flatten(weights) for weights in client_weights],
-            sample_counts,
-            huber_threshold,
-        )
-        return _unflatten(aggregate, client_weights[0])
-
-    weighted_models = list(zip(client_weights, sample_counts, strict=True))
-    if strategy == "fedmedian":
-        return aggregate_median(weighted_models)
-    if strategy == "fedtrimmedavg":
-        return aggregate_trimmed_avg(weighted_models, proportiontocut=trimmed_fraction)
-
-    results: list[tuple[Any, FitRes]] = [
-        (
-            None,
-            FitRes(
-                status=Status(code=Code.OK, message=""),
-                parameters=ndarrays_to_parameters(weights),
-                num_examples=count,
-                metrics={"client_id": client_id},
+        aggregated = _unflatten(
+            huber_aggregate(
+                [_flatten(weights) for weights in client_weights],
+                sample_counts,
+                huber_threshold,
             ),
+            client_weights[0],
         )
-        for client_id, (weights, count) in enumerate(
-            zip(client_weights, sample_counts, strict=True)
-        )
-    ]
-    return aggregate_inplace(results)
+    else:
+        weighted_models = list(zip(client_weights, sample_counts, strict=True))
+        if strategy == "fedmedian":
+            aggregated = aggregate_median(weighted_models)
+        elif strategy == "fedtrimmedavg":
+            aggregated = aggregate_trimmed_avg(
+                weighted_models, proportiontocut=trimmed_fraction
+            )
+        else:
+            results: list[tuple[Any, FitRes]] = [
+                (
+                    None,
+                    FitRes(
+                        status=Status(code=Code.OK, message=""),
+                        parameters=ndarrays_to_parameters(weights),
+                        num_examples=count,
+                        metrics={"client_id": client_id},
+                    ),
+                )
+                for client_id, (weights, count) in enumerate(
+                    zip(client_weights, sample_counts, strict=True)
+                )
+            ]
+            aggregated = aggregate_inplace(results)
+    return _validate_aggregated_weights(aggregated, client_weights[0])
 
 
 def _cell_id(strategy: str, seed: int) -> str:
@@ -385,6 +429,64 @@ def _evaluation_record(
     }
 
 
+class _LocalOnlyValidationCallback(keras.callbacks.Callback):
+    """Record canonical validation metrics from each live epoch model."""
+
+    def __init__(
+        self,
+        data: ArrayPair,
+        output_dir: Path,
+        client_id: int,
+    ) -> None:
+        """Initialize one client's fixed validation callback.
+
+        Parameters
+        ----------
+        data : tuple of numpy.ndarray
+            Fixed validation token IDs and exact int64 labels.
+        output_dir : pathlib.Path
+            Owned result directory.
+        client_id : int
+            Zero-based client identifier.
+
+        Returns
+        -------
+        None
+        """
+        super().__init__()
+        self._data = data
+        self._output_dir = output_dir
+        self._client_id = client_id
+        self.curve: list[dict[str, Any]] = []
+
+    def on_epoch_end(self, epoch: int, logs: dict[str, Any] | None = None) -> None:
+        """Evaluate the live model after one completed epoch.
+
+        Parameters
+        ----------
+        epoch : int
+            Zero-based completed epoch index.
+        logs : dict of str to Any or None, optional
+            Keras epoch logs, unused because reporting is canonical.
+
+        Returns
+        -------
+        None
+        """
+        self.curve.append(
+            {
+                "epoch": epoch,
+                **_evaluation_record(
+                    self.model,
+                    self._data,
+                    self._output_dir,
+                    f"client-{self._client_id}-validation-epoch-{epoch}.npy",
+                    local_only=True,
+                ),
+            }
+        )
+
+
 def _load_test_data(
     args: argparse.Namespace, manifest: AppManifest
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -451,27 +553,14 @@ def _run_local_only(
             client_id,
             args.epochs,
         )
-        curve = []
-        for epoch, order in enumerate(orders):
-            _train_one_epoch(
-                model,
-                train_data,
-                order,
-                args.batch_size,
-                quiet=args.quiet,
-            )
-            curve.append(
-                {
-                    "epoch": epoch,
-                    **_evaluation_record(
-                        model,
-                        validation_data,
-                        output_dir,
-                        f"client-{client_id}-validation-epoch-{epoch}.npy",
-                        local_only=True,
-                    ),
-                }
-            )
+        callback = _LocalOnlyValidationCallback(validation_data, output_dir, client_id)
+        model.fit(
+            _EpochOrderedBatches(train_data, orders, args.batch_size),
+            callbacks=[callback],
+            epochs=args.epochs,
+            shuffle=False,
+            verbose=0 if args.quiet else 1,
+        )
         models.append(model)
         clients.append(
             {
@@ -481,7 +570,7 @@ def _run_local_only(
                     "dropout": dropout_seed,
                     "model_initialization": model_seed,
                 },
-                "validation": curve,
+                "validation": callback.curve,
             }
         )
 
