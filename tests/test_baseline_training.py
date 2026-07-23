@@ -1,7 +1,9 @@
 import argparse
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -13,6 +15,7 @@ from src.baseline_training import (
     _derive_seed,
     _registered_iid_splits,
     _training_orders,
+    parse_args,
     run,
 )
 from src.evaluation_artifact import load_scientific_protocol
@@ -470,6 +473,17 @@ class BaselineTrainingTests(unittest.TestCase):
                         run(args)
 
                     self.assertFalse(args.output_dir.exists())
+
+    def test_cli_does_not_expose_frozen_training_overrides(self) -> None:
+        for option in (
+            "--batch-size",
+            "--client-count",
+            "--epochs",
+            "--validation-split",
+        ):
+            with self.subTest(option=option), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    parse_args(["centralized", "--output-dir", "baseline", option, "1"])
 
 
 if __name__ == "__main__":
