@@ -53,9 +53,10 @@ storage only after this centralized preparation; they are not evidence that data
 originated at or remained hidden within independent organizations. Clients
 tokenize their own mounted reviews, and no centrally tokenized partitions are
 generated. The evaluation directory is immutable and evaluation-only: it must not
-be mounted into ClientApp, the dashboard, or the current training ServerApp. PR14
-and PR15 will add the registered consumers and metrics; this command performs no
-evaluation.
+be mounted into ClientApp, the dashboard, or the current training ServerApp. Only
+the baseline evaluator consumes it, after training has completed; the preparation
+command itself performs no evaluation. The canonical classification metrics are
+added separately in PR15.
 
 The server does not read raw shard files during training, but it receives each
 client's resulting model parameters, sample counts, training metrics, and
@@ -72,6 +73,28 @@ uv run --env-file .env.protocol python -m src.local_training --client-data-dir a
 The local command treats `--run-artifact-dir` as a reusable history root. Every
 training invocation writes to a new `runs/<run_id>` directory; finalization binds
 its regular files into a checksum-verified artifact snapshot.
+
+Train the centralized or local-only baseline from the four prepared client
+shards, then evaluate on the untouched test artifact:
+
+```bash
+uv run --env-file .env.protocol python -m src.baseline_training centralized --output-dir artifacts/baselines/centralized
+uv run --env-file .env.protocol python -m src.baseline_training local-only --output-dir artifacts/baselines/local-only
+```
+
+Each output directory must be new. The centralized command trains one model on
+the union of the registered fitted rows and validates on their registered
+validation union. The local-only command trains one independent model per
+registered IID client and reports the unweighted mean of their untouched-test
+loss and accuracy. Both commands reconstruct the frozen `iid_stratified`
+assignment from the complete validated train-shard union, derive validation,
+model, Dropout, and per-epoch training-order seeds from the frozen namespaces,
+finish every training call before loading the evaluation artifact, and write the
+trained model files plus canonical `results.json` with the effective inputs. The
+CLI enforces four clients, 20 epochs, batch size 64, validation fraction 0.2, and
+one of the five frozen seeds; seed 67 is the default. PR15 adds the complete
+frozen classification metric set; later experiment-matrix work executes the
+remaining registered seeds and non-IID partitions.
 
 ## Direct Flower simulation
 

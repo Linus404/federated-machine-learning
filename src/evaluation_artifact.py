@@ -72,11 +72,14 @@ class EvaluationArtifactSnapshot:
         Strictly validated manifest payload.
     records : bytes
         Canonical JSONL bytes verified against the manifest and frozen protocol.
+    rows : tuple of tuple
+        Immutable ``(row_id, text, label)`` records in official test order.
     """
 
     directory: Path
     manifest: Mapping[str, Any]
     records: bytes
+    rows: tuple[tuple[str, str, int], ...]
 
 
 def load_scientific_protocol() -> Mapping[str, Any]:
@@ -709,6 +712,7 @@ def load_evaluation_artifact_snapshot(
 
     content_hash = hashlib.sha256()
     label_counts: Counter[int] = Counter()
+    validated_rows: list[tuple[str, str, int]] = []
     lines = records.splitlines(keepends=True)
     if len(lines) != payload["records"]["row_count"]:
         raise ValueError("evaluation record row count mismatch")
@@ -732,6 +736,7 @@ def load_evaluation_artifact_snapshot(
             raise ValueError(f"evaluation record is not canonical at row {index}")
         content_hash.update(canonical_source_row_bytes(text, label))
         label_counts[label] += 1
+        validated_rows.append((str(row["row_id"]), text, label))
 
     dataset = payload["dataset"]
     if [label_counts[0], label_counts[1]] != dataset["label_counts"]:
@@ -742,4 +747,5 @@ def load_evaluation_artifact_snapshot(
         canonical_dir,
         deep_freeze(payload),
         records,
+        tuple(validated_rows),
     )

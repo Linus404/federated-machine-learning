@@ -8,7 +8,7 @@ import warnings
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, TypeAlias
+from typing import Any, Mapping, Sequence, TypeAlias
 
 from src.protocol_runtime import validate_protocol_runtime
 
@@ -407,12 +407,7 @@ def _tokenize_client_shard(
     PartitionSplit
         Tokenized training and validation arrays.
     """
-    vectorizer = create_text_vectorizer(
-        sequence_length=manifest.payload["sequence_length"],
-        vocabulary=manifest.vocabulary_terms[2:],
-    )
-    x = np.asarray(vectorizer([row[1] for row in snapshot.rows]), dtype="int32")
-    y = np.asarray([row[2] for row in snapshot.rows], dtype="float32")
+    x, y = tokenize_rows(snapshot.rows, manifest)
 
     train_indices, validation_indices = _stratified_split_indices(y, validation_split)
 
@@ -422,10 +417,45 @@ def _tokenize_client_shard(
     )
 
 
+def tokenize_rows(
+    rows: Sequence[tuple[str, str, int]], manifest: AppManifest
+) -> ArrayPair:
+    """Tokenize validated review rows with the frozen public vocabulary.
+
+    Parameters
+    ----------
+    rows : sequence of tuple
+        Validated ``(row_id, text, label)`` records in evaluation order.
+    manifest : AppManifest
+        Public vocabulary and model contract.
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        Token IDs with ``int32`` dtype and labels with ``float32`` dtype.
+
+    Raises
+    ------
+    ValueError
+        If no rows are supplied.
+    """
+    if not rows:
+        raise ValueError("at least one validated review row is required")
+    vectorizer = create_text_vectorizer(
+        sequence_length=manifest.payload["sequence_length"],
+        vocabulary=manifest.vocabulary_terms[2:],
+    )
+    return (
+        np.asarray(vectorizer([row[1] for row in rows]), dtype="int32"),
+        np.asarray([row[2] for row in rows], dtype="float32"),
+    )
+
+
 def build_model(
     vocab_size: int,
     sequence_length: int,
     embedding_dim: int,
+    dropout_seed: int | None = None,
 ) -> Any:
     """Build the sentiment model reused by local and federated training.
 
@@ -437,6 +467,8 @@ def build_model(
         Exact frozen token sequence length.
     embedding_dim : int
         Exact frozen embedding dimension.
+    dropout_seed : int or None, optional
+        Explicit deterministic Dropout seed for registered experiments.
 
     Returns
     -------
@@ -466,7 +498,7 @@ def build_model(
     )(x)
     x = keras.layers.GlobalMaxPooling1D()(x)
     x = keras.layers.Dense(32, activation="relu")(x)
-    x = keras.layers.Dropout(0.3)(x)
+    x = keras.layers.Dropout(0.3, seed=dropout_seed)(x)
 
     outputs = keras.layers.Dense(1, activation="sigmoid")(x)
 
@@ -586,13 +618,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def build_model_from_manifest(manifest: AppManifest) -> Any:
+def build_model_from_manifest(
+    manifest: AppManifest, *, dropout_seed: int | None = None
+) -> Any:
     """Build the sentiment model from public manifest metadata.
 
     Parameters
     ----------
     manifest : AppManifest
         Manifest containing the model dimensions.
+    dropout_seed : int or None, optional
+        Explicit deterministic Dropout seed for registered experiments.
 
     Returns
     -------
@@ -605,6 +641,7 @@ def build_model_from_manifest(manifest: AppManifest) -> Any:
         payload["vocabulary_size"],
         payload["sequence_length"],
         payload["embedding_dim"],
+        dropout_seed,
     )
 
 
