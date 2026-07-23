@@ -1,6 +1,10 @@
 # Federated Sentiment Analysis
 
 [![CI](https://github.com/Linus404/federated-machine-learning/actions/workflows/ci.yml/badge.svg)](https://github.com/Linus404/federated-machine-learning/actions/workflows/ci.yml)
+![Coverage threshold](https://img.shields.io/badge/coverage-80%25%2B-brightgreen)
+![Python](https://img.shields.io/badge/python-3.11--3.13-blue)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+![Docker Compose](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
 
 A reproducible federated-learning pet project that trains an IMDB sentiment
 classifier with Keras, TensorFlow, and Flower. It compares local-only,
@@ -33,6 +37,11 @@ Smoke runs and isolated strategy runs are not presented as benchmark results.
 Comparative values will be published only after the compact matrix has been
 executed against the frozen protocol.
 
+**Portfolio summary:** Built a reproducible federated sentiment-analysis system
+with deterministic data preparation, centralized and local baselines, six
+aggregation strategies, immutable versioned artifacts, strict update
+validation, a Streamlit dashboard, and containerized Flower orchestration.
+
 ## Architecture
 
 ```mermaid
@@ -58,6 +67,18 @@ storage models the runtime boundary only; it is not evidence that the data came
 from independent organizations. The untouched test artifact is available only
 to offline evaluators after training and is not mounted into ClientApp,
 ServerApp, or the dashboard.
+
+### Key design decisions
+
+| Decision | Rejected alternative | Reason |
+| --- | --- | --- |
+| Freeze one executable scientific protocol | Tune settings after seeing test results | Prevent test leakage and irreproducible comparisons |
+| Keep the test artifact outside training services | Let clients report test metrics | Preserve one untouched global evaluation boundary |
+| Store immutable run directories with checksums | Overwrite one “latest” model | Retain history and detect accidental artifact changes |
+| Defer secure aggregation | Claim protection from update noise or Huber aggregation | Flower integration prerequisites are unresolved; neither alternative hides updates |
+
+The complete secure-aggregation trade-off is recorded in
+[`docs/adr/0001-secure-aggregation.md`](docs/adr/0001-secure-aggregation.md).
 
 ## Reproduce one experiment
 
@@ -219,7 +240,7 @@ retention never removes the active or selected run.
 See [`COMPATIBILITY.md`](COMPATIBILITY.md) for schema compatibility and
 regeneration rules.
 
-## Security and privacy limitations
+## Limitations and responsible use
 
 This repository does not implement TLS, client or SuperNode authentication,
 secure aggregation, formal differential privacy, or dashboard authentication.
@@ -232,6 +253,10 @@ accountant, composition analysis, sensitivity model, or epsilon/delta guarantee.
 The supported deployment target is local execution. Cloud deployment,
 monitoring, disaster recovery, canary releases, and other production operations
 are intentionally outside the pet-project finish line.
+
+Use the project for education and controlled research, not decisions about
+people or deployment with private client data. Do not publish prepared review
+shards, and do not describe the demo as privacy-preserving or production-ready.
 
 See [`THREAT_MODEL.md`](THREAT_MODEL.md),
 [`SECURITY.md`](SECURITY.md), and the
@@ -270,3 +295,8 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a change.
   IMDB dataset
 - [Streamlit](https://streamlit.io/) for the local dashboard
 - NumPy for deterministic artifacts and metric inputs
+
+## Roadmap
+
+[`TODO.md`](TODO.md) tracks the remaining experiment matrix, published results,
+end-to-end reliability evidence, privacy experiments, and deployment controls.
