@@ -69,7 +69,7 @@ federated learning system.
 
 - [x] Assign a unique ID to every training run.
 - [x] Persist the complete run configuration and environment metadata with each run.
-- [ ] Add structured application logs with consistent levels and context.
+- [x] Add structured application logs with consistent levels and context.
 - [ ] Record client availability, failures, round duration, and communication metrics.
 - [ ] Add model checkpoints and documented resume behavior.
 - [x] Introduce model and artifact versioning with retention rules.

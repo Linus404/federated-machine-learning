@@ -224,6 +224,9 @@ Linux capabilities, `no-new-privileges`, health checks, and CPU, memory, and
 process limits. The limits are local safety ceilings, not capacity-planning
 recommendations.
 
+Client and server lifecycle events are emitted to standard error as one JSON
+object per line with a timestamp, level, logger, message, and event context.
+
 The `local-docker` Flower profile uses insecure loopback transport. It must not
 be used for a remote or public SuperLink.
 

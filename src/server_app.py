@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import logging
 import math
 import warnings
 from numbers import Real
@@ -43,6 +44,7 @@ from src.paths import (
     metrics_path,
     resolve_dir,
 )
+from src.structured_logging import structured_logger
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"keras\..*")
 
@@ -313,6 +315,7 @@ class SentimentServer(FedProx):
 
     expected_client_ids: frozenset[int]
     expected_weight_shapes: tuple[tuple[int, ...], ...]
+    logger: logging.Logger | None = None
 
     def __init__(
         self,
@@ -456,7 +459,29 @@ class SentimentServer(FedProx):
             model = build_model_from_manifest(self.app_manifest)
             model.set_weights(parameters_to_ndarrays(parameters))
             model.save(str(self.model_path))
+            if self.logger is not None:
+                self.logger.info(
+                    "fit round completed",
+                    extra={
+                        "context": {
+                            "event": "fit_round_completed",
+                            "round": server_round,
+                            "clients": len(ordered_results),
+                            "aggregation": "huber" if self.use_huber else "fedprox",
+                        }
+                    },
+                )
         except BaseException:
+            if self.logger is not None:
+                self.logger.exception(
+                    "fit round failed",
+                    extra={
+                        "context": {
+                            "event": "fit_round_failed",
+                            "round": server_round,
+                        }
+                    },
+                )
             self._release_artifact_lock()
             raise
 
@@ -527,8 +552,31 @@ class SentimentServer(FedProx):
                     active_run_dir=self.artifact_dir,
                 )
         except BaseException:
+            if self.logger is not None:
+                self.logger.exception(
+                    "evaluation round failed",
+                    extra={
+                        "context": {
+                            "event": "evaluation_round_failed",
+                            "round": server_round,
+                        }
+                    },
+                )
             self._release_artifact_lock()
             raise
+        if self.logger is not None:
+            self.logger.info(
+                "evaluation round completed",
+                extra={
+                    "context": {
+                        "event": "evaluation_round_completed",
+                        "round": server_round,
+                        "clients": len(ordered_results),
+                        "loss": loss,
+                        "accuracy": float(metrics["accuracy"]),
+                    }
+                },
+            )
         if server_round == self.final_round:
             self._release_artifact_lock()
         return loss, metrics
@@ -680,6 +728,19 @@ def server_fn(context: Context) -> ServerAppComponents:
             huber_threshold=float(
                 run_config.get("huber-threshold", DEFAULT_HUBER_THRESHOLD)
             ),
+        )
+        strategy.logger = structured_logger("server")
+        strategy.logger.info(
+            "server ready",
+            extra={
+                "context": {
+                    "event": "server_ready",
+                    "run_id": run_dir.name,
+                    "rounds": num_rounds,
+                    "expected_clients": expected_clients,
+                    "artifact_directory": str(run_dir),
+                }
+            },
         )
         return ServerAppComponents(
             strategy=strategy,

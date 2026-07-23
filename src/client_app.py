@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ from src.local_training import (
     load_client_shard,
 )
 from src.paths import resolve_dir
+from src.structured_logging import structured_logger
 
 UPDATE_NOISE_L2_NORM_CLIP = 1.0
 UPDATE_NOISE_MULTIPLIER = 0.001
@@ -41,6 +43,8 @@ def _proximal_penalty(local_weights: list[Any], global_weights: list[Any]) -> An
 
 class SentimentClient(NumPyClient):
     """Flower client that tokenizes and trains on its client-scoped shard."""
+
+    logger: logging.Logger | None = None
 
     def __init__(
         self,
@@ -212,6 +216,18 @@ class SentimentClient(NumPyClient):
             name: float(values[-1]) for name, values in history.history.items()
         }
         metrics["client_id"] = self.client_id
+        if self.logger is not None:
+            self.logger.info(
+                "client fit completed",
+                extra={
+                    "context": {
+                        "event": "fit_completed",
+                        "client_id": self.client_id,
+                        "examples": len(self.train_data[0]),
+                        "update_noise": self.use_update_noise,
+                    }
+                },
+            )
 
         return weights, len(self.train_data[0]), metrics
 
@@ -221,6 +237,19 @@ class SentimentClient(NumPyClient):
         """Evaluate the global model on this client's validation split."""
         self.model.set_weights(parameters)
         loss, accuracy = self.model.evaluate(*self.val_data, verbose=0)
+        if self.logger is not None:
+            self.logger.info(
+                "client evaluation completed",
+                extra={
+                    "context": {
+                        "event": "evaluation_completed",
+                        "client_id": self.client_id,
+                        "examples": len(self.val_data[0]),
+                        "loss": float(loss),
+                        "accuracy": float(accuracy),
+                    }
+                },
+            )
 
         return (
             float(loss),
@@ -238,7 +267,7 @@ def client_fn(context: Any) -> Any:
     partition = int(context.node_config.get("partition-id", 0))
     client_data_dir = _configured_client_data_dir(run_config, partition)
 
-    return SentimentClient(
+    client = SentimentClient(
         client_data_dir=client_data_dir,
         client_id=partition,
         epochs=int(run_config.get("local-epochs", DEFAULT_LOCAL_EPOCHS)),
@@ -254,7 +283,19 @@ def client_fn(context: Any) -> Any:
         update_noise_multiplier=float(
             run_config.get("update-noise-multiplier", UPDATE_NOISE_MULTIPLIER)
         ),
-    ).to_client()
+    )
+    client.logger = structured_logger("client")
+    client.logger.info(
+        "client ready",
+        extra={
+            "context": {
+                "event": "client_ready",
+                "client_id": partition,
+                "data_directory": str(client_data_dir),
+            }
+        },
+    )
+    return client.to_client()
 
 
 def _configured_client_data_dir(run_config: dict[str, Any], partition: int) -> Path:
