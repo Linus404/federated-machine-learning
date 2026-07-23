@@ -1,8 +1,8 @@
-# Production Readiness TODO
+# Completed Academic Project Roadmap
 
-This roadmap tracks the work required to turn the project from a strong academic
-prototype into a polished portfolio project and, eventually, a production-ready
-federated learning system.
+This file records the completed scope of the academic project. A checked item
+means that the capability was implemented or that its design decision and
+limitation were documented. It does not assert production readiness.
 
 ## P0 — Portfolio and engineering foundation
 
@@ -36,18 +36,18 @@ federated learning system.
 - [x] Document what information model updates can leak.
 - [x] Add TLS for Flower communication.
 - [x] Add SuperNode/client authentication and certificate lifecycle documentation.
-- [x] Evaluate secure aggregation.
+- [x] Evaluate and document the secure-aggregation decision.
   - Decision: defer Flower 1.32.1 SecAgg+ until its documented integration,
     incompatibilities, and end-to-end prerequisites are resolved; see
     `docs/adr/0001-secure-aggregation.md`.
-- [x] If differential privacy is claimed, implement formal privacy accounting and publish epsilon/delta values.
+- [x] Resolve the differential-privacy claim requirements.
   - Resolved by explicit non-claim: the current update-noise ablation has no
     accountant, composition or sensitivity model, so no epsilon/delta or formal
     differential-privacy claim is made.
-- [x] Add membership-inference and model-update leakage experiments.
-  - Exact evaluators and golden-vector experiments are implemented; real runs require
-    protocol-selected candidate probabilities, gradients, and individual updates,
-    so no privacy result is fabricated from final aggregate artifacts.
+- [x] Implement membership-inference and model-update leakage evaluators.
+  - Exact evaluators and golden-vector tests are implemented. The published campaign
+    does not include attack results because it did not retain the required candidate
+    probabilities, gradients, and individual client updates.
 - [x] Keep the current update-noise feature labeled as an illustrative ablation, not production differential privacy.
 
 ## P1 — Reliability and testing
@@ -76,7 +76,7 @@ federated learning system.
 - [x] Add monitoring dashboards and alerts for deployed runs.
 - [x] Define backup, restore, rollback, and disaster-recovery procedures.
 
-## P1 — Deployment hardening
+## P1 — Demonstration hardening
 
 - [x] Run containers as a non-root user.
 - [x] Pin base images by digest and define an update policy.
@@ -85,9 +85,9 @@ federated learning system.
 - [x] Add CPU, memory, and process limits.
 - [x] Protect the Streamlit dashboard with authentication or an authenticated proxy.
 - [x] Re-enable and correctly configure CORS and XSRF protection.
-- [x] Replace ad-hoc cloud provisioning with reviewed infrastructure as code.
-  - The supported target is reviewed Compose IaC. Cloud IaC is an explicit non-goal
-    until a provider, region, IAM, network, and availability contract exists.
+- [x] Define the supported infrastructure boundary.
+  - Reviewed Compose configuration is the only supported infrastructure target.
+    Provider-specific cloud infrastructure is outside the academic project scope.
 - [x] Separate development, staging, and production configuration.
 - [x] Add centralized log collection and deployment audit trails.
 - [x] Document cost estimates and teardown safeguards.
@@ -105,9 +105,9 @@ federated learning system.
 - [x] Add a model card and dataset card.
 - [x] Standardize all dashboard text to one language.
 - [x] Remove stale branch instructions and clean up the research notebook.
-- [x] Add a roadmap and a resume-ready project summary.
+- [x] Add a completed roadmap and concise project summary.
 
-## P2 — Advanced production capabilities
+## P2 — Extended engineering capabilities
 
 - [x] Add scalable client sampling and configurable participation policies.
 - [x] Benchmark behavior with substantially more simulated clients.
@@ -120,12 +120,11 @@ federated learning system.
 - [x] Add performance profiling and optimize serialization and communication overhead.
 - [x] Conduct a documented security and privacy review before making production claims.
 
-## Definition of done
+## Completion statement
 
-The project can be presented as an exceptional portfolio project when CI is green,
-results are reproducible and published, the architecture and limitations are clear,
+The academic project is complete: results are reproducible and published, the
+architecture and limitations are documented, CI enforces the repository contracts,
 and a reviewer can run a small end-to-end demonstration from a clean checkout.
 
-The project should only be described as production-ready after authenticated and
-encrypted communication, operational monitoring, hardened deployment, failure
-recovery, and evidence-backed privacy guarantees are implemented and tested.
+Production readiness is outside this project's scope and must not be inferred from
+the demonstration hardening or security experiments.

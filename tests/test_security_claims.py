@@ -65,13 +65,13 @@ class SecurityClaimContractTests(unittest.TestCase):
         for completed_control in (
             "Add TLS for Flower communication.",
             "Add SuperNode/client authentication and certificate lifecycle documentation.",
-            "Add membership-inference and model-update leakage experiments.",
+            "Implement membership-inference and model-update leakage evaluators.",
         ):
             self.assertIn(f"- [x] {completed_control}", todo)
 
         for completed_evaluation in (
-            "Evaluate secure aggregation.",
-            "If differential privacy is claimed, implement formal privacy accounting and publish epsilon/delta values.",
+            "Evaluate and document the secure-aggregation decision.",
+            "Resolve the differential-privacy claim requirements.",
         ):
             self.assertIn(f"- [x] {completed_evaluation}", todo)
 

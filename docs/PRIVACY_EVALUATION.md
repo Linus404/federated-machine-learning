@@ -1,4 +1,9 @@
-# Empirical privacy evaluation
+# Privacy evaluation tooling
+
+**Evidence status:** the evaluators and their golden-vector tests are complete.
+The published training campaign does not contain membership-inference or
+model-update leakage results because its retained artifacts do not include the
+required candidate records, probabilities, gradients, or individual updates.
 
 `src.privacy_evaluation` implements the frozen protocol's two empirical attacks:
 

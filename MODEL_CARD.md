@@ -28,9 +28,17 @@ The registered evaluator reports accuracy, precision, recall, F1, ROC-AUC, and
 a confusion matrix at a fixed `0.5` threshold. The official IMDB test split is
 reserved as an untouched final test set.
 
-Comparative performance values are not published yet. A generated model should
-not be described as validated until the registered multi-seed IID/non-IID
-matrix has been completed and its provenance artifacts have been reviewed.
+The published campaign contains 36 runs across local-only, FedAvg, FedProx, and
+FedProx plus Huber aggregation; IID and two Dirichlet non-IID partitions; and
+three seeds. FedAvg achieved the highest mean accuracy in all three partitions:
+0.8876 on IID, 0.8639 at `α=0.5`, and 0.7094 at `α=0.1`. Complete metrics,
+per-seed records, confusion matrices, and provenance are published in
+[`results/portfolio-matrix.md`](results/portfolio-matrix.md) and
+[`results/portfolio-matrix.json`](results/portfolio-matrix.json).
+
+These results validate the registered configurations on the pinned IMDB test
+set. They do not establish performance on other domains, client populations,
+architectures, or privacy attacks.
 
 ## Limitations and risks
 
@@ -41,8 +49,10 @@ matrix has been completed and its provenance artifacts have been reviewed.
   sentiment reliably.
 - Model parameters, outputs, metrics, and the shared vocabulary can leak
   information about training data.
-- The deployment demo has no TLS, component authentication, secure aggregation,
-  formal differential privacy, or dashboard authentication.
+- The base deployment profile is loopback-only and unauthenticated. The secure
+  and production overlays add TLS, SuperNode authentication, and an authenticated
+  dashboard proxy, but secure aggregation and formal differential privacy remain
+  unimplemented.
 - Robust aggregators reduce selected outlier effects under registered
   assumptions; they do not establish Byzantine security.
 

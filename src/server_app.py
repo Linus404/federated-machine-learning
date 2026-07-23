@@ -765,7 +765,6 @@ class SentimentServer(FedProx):
                     }
                 )
 
-            # Artifact saving
             self.artifact_dir.mkdir(parents=True, exist_ok=True)
             model = build_model_from_manifest(self.app_manifest)
             aggregate_weights = parameters_to_ndarrays(parameters)

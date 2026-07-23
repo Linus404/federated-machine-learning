@@ -183,7 +183,7 @@ def _require_exact_fields(
 def validate_provenance_manifest(
     protocol: dict[str, Any], manifest: dict[str, Any]
 ) -> bytes:
-    """Validate the golden future-runner manifest and return canonical bytes.
+    """Validate the registered provenance manifest and return canonical bytes.
 
     Parameters
     ----------

@@ -1,9 +1,8 @@
-- prefer robustness
-- avoid redundancy
-- do step by step commits (do make to small steps) with consice and informing commit messages. Dont include AI artifacts such as confidence, ran tests, scope-risk, etc.
-- utilize python features to their fullest potentiell (dont overengineer)
-- comment unintuitive lines/sections
-- no meta comments
-- no shortcuts / dummys / temporary solutions / simplifications; production grade, fully accurate work
-- When writing commit messages, dont break a sentence with a new lines
-- Always apply NumPy style docstring with Args and Returns, etc.
+# Repository development standards
+
+- Prefer robust, non-redundant implementations.
+- Make small, focused commits with concise, informative one-line subjects.
+- Use Python language features where they improve clarity without adding unnecessary abstraction.
+- Comment only non-obvious behavior; avoid comments about the development process.
+- Do not commit placeholders or incomplete implementations.
+- Use NumPy-style docstrings with `Parameters`, `Returns`, and `Raises` sections where applicable.
