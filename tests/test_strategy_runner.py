@@ -10,6 +10,8 @@ import numpy as np
 from src.evaluation_artifact import load_scientific_protocol
 from src.strategy_runner import (
     RowSplit,
+    _convergence_round,
+    _parameter_payload_bytes,
     _run_federated,
     _run_local_only,
     _train_one_epoch,
@@ -171,6 +173,19 @@ class StrategyAggregationTests(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "finite"),
             ):
                 aggregate_model_weights(strategy, weights, self.counts)
+
+    def test_system_metrics_use_serialized_parameters_and_registered_convergence(
+        self,
+    ) -> None:
+        payload_size = _parameter_payload_bytes(self.weights[0])
+        curve = [
+            {"round": 0, "accuracy": 0.4},
+            {"round": 1, "accuracy": 0.8},
+            {"round": 2, "accuracy": 0.82},
+        ]
+
+        self.assertGreater(payload_size, sum(array.nbytes for array in self.weights[0]))
+        self.assertEqual(_convergence_round(curve), 1)
 
 
 class StrategyExecutionTests(unittest.TestCase):

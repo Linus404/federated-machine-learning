@@ -7,11 +7,13 @@ import json
 import shutil
 from pathlib import Path
 from statistics import fmean
+from time import perf_counter_ns
 from typing import Any, Mapping, TypeAlias
 
 import keras
 import numpy as np
 import tensorflow as tf
+from flwr.common import serde
 from flwr.common import Code, FitRes, Status, ndarrays_to_parameters
 from flwr.server.strategy.aggregate import (
     aggregate_inplace,
@@ -442,6 +444,44 @@ def _evaluation_record(
     }
 
 
+def _parameter_payload_bytes(weights: NDArrays) -> int:
+    """Return exact Flower ``Parameters`` protobuf bytes for model weights.
+
+    Parameters
+    ----------
+    weights : list of numpy.ndarray
+        Complete model tensors in model order.
+
+    Returns
+    -------
+    int
+        Serialized protobuf byte count, excluding message metadata and transport
+        framing.
+    """
+    return len(
+        serde.parameters_to_proto(ndarrays_to_parameters(weights)).SerializeToString()
+    )
+
+
+def _convergence_round(curve: list[dict[str, Any]]) -> int:
+    """Return the first round reaching 95 percent of peak validation accuracy.
+
+    Parameters
+    ----------
+    curve : list of dict of str to Any
+        Registered per-round validation records.
+
+    Returns
+    -------
+    int
+        Zero-based first qualifying round.
+    """
+    target = max(float(record["accuracy"]) for record in curve) * 0.95
+    return next(
+        int(record["round"]) for record in curve if float(record["accuracy"]) >= target
+    )
+
+
 class _LocalOnlyValidationCallback(keras.callbacks.Callback):
     """Record canonical validation metrics from each live epoch model."""
 
@@ -572,13 +612,17 @@ def _run_local_only(
             args.epochs,
         )
         callback = _LocalOnlyValidationCallback(validation_data, output_dir, client_id)
-        model.fit(
-            _EpochOrderedBatches(train_data, orders, args.batch_size),
-            callbacks=[callback],
-            epochs=args.epochs,
-            shuffle=False,
-            verbose=0 if args.quiet else 1,
-        )
+        started_at = perf_counter_ns()
+        try:
+            model.fit(
+                _EpochOrderedBatches(train_data, orders, args.batch_size),
+                callbacks=[callback],
+                epochs=args.epochs,
+                shuffle=False,
+                verbose=0 if args.quiet else 1,
+            )
+        finally:
+            training_time_ns = perf_counter_ns() - started_at
         models.append(model)
         clients.append(
             {
@@ -588,6 +632,7 @@ def _run_local_only(
                     "dropout": dropout_seed,
                     "model_initialization": model_seed,
                 },
+                "training_time_ns": training_time_ns,
                 "validation": callback.curve,
             }
         )
@@ -610,6 +655,11 @@ def _run_local_only(
             for metric in ("accuracy", "precision", "recall", "f1", "roc_auc")
         },
         "models": [client["model"] for client in clients],
+        "system": {
+            "training_time_ns": sum(
+                int(client["training_time_ns"]) for client in clients
+            )
+        },
     }
     return result, models
 
@@ -699,8 +749,14 @@ def _run_federated(
         else 0.0
     )
     curve = []
+    client_training_time_ns = 0
+    server_to_client_bytes = 0
+    client_to_server_bytes = 0
+    round_durations_ns: list[int] = []
     for round_index in range(args.epochs):
+        round_started_at = perf_counter_ns()
         round_start = global_model.get_weights()
+        server_to_client_bytes += _parameter_payload_bytes(round_start) * len(splits)
         client_weights = []
         for client_id, (split, train_data) in enumerate(
             zip(splits, tokenized, strict=True)
@@ -723,15 +779,21 @@ def _run_federated(
                 1,
                 round_index=round_index,
             )[0]
-            _train_one_epoch(
-                client_model,
-                train_data,
-                order,
-                args.batch_size,
-                proximal_mu=proximal_mu,
-                quiet=args.quiet,
-            )
-            client_weights.append(client_model.get_weights())
+            started_at = perf_counter_ns()
+            try:
+                _train_one_epoch(
+                    client_model,
+                    train_data,
+                    order,
+                    args.batch_size,
+                    proximal_mu=proximal_mu,
+                    quiet=args.quiet,
+                )
+            finally:
+                client_training_time_ns += perf_counter_ns() - started_at
+            updated_weights = client_model.get_weights()
+            client_to_server_bytes += _parameter_payload_bytes(updated_weights)
+            client_weights.append(updated_weights)
 
         global_model.set_weights(
             aggregate_model_weights(
@@ -755,6 +817,7 @@ def _run_federated(
                 ),
             }
         )
+        round_durations_ns.append(perf_counter_ns() - round_started_at)
 
     test = _evaluation_record(
         global_model,
@@ -770,6 +833,20 @@ def _run_federated(
             "validation": curve,
             "test": test,
             "models": ["global.keras"],
+            "system": {
+                "client_training_time_ns": client_training_time_ns,
+                "communication": {
+                    "scope": (
+                        "serialized Flower Parameters protobufs; excludes message "
+                        "metadata, TLS, and transport framing"
+                    ),
+                    "server_to_client_bytes": server_to_client_bytes,
+                    "client_to_server_bytes": client_to_server_bytes,
+                    "total_bytes": server_to_client_bytes + client_to_server_bytes,
+                },
+                "convergence_round": _convergence_round(curve),
+                "round_duration_ns": round_durations_ns,
+            },
         },
         [global_model],
     )
