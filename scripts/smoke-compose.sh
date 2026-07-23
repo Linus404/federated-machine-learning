@@ -14,53 +14,43 @@ fi
 
 project="fml-smoke-$$"
 home_dir="$(mktemp -d)"
+network="${project}-default"
 export FML_CONTROL_BIND="127.0.0.1:0"
 export FML_DASHBOARD_BIND="127.0.0.1:0"
 export FML_PREPARED_ARTIFACT_ROOT
 FML_PREPARED_ARTIFACT_ROOT="$(realpath "$prepared_root")"
-cleanup() {
-  "${compose[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
-  rm -r "$home_dir"
-}
-
-existing_subnets="$(
-  docker network inspect $(docker network ls -q) \
-    --format '{{range .IPAM.Config}}{{println .Subnet}}{{end}}'
-)"
-subnet="$(
-  python3 - "$existing_subnets" <<'PY'
-import ipaddress
-import sys
-
-existing = []
-for value in sys.argv[1].split():
-    try:
-        existing.append(ipaddress.ip_network(value))
-    except ValueError:
-        pass
-for octet in range(240, 256):
-    candidate = ipaddress.ip_network(f"10.{octet}.0.0/24")
-    if not any(candidate.overlaps(network) for network in existing):
-        print(candidate)
-        break
-else:
-    raise SystemExit("no isolated smoke-test subnet is available")
-PY
-)"
-cat >"$home_dir/network.yaml" <<EOF
-networks:
-  default:
-    ipam:
-      config:
-        - subnet: "$subnet"
-EOF
 compose=(
   docker compose
   -f compose.yaml
   -f "$home_dir/network.yaml"
   -p "$project"
 )
+cleanup() {
+  "${compose[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
+  docker network remove "$network" >/dev/null 2>&1 || true
+  rm -r "$home_dir"
+}
 trap cleanup EXIT
+
+subnet=""
+for octet in {240..255}; do
+  candidate="10.$octet.0.0/24"
+  if docker network create --subnet "$candidate" "$network" >/dev/null 2>&1; then
+    subnet="$candidate"
+    break
+  fi
+done
+if [[ -z "$subnet" ]]; then
+  echo "ERROR: no isolated smoke-test subnet is available." >&2
+  exit 1
+fi
+
+cat >"$home_dir/network.yaml" <<EOF
+networks:
+  default:
+    external: true
+    name: "$network"
+EOF
 
 "${compose[@]}" config --quiet
 "${compose[@]}" build

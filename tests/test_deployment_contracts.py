@@ -163,6 +163,14 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         self.assertIn(".git", dockerignore)
         self.assertNotIn("COPY .git", dockerfile)
 
+    def test_smoke_network_allocation_is_atomic(self) -> None:
+        smoke_script = Path("scripts/smoke-compose.sh").read_text(encoding="utf-8")
+
+        self.assertIn('docker network create --subnet "$candidate"', smoke_script)
+        self.assertIn('docker network remove "$network"', smoke_script)
+        self.assertIn("external: true", smoke_script)
+        self.assertNotIn("docker network inspect", smoke_script)
+
     def test_image_includes_runtime_scientific_protocol(self) -> None:
         dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
 
