@@ -4,6 +4,18 @@ This research demo simulates competing streaming platforms that jointly train a
 sentiment classifier. The local data-preparation command centrally creates all
 demo shards; it does not demonstrate ingestion from independent data owners.
 
+## Project scope
+
+This university-origin pet project demonstrates reproducible local federated
+learning experiments, artifact handling, and honest security and privacy
+boundaries. It assumes a trusted single-user operator, a local filesystem, and
+centrally prepared demo data.
+
+The finish line is a compact IID/non-IID comparison, a runnable local
+end-to-end demo, and published results and limitations. Production transport,
+authentication, monitoring, disaster recovery, cloud hardening, and large-scale
+deployment are intentionally out of scope.
+
 ## Project setup
 
 This project uses [uv](https://docs.astral.sh/uv/) to manage Python versions and dependencies.
@@ -95,9 +107,9 @@ trained model files plus canonical `results.json` with the effective inputs. The
 CLI enforces four clients, 20 epochs, batch size 64, validation fraction 0.2, and
 one of the five frozen seeds; seed 67 is the default. Later experiment-matrix
 work executes the remaining registered seeds and non-IID partitions.
-The current baseline validation curves remain Keras loss/accuracy history; the
-experiment runner must evaluate the fixed validation rows through the canonical
-evaluator after every epoch before claiming complete protocol conformance.
+The baseline validation curves remain Keras loss/accuracy history. The strategy
+runner below instead evaluates the fixed validation rows through the canonical
+evaluator after every epoch or round.
 
 Run one four-client IID strategy contract with live canonical validation after
 every local-only epoch or federated round:
@@ -110,8 +122,9 @@ The accepted strategy names are `local_only`, `fedavg`, `fedprox`,
 `fedprox_huber`, `fedmedian`, and `fedtrimmedavg`. Each output directory must be
 new. This runner saves the model, direct per-epoch or per-round float32
 validation predictions, final untouched-test predictions, and `results.json`.
-It intentionally runs one `iid_stratified` seed cell at a time; later matrix
-work adds non-IID partitions, client scales, threats, and comparative summaries.
+It intentionally runs one `iid_stratified` seed cell at a time. Follow-up work is
+limited to the compact multi-seed IID/non-IID comparison and its published
+summary.
 
 ## Direct Flower simulation
 
