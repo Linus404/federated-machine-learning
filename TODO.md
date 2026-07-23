@@ -62,7 +62,7 @@ federated learning system.
 - [x] Test invalid model updates, incompatible tensor shapes, NaN values, and empty aggregation inputs.
 - [x] Add dashboard tests for metric loading, inference errors, and missing artifacts.
 - [x] Test model save/load compatibility.
-- [ ] Add a supported Python and operating-system test matrix.
+- [x] Add a supported Python and operating-system test matrix.
 - [ ] Add deployment-script tests or dry-run validation.
 
 ## P1 — Observability and experiment lifecycle

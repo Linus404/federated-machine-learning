@@ -287,8 +287,9 @@ uv run --env-file .env.protocol coverage report
 docker compose config --quiet
 ```
 
-CI validates Python 3.11, 3.12, and 3.13, scans dependencies and containers, and
-builds and smoke-tests the application image.
+CI runs the test suite with Python 3.11, 3.12, and 3.13 on Linux and macOS,
+scans dependencies and containers, and builds and smoke-tests the application
+image.
 
 The Docker base image is pinned by digest. Dependabot checks the retained tag
 weekly; base-image updates must pass the container build, smoke test, and
