@@ -247,6 +247,31 @@ def global_model_path(artifact_dir: str | Path) -> Path:
     return resolve_dir(artifact_dir) / "global_model.keras"
 
 
+def checkpoint_path(artifact_dir: str | Path, server_round: int) -> Path:
+    """Return the immutable model checkpoint path for one completed fit round.
+
+    Parameters
+    ----------
+    artifact_dir : str or pathlib.Path
+        Server run artifact directory.
+    server_round : int
+        Positive one-based Flower server round.
+
+    Returns
+    -------
+    pathlib.Path
+        Round-specific NumPy checkpoint path.
+
+    Raises
+    ------
+    ValueError
+        If ``server_round`` is not a positive built-in integer.
+    """
+    if type(server_round) is not int or server_round <= 0:
+        raise ValueError("server_round must be a positive built-in integer")
+    return resolve_dir(artifact_dir) / f"checkpoint-round-{server_round:06d}.npz"
+
+
 def metrics_path(artifact_dir: str | Path) -> Path:
     return resolve_dir(artifact_dir) / "metrics.csv"
 

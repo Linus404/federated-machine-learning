@@ -71,7 +71,7 @@ federated learning system.
 - [x] Persist the complete run configuration and environment metadata with each run.
 - [x] Add structured application logs with consistent levels and context.
 - [ ] Record client availability, failures, round duration, and communication metrics.
-- [ ] Add model checkpoints and documented resume behavior.
+- [x] Add model checkpoints and documented resume behavior.
 - [x] Introduce model and artifact versioning with retention rules.
 - [x] Preserve experiment history instead of relying on manually selected artifact directories.
 - [x] Add health checks for containers and deployed services.

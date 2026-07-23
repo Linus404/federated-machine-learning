@@ -40,6 +40,24 @@ docker compose up -d
 Verify `docker compose ps`, the service health checks, the dashboard, and the
 selected run's artifact checksums after restoration.
 
+## Checkpoints and resume
+
+The server writes `checkpoint-round-XXXXXX.npz` after every successful
+aggregation. A checkpoint is immutable once its run is complete and is covered
+by the run's artifact checksums.
+
+Resume from an explicit checkpoint with:
+
+```bash
+uv run --env-file .env.protocol flwr run . --stream \
+  --run-config "resume-from-checkpoint='artifacts/server/runs/<run-id>/checkpoint-round-000010.npz'"
+```
+
+Resume starts a new run, resets Flower round and metric numbering, and executes
+the configured number of additional rounds. It restores global model tensors
+only; client-local state and optimizer state are intentionally not shared by
+the current federated protocol. The source run is never modified.
+
 ## Rollback and disaster recovery
 
 Before an update, record `git rev-parse HEAD` and

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import csv
+import io
 import logging
 import math
+import os
+import tempfile
 import warnings
 from numbers import Real
 from pathlib import Path
@@ -27,7 +30,11 @@ from src.artifact_history import (
     prune_run_history,
     publish_completed_run,
 )
-from src.artifact_compatibility import write_server_artifact_manifest
+from src.artifact_compatibility import (
+    load_server_artifact_snapshot,
+    read_regular_file,
+    write_server_artifact_manifest,
+)
 from src.huber_strategy import (
     DEFAULT_HUBER_THRESHOLD,
     _flatten,
@@ -38,6 +45,7 @@ from src.local_training import build_model_from_manifest
 from src.paths import (
     RunArtifactLock,
     acquire_run_artifact_lock,
+    checkpoint_path,
     client_metrics_path,
     default_server_artifact_dir,
     global_model_path,
@@ -310,6 +318,102 @@ def _validate_aggregated_parameters(
             raise ValueError("aggregate model weights must contain finite values")
 
 
+def _write_checkpoint(
+    artifact_dir: Path, server_round: int, weights: list[np.ndarray]
+) -> Path:
+    """Atomically persist one round's ordered model tensors.
+
+    Parameters
+    ----------
+    artifact_dir : pathlib.Path
+        Active server run artifact directory.
+    server_round : int
+        Positive one-based Flower server round.
+    weights : list of numpy.ndarray
+        Validated model weights in model order.
+
+    Returns
+    -------
+    pathlib.Path
+        Published checkpoint path.
+    """
+    path = checkpoint_path(artifact_dir, server_round)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.parent.is_symlink() or not path.parent.is_dir():
+        raise ValueError("checkpoint directory must be a regular directory")
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w+b",
+            dir=path.parent,
+            prefix=".checkpoint-",
+            suffix=".npz",
+            delete=False,
+        ) as file:
+            temporary_path = Path(file.name)
+            np.savez(file, *weights)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+    return path
+
+
+def _load_checkpoint(
+    path: str | Path,
+    app_manifest: Any,
+    expected_weight_shapes: tuple[tuple[int, ...], ...],
+) -> list[np.ndarray]:
+    """Load a compatible checkpoint with the exact runtime tensor contract.
+
+    Parameters
+    ----------
+    path : str or pathlib.Path
+        Explicit ``checkpoint-round-XXXXXX.npz`` path from an earlier run.
+    app_manifest : Any
+        Validated public application manifest for the new run.
+    expected_weight_shapes : tuple of tuple of int
+        Required model-weight shapes in model order.
+
+    Returns
+    -------
+    list of numpy.ndarray
+        Validated checkpoint tensors in model order.
+
+    Raises
+    ------
+    ValueError
+        If the source layout, public-artifact binding, archive, or any tensor is
+        incompatible.
+    """
+    resolved = resolve_dir(path)
+    round_text = resolved.stem.removeprefix("checkpoint-round-")
+    if (
+        not round_text.isdecimal()
+        or int(round_text) <= 0
+        or resolved.name != f"checkpoint-round-{int(round_text):06d}.npz"
+    ):
+        raise ValueError("resume checkpoint must be a generated round checkpoint")
+    source_run_dir = resolved.parent
+    load_server_artifact_snapshot(source_run_dir, app_manifest=app_manifest)
+    try:
+        content = read_regular_file(resolved, parent=resolved.parent)
+        with np.load(io.BytesIO(content), allow_pickle=False) as archive:
+            expected_names = [
+                f"arr_{index}" for index in range(len(expected_weight_shapes))
+            ]
+            if archive.files != expected_names:
+                raise ValueError("checkpoint tensor count or order is invalid")
+            weights = [archive[name].copy() for name in expected_names]
+    except (OSError, ValueError) as error:
+        raise ValueError("resume checkpoint is missing, unsafe, or invalid") from error
+    parameters = ndarrays_to_parameters(weights)
+    _validate_aggregated_parameters(parameters, expected_weight_shapes)
+    return weights
+
+
 class SentimentServer(FedProx):
     """Run FedProx with optional experimental Huber aggregation and artifacts."""
 
@@ -457,8 +561,10 @@ class SentimentServer(FedProx):
             # Artifact saving
             self.artifact_dir.mkdir(parents=True, exist_ok=True)
             model = build_model_from_manifest(self.app_manifest)
-            model.set_weights(parameters_to_ndarrays(parameters))
+            aggregate_weights = parameters_to_ndarrays(parameters)
+            model.set_weights(aggregate_weights)
             model.save(str(self.model_path))
+            _write_checkpoint(self.artifact_dir, server_round, aggregate_weights)
             log_event(
                 self.logger,
                 logging.INFO,
@@ -583,6 +689,7 @@ def create_strategy(
     proximal_mu: float = 0.1,
     use_huber: bool = False,
     huber_threshold: float = DEFAULT_HUBER_THRESHOLD,
+    resume_from_checkpoint: str | Path | None = None,
 ) -> SentimentServer:
     """Create the deployment strategy with exact-round validation.
 
@@ -608,6 +715,10 @@ def create_strategy(
         Whether to replace sample-weighted averaging with Huber aggregation.
     huber_threshold : float, optional
         Positive Huber residual threshold.
+    resume_from_checkpoint : str or pathlib.Path or None, optional
+        Explicit checkpoint from an earlier run. Resume starts a new immutable run,
+        uses these weights as round-zero parameters, and executes ``final_round`` new
+        rounds; metrics and round numbers do not continue from the source run.
 
     Returns
     -------
@@ -628,6 +739,11 @@ def create_strategy(
     )
     initial_model = build_model_from_manifest(app_manifest)
     initial_weights = initial_model.get_weights()
+    expected_weight_shapes = tuple(weight.shape for weight in initial_weights)
+    if resume_from_checkpoint is not None:
+        initial_weights = _load_checkpoint(
+            resume_from_checkpoint, app_manifest, expected_weight_shapes
+        )
 
     strategy = SentimentServer(
         proximal_mu=proximal_mu,
@@ -650,7 +766,7 @@ def create_strategy(
         evaluate_metrics_aggregation_fn=weighted_average,
     )
     strategy.expected_client_ids = frozenset(range(min_clients))
-    strategy.expected_weight_shapes = tuple(weight.shape for weight in initial_weights)
+    strategy.expected_weight_shapes = expected_weight_shapes
     return strategy
 
 
@@ -671,6 +787,13 @@ def server_fn(context: Context) -> ServerAppComponents:
     ------
     ValueError
         If numeric settings or artifact directory boundaries are invalid.
+
+    Notes
+    -----
+    ``resume-from-checkpoint`` names an explicit checkpoint file. Resuming creates a
+    separate run, resets metrics and Flower round numbering, and performs the
+    configured number of new rounds. The source run and completed publications are
+    never modified.
     """
     run_config: dict[str, Any] = context.run_config
     artifact_root = resolve_dir(
@@ -704,7 +827,6 @@ def server_fn(context: Context) -> ServerAppComponents:
             public_artifact_dir=public_artifact_dir,
             flower_run_id=getattr(context, "run_id", None),
         )
-        prune_run_history(artifact_root, retention_runs, active_run_dir=run_dir)
         strategy = create_strategy(
             min_clients=expected_clients,
             artifact_dir=run_dir,
@@ -718,7 +840,9 @@ def server_fn(context: Context) -> ServerAppComponents:
             huber_threshold=float(
                 run_config.get("huber-threshold", DEFAULT_HUBER_THRESHOLD)
             ),
+            resume_from_checkpoint=run_config.get("resume-from-checkpoint"),
         )
+        prune_run_history(artifact_root, retention_runs, active_run_dir=run_dir)
         strategy.logger = structured_logger("server")
         log_event(
             strategy.logger,

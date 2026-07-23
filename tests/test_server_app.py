@@ -832,5 +832,76 @@ class MetricAggregationTests(unittest.TestCase):
                 self.assertFalse(strategy.client_metrics_path.exists())
 
 
+class ServerCheckpointTests(unittest.TestCase):
+    def test_checkpoint_round_trip_preserves_exact_tensor_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = Path(tmpdir) / "runs" / "source"
+            manifest = cast(Any, fake_app_manifest())
+            server_app.write_server_artifact_manifest(run_dir, app_manifest=manifest)
+            weights = [
+                np.array([[1.0, 2.0]], dtype=np.float32),
+                np.array([3.0], dtype=np.float32),
+            ]
+
+            path = server_app._write_checkpoint(run_dir, 7, weights)
+            loaded = server_app._load_checkpoint(path, manifest, ((1, 2), (1,)))
+
+            self.assertEqual(path.name, "checkpoint-round-000007.npz")
+            for actual, expected in zip(loaded, weights, strict=True):
+                np.testing.assert_array_equal(actual, expected)
+            (run_dir / "global_model.keras").write_bytes(b"model")
+            (run_dir / "metrics.csv").write_text("round,loss,accuracy\n")
+            (run_dir / "run_manifest.json").write_text("{}")
+            server_app.write_server_artifact_manifest(run_dir, finalized=True)
+            snapshot = server_app.load_server_artifact_snapshot(run_dir)
+            self.assertIn(path.name, snapshot.files)
+
+    def test_resume_rejects_incompatible_binding_and_tensors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = Path(tmpdir) / "runs" / "source"
+            manifest = cast(Any, fake_app_manifest())
+            server_app.write_server_artifact_manifest(run_dir, app_manifest=manifest)
+            path = server_app._write_checkpoint(
+                run_dir, 1, [np.array([1.0], dtype=np.float64)]
+            )
+
+            with self.assertRaisesRegex(ValueError, "exactly float32"):
+                server_app._load_checkpoint(path, manifest, ((1,),))
+
+            incompatible = fake_app_manifest()
+            incompatible.manifest_bytes = b"different public manifest\n"
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                server_app._load_checkpoint(path, incompatible, ((1,),))
+
+    def test_create_strategy_uses_checkpoint_as_initial_parameters(self) -> None:
+        model = Mock()
+        model.get_weights.return_value = [
+            np.zeros(2, dtype=np.float32),
+            np.zeros(1, dtype=np.float32),
+        ]
+        resumed = [
+            np.array([1.0, 2.0], dtype=np.float32),
+            np.array([3.0], dtype=np.float32),
+        ]
+        strategy = SimpleNamespace()
+
+        with (
+            patch.object(server_app, "load_app_manifest", return_value=object()),
+            patch.object(server_app, "build_model_from_manifest", return_value=model),
+            patch.object(server_app, "_load_checkpoint", return_value=resumed) as load,
+            patch.object(
+                server_app, "SentimentServer", return_value=strategy
+            ) as server_type,
+        ):
+            server_app.create_strategy(resume_from_checkpoint="source.npz")
+
+        load.assert_called_once_with("source.npz", unittest.mock.ANY, ((2,), (1,)))
+        initial = parameters_to_ndarrays(
+            server_type.call_args.kwargs["initial_parameters"]
+        )
+        for actual, expected in zip(initial, resumed, strict=True):
+            np.testing.assert_array_equal(actual, expected)
+
+
 if __name__ == "__main__":
     unittest.main()
