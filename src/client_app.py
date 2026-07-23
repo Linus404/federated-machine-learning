@@ -22,7 +22,7 @@ from src.local_training import (
     load_client_shard,
 )
 from src.paths import resolve_dir
-from src.structured_logging import structured_logger
+from src.structured_logging import log_event, structured_logger
 
 UPDATE_NOISE_L2_NORM_CLIP = 1.0
 UPDATE_NOISE_MULTIPLIER = 0.001
@@ -216,18 +216,15 @@ class SentimentClient(NumPyClient):
             name: float(values[-1]) for name, values in history.history.items()
         }
         metrics["client_id"] = self.client_id
-        if self.logger is not None:
-            self.logger.info(
-                "client fit completed",
-                extra={
-                    "context": {
-                        "event": "fit_completed",
-                        "client_id": self.client_id,
-                        "examples": len(self.train_data[0]),
-                        "update_noise": self.use_update_noise,
-                    }
-                },
-            )
+        log_event(
+            self.logger,
+            logging.INFO,
+            "client fit completed",
+            "fit_completed",
+            client_id=self.client_id,
+            examples=len(self.train_data[0]),
+            update_noise=self.use_update_noise,
+        )
 
         return weights, len(self.train_data[0]), metrics
 
@@ -237,19 +234,16 @@ class SentimentClient(NumPyClient):
         """Evaluate the global model on this client's validation split."""
         self.model.set_weights(parameters)
         loss, accuracy = self.model.evaluate(*self.val_data, verbose=0)
-        if self.logger is not None:
-            self.logger.info(
-                "client evaluation completed",
-                extra={
-                    "context": {
-                        "event": "evaluation_completed",
-                        "client_id": self.client_id,
-                        "examples": len(self.val_data[0]),
-                        "loss": float(loss),
-                        "accuracy": float(accuracy),
-                    }
-                },
-            )
+        log_event(
+            self.logger,
+            logging.INFO,
+            "client evaluation completed",
+            "evaluation_completed",
+            client_id=self.client_id,
+            examples=len(self.val_data[0]),
+            loss=float(loss),
+            accuracy=float(accuracy),
+        )
 
         return (
             float(loss),
@@ -285,15 +279,13 @@ def client_fn(context: Any) -> Any:
         ),
     )
     client.logger = structured_logger("client")
-    client.logger.info(
+    log_event(
+        client.logger,
+        logging.INFO,
         "client ready",
-        extra={
-            "context": {
-                "event": "client_ready",
-                "client_id": partition,
-                "data_directory": str(client_data_dir),
-            }
-        },
+        "client_ready",
+        client_id=partition,
+        data_directory=str(client_data_dir),
     )
     return client.to_client()
 

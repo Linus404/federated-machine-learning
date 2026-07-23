@@ -61,3 +61,42 @@ def structured_logger(component: str) -> logging.Logger:
         handler.setFormatter(JsonFormatter())
         logger.addHandler(handler)
     return logger
+
+
+def log_event(
+    logger: logging.Logger | None,
+    level: int,
+    message: str,
+    event: str,
+    *,
+    exc_info: bool = False,
+    **context: Any,
+) -> None:
+    """Log one event when a component logger is configured.
+
+    Parameters
+    ----------
+    logger : logging.Logger or None
+        Destination logger, or ``None`` outside an application lifecycle.
+    level : int
+        Standard-library logging level.
+    message : str
+        Human-readable event summary.
+    event : str
+        Stable machine-readable event name.
+    exc_info : bool, optional
+        Whether to include the active exception traceback.
+    **context : Any
+        Additional machine-readable event fields.
+
+    Returns
+    -------
+    None
+    """
+    if logger is not None:
+        logger.log(
+            level,
+            message,
+            extra={"context": {"event": event, **context}},
+            exc_info=exc_info,
+        )
