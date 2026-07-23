@@ -173,8 +173,8 @@ FML_SERVER_ARTIFACT_DIR=artifacts/server \
 Distributed Compose demonstration:
 
 ```bash
-FML_PREPARED_ARTIFACT_ROOT=artifacts/portfolio-data/.prepared-current \
-  docker compose up --build -d --wait
+export FML_PREPARED_ARTIFACT_ROOT=artifacts/portfolio-data/.prepared-current
+FML_CODE_REVISION="$(git rev-parse HEAD)" docker compose up --build -d --wait
 uv run --env-file .env.protocol python -m src.flower_config
 uv run --env-file .env.protocol flwr run . local-docker --stream
 ```
