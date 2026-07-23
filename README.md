@@ -95,6 +95,9 @@ trained model files plus canonical `results.json` with the effective inputs. The
 CLI enforces four clients, 20 epochs, batch size 64, validation fraction 0.2, and
 one of the five frozen seeds; seed 67 is the default. Later experiment-matrix
 work executes the remaining registered seeds and non-IID partitions.
+The current baseline validation curves remain Keras loss/accuracy history; the
+experiment runner must evaluate the fixed validation rows through the canonical
+evaluator after every epoch before claiming complete protocol conformance.
 
 ## Direct Flower simulation
 
