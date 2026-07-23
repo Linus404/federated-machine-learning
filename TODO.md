@@ -49,8 +49,8 @@ federated learning system.
 
 ## P1 — Reliability and testing
 
-- [ ] Add a real end-to-end Flower test with multiple clients and at least one training round.
-- [ ] Add a containerized end-to-end smoke test.
+- [x] Add a real end-to-end Flower test with multiple clients and at least one training round.
+- [x] Add a containerized end-to-end smoke test.
 - [x] Make the required client count configurable throughout server and deployment code.
 - [x] Test partial client participation, disconnects, timeouts, and failed rounds.
 - [x] Test malformed, missing, incompatible, and corrupted manifests and artifacts.

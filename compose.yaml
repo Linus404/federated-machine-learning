@@ -75,7 +75,7 @@ services:
       retries: 12
       start_period: 10s
     ports:
-      - "127.0.0.1:9093:9093"
+      - "${FML_CONTROL_BIND:-127.0.0.1:9093}:9093"
     volumes:
       - superlink-state:/app/state
 
@@ -96,8 +96,8 @@ services:
       superlink:
         condition: service_healthy
     volumes:
-      - ./artifacts/.prepared-current/public:/app/artifacts/public:ro
-      - server-artifacts:/app/artifacts/server
+      - ${FML_PREPARED_ARTIFACT_ROOT:-./artifacts/.prepared-current}/public:/app/artifacts/public:ro
+      - server-artifacts:/app/artifacts
 
   supernode-0:
     <<: *supernode
@@ -127,9 +127,9 @@ services:
       supernode-0:
         condition: service_healthy
     volumes:
-      - ./artifacts/.prepared-current/public:/app/artifacts/public:ro
+      - ${FML_PREPARED_ARTIFACT_ROOT:-./artifacts/.prepared-current}/public:/app/artifacts/public:ro
       - type: bind
-        source: ./artifacts/.prepared-current/client/client-0
+        source: ${FML_PREPARED_ARTIFACT_ROOT:-./artifacts/.prepared-current}/client/client-0
         target: /app/client-data
         read_only: true
 
@@ -161,9 +161,9 @@ services:
       supernode-1:
         condition: service_healthy
     volumes:
-      - ./artifacts/.prepared-current/public:/app/artifacts/public:ro
+      - ${FML_PREPARED_ARTIFACT_ROOT:-./artifacts/.prepared-current}/public:/app/artifacts/public:ro
       - type: bind
-        source: ./artifacts/.prepared-current/client/client-1
+        source: ${FML_PREPARED_ARTIFACT_ROOT:-./artifacts/.prepared-current}/client/client-1
         target: /app/client-data
         read_only: true
 
@@ -195,9 +195,9 @@ services:
       supernode-2:
         condition: service_healthy
     volumes:
-      - ./artifacts/.prepared-current/public:/app/artifacts/public:ro
+      - ${FML_PREPARED_ARTIFACT_ROOT:-./artifacts/.prepared-current}/public:/app/artifacts/public:ro
       - type: bind
-        source: ./artifacts/.prepared-current/client/client-2
+        source: ${FML_PREPARED_ARTIFACT_ROOT:-./artifacts/.prepared-current}/client/client-2
         target: /app/client-data
         read_only: true
 
@@ -229,9 +229,9 @@ services:
       supernode-3:
         condition: service_healthy
     volumes:
-      - ./artifacts/.prepared-current/public:/app/artifacts/public:ro
+      - ${FML_PREPARED_ARTIFACT_ROOT:-./artifacts/.prepared-current}/public:/app/artifacts/public:ro
       - type: bind
-        source: ./artifacts/.prepared-current/client/client-3
+        source: ${FML_PREPARED_ARTIFACT_ROOT:-./artifacts/.prepared-current}/client/client-3
         target: /app/client-data
         read_only: true
 
@@ -260,10 +260,10 @@ services:
       FML_PUBLIC_ARTIFACT_DIR: /app/artifacts/public
       FML_SERVER_ARTIFACT_DIR: /app/artifacts/server
     ports:
-      - "127.0.0.1:8501:8501"
+      - "${FML_DASHBOARD_BIND:-127.0.0.1:8501}:8501"
     volumes:
-      - ./artifacts/.prepared-current/public:/app/artifacts/public:ro
-      - server-artifacts:/app/artifacts/server:ro
+      - ${FML_PREPARED_ARTIFACT_ROOT:-./artifacts/.prepared-current}/public:/app/artifacts/public:ro
+      - server-artifacts:/app/artifacts:ro
 
 volumes:
   server-artifacts:

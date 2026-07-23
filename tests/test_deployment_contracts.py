@@ -52,8 +52,14 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         self.assertEqual(services, expected)
 
     def test_host_ports_are_published_on_loopback_only(self) -> None:
-        self.assertIn('"127.0.0.1:9093:9093"', service_block(self.compose, "superlink"))
-        self.assertIn('"127.0.0.1:8501:8501"', service_block(self.compose, "dashboard"))
+        self.assertIn(
+            '"${FML_CONTROL_BIND:-127.0.0.1:9093}:9093"',
+            service_block(self.compose, "superlink"),
+        )
+        self.assertIn(
+            '"${FML_DASHBOARD_BIND:-127.0.0.1:8501}:8501"',
+            service_block(self.compose, "dashboard"),
+        )
 
     def test_dashboard_enables_browser_request_protections(self) -> None:
         dashboard = service_block(self.compose, "dashboard")
@@ -214,7 +220,10 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         for index in range(4):
             clientapp = service_block(self.compose, f"clientapp-{index}")
             with self.subTest(index=index):
-                source = f"source: ./artifacts/.prepared-current/client/client-{index}"
+                source = (
+                    "source: ${FML_PREPARED_ARTIFACT_ROOT:-"
+                    f"./artifacts/.prepared-current}}/client/client-{index}"
+                )
                 self.assertIn(source, clientapp)
                 self.assertEqual(
                     self.compose.count(source),
@@ -250,7 +259,8 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         for service in consumers:
             with self.subTest(service=service):
                 self.assertIn(
-                    "./artifacts/.prepared-current/public:/app/artifacts/public:ro",
+                    "${FML_PREPARED_ARTIFACT_ROOT:-./artifacts/.prepared-current}"
+                    "/public:/app/artifacts/public:ro",
                     service_block(self.compose, service),
                 )
         for service in ["superlink"] + [f"supernode-{index}" for index in range(4)]:
@@ -272,11 +282,11 @@ class DistributedDeploymentContractTests(unittest.TestCase):
 
     def test_server_outputs_have_one_writer_and_read_only_dashboard(self) -> None:
         self.assertIn(
-            "server-artifacts:/app/artifacts/server\n",
+            "server-artifacts:/app/artifacts\n",
             service_block(self.compose, "serverapp"),
         )
         self.assertIn(
-            "server-artifacts:/app/artifacts/server:ro",
+            "server-artifacts:/app/artifacts:ro",
             service_block(self.compose, "dashboard"),
         )
         self.assertIn("server-artifacts:", self.compose)
