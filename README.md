@@ -310,3 +310,5 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a change.
 
 [`TODO.md`](TODO.md) tracks the remaining experiment matrix, published results,
 end-to-end reliability evidence, privacy experiments, and deployment controls.
+[`OPERATIONS.md`](OPERATIONS.md) defines local backup, restore, rollback,
+disaster-recovery, cost, and teardown procedures.

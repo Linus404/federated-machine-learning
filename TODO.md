@@ -76,7 +76,7 @@ federated learning system.
 - [x] Preserve experiment history instead of relying on manually selected artifact directories.
 - [x] Add health checks for containers and deployed services.
 - [ ] Add monitoring dashboards and alerts for deployed runs.
-- [ ] Define backup, restore, rollback, and disaster-recovery procedures.
+- [x] Define backup, restore, rollback, and disaster-recovery procedures.
 
 ## P1 — Deployment hardening
 
@@ -90,7 +90,7 @@ federated learning system.
 - [ ] Replace ad-hoc cloud provisioning with reviewed infrastructure as code.
 - [ ] Separate development, staging, and production configuration.
 - [ ] Add centralized log collection and deployment audit trails.
-- [ ] Document cost estimates and teardown safeguards.
+- [x] Document cost estimates and teardown safeguards.
 
 ## P1 — Portfolio presentation
 
