@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import dashboard
 import numpy as np
@@ -41,6 +41,41 @@ def write_server_manifest(path: Path, version: int | None) -> None:
 
 
 class DashboardArtifactTests(unittest.TestCase):
+    def test_prediction_rejects_malformed_model_outputs(self) -> None:
+        """Reject invalid inference outputs before rendering them.
+
+        Returns
+        -------
+        None
+        """
+        manifest = fake_app_manifest()
+        manifest.vocabulary_terms = ("", "[UNK]")
+        for output in (
+            np.array([0.5]),
+            np.array([[np.nan]]),
+            np.array([[1.1]]),
+            np.array([["invalid"]]),
+        ):
+            with self.subTest(output=output):
+                model = MagicMock()
+                model.predict.return_value = output
+                with (
+                    patch.object(dashboard, "validate_protocol_runtime"),
+                    patch.object(
+                        dashboard,
+                        "load_app_manifest",
+                        return_value=manifest,
+                    ),
+                    patch.object(dashboard, "_load_bound_model", return_value=model),
+                    patch.object(
+                        dashboard,
+                        "create_text_vectorizer",
+                        return_value=lambda inputs: inputs,
+                    ),
+                    self.assertRaisesRegex(ValueError, "prediction"),
+                ):
+                    dashboard.predict_sentiment("A review")
+
     def test_metrics_loader_treats_only_a_fresh_root_as_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

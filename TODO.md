@@ -60,7 +60,7 @@ federated learning system.
 - [ ] Test partial client participation, disconnects, timeouts, and failed rounds.
 - [x] Test malformed, missing, incompatible, and corrupted manifests and artifacts.
 - [x] Test invalid model updates, incompatible tensor shapes, NaN values, and empty aggregation inputs.
-- [ ] Add dashboard tests for metric loading, inference errors, and missing artifacts.
+- [x] Add dashboard tests for metric loading, inference errors, and missing artifacts.
 - [x] Test model save/load compatibility.
 - [ ] Add a supported Python and operating-system test matrix.
 - [ ] Add deployment-script tests or dry-run validation.

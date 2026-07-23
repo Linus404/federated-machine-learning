@@ -6,6 +6,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Mapping
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -252,8 +253,17 @@ def predict_sentiment(review_text: str) -> tuple[float, str]:
     )
     inputs = tf.constant([review_text])
     token_ids = vectorizer(inputs)
-    preds = model.predict(token_ids, verbose=0)
-    positive_prob = float(preds[0][0])
+    try:
+        predictions = np.asarray(model.predict(token_ids, verbose=0), dtype=np.float64)
+    except (TypeError, ValueError) as error:
+        raise ValueError("model returned a non-numeric prediction") from error
+    if (
+        predictions.shape != (1, 1)
+        or not np.isfinite(predictions[0, 0])
+        or not 0.0 <= predictions[0, 0] <= 1.0
+    ):
+        raise ValueError("model prediction must be one finite probability in [0, 1]")
+    positive_prob = float(predictions[0, 0])
     label = "positive" if positive_prob >= 0.5 else "negative"
     return positive_prob, label
 
