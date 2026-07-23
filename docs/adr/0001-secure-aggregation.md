@@ -95,7 +95,8 @@ a compromised client endpoint.
 The Simulation Engine can establish functional and dropout behavior with virtual
 clients, but it does not demonstrate independent administrative boundaries or
 multi-host confidentiality. Deployment validation must use separate SuperNodes
-with TLS and authentication; the current loopback Compose deployment has neither.
+with TLS and authentication. The base loopback profile has neither; the reviewed
+secure overlay provides both without changing the secure-aggregation decision.
 
 ## Prerequisites and acceptance evidence
 

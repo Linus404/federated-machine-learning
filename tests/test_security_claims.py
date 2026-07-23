@@ -13,6 +13,7 @@ DOCUMENTS = (
     ROOT / "COMPATIBILITY.md",
     ROOT / "CONTRIBUTING.md",
     ROOT / "docs" / "adr" / "0001-secure-aggregation.md",
+    ROOT / "docs" / "SECURITY_PRIVACY_REVIEW.md",
 )
 
 
@@ -32,15 +33,19 @@ class SecurityClaimContractTests(unittest.TestCase):
         threat_model = (ROOT / "THREAT_MODEL.md").read_text(encoding="utf-8")
 
         for content in (readme, security, threat_model):
-            normalized = " ".join(content.split())
-            self.assertIn("does not implement TLS", normalized)
-            self.assertIn("secure aggregation", normalized)
+            normalized = " ".join(content.lower().split())
+            self.assertRegex(normalized, r"secure-? aggregation")
             self.assertIn("formal differential privacy", normalized)
+            self.assertIn("overlay", normalized)
 
         self.assertIn("centrally creates all", readme)
         self.assertIn("reads every review and label", threat_model)
         self.assertIn("resulting model parameters", threat_model)
         self.assertIn("per-client evaluation metrics", threat_model)
+        secure_compose = (ROOT / "compose.secure.yaml").read_text(encoding="utf-8")
+        self.assertIn("--ssl-ca-certfile", secure_compose)
+        self.assertIn("--enable-supernode-auth", secure_compose)
+        self.assertIn("--auth-supernode-private-key", secure_compose)
 
     def test_update_noise_is_not_documented_as_a_privacy_guarantee(self) -> None:
         for path in (
@@ -57,12 +62,12 @@ class SecurityClaimContractTests(unittest.TestCase):
             self.assertIn("delta", content)
 
         todo = (ROOT / "TODO.md").read_text(encoding="utf-8")
-        for unfinished_control in (
+        for completed_control in (
             "Add TLS for Flower communication.",
             "Add SuperNode/client authentication and certificate lifecycle documentation.",
             "Add membership-inference and model-update leakage experiments.",
         ):
-            self.assertIn(f"- [ ] {unfinished_control}", todo)
+            self.assertIn(f"- [x] {completed_control}", todo)
 
         for completed_evaluation in (
             "Evaluate secure aggregation.",

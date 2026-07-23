@@ -6,12 +6,11 @@ This threat model describes the repository at the current `main` branch: a
 local research demo built with Flower, Keras, Streamlit, and Docker Compose. It
 is not a production deployment assessment.
 
-This repository does not implement TLS, client or SuperNode authentication,
-secure aggregation, encryption at rest, or formal differential privacy. The
-local Compose topology binds host-facing ports to loopback, but its Flower
-connections use insecure plaintext transport inside the host and Compose
-network. Process and volume separation reduce accidental access; they do not
-provide cryptographic confidentiality, integrity, or identity.
+The base local Compose profile uses plaintext Flower transport and loopback host
+bindings. `compose.secure.yaml` adds TLS to Flower endpoints and P-384 SuperNode
+identity authentication; `compose.production.yaml` adds an authenticated
+dashboard proxy. Secure aggregation, encryption at rest, and formal differential
+privacy remain unimplemented.
 
 ## Actual data flow
 
@@ -31,8 +30,9 @@ provide cryptographic confidentiality, integrity, or identity.
    aggregate round metrics, per-client evaluation metrics, run configuration,
    environment and code provenance, and checksums under the server artifact
    root.
-5. The dashboard reads the selected server run and public vocabulary. In the
-   supported Compose topology it is unauthenticated and bound to host loopback.
+5. The dashboard reads the selected server run and public vocabulary. The base
+   profile exposes it on loopback; the production overlay removes that direct
+   port and exposes it through an authenticated Nginx proxy.
 
 ### Demo shards are not evidence of client-owned ingestion
 
@@ -43,10 +43,10 @@ raw files during training. It does not mean the source data originated at
 independent organizations or remained hidden from the demo operator.
 
 A real deployment would need each organization to acquire, validate, retain,
-and expose its own data inside its own administrative boundary. It would also
-need authenticated and encrypted transport, credential lifecycle management,
-access controls, and operational monitoring that this repository does not
-provide.
+and expose its own data inside its own administrative boundary. The repository
+provides reference transport identity, certificate lifecycle, access control,
+and single-host monitoring controls, but not organization-specific IAM,
+off-host monitoring, or availability guarantees.
 
 ## Assets and observations
 
@@ -72,8 +72,8 @@ came from a trusted client.
 | Operator and preparation host | Trusted with all demo input and generated shards | Accidental disclosure, malicious preparation, poisoned data or vocabulary, overly broad filesystem access. |
 | ClientApp and its shard | Trusted to protect its own local files; untrusted by the server | A compromised or malicious client can disclose its shard, report false metrics, poison parameters, or send malformed values. |
 | SuperNode, SuperLink, and ServerApp | Trusted to execute the demo; observable by the operator and honest-but-curious from a data owner's perspective | Individual updates and metadata can be inspected; compromised services can alter runs or artifacts. |
-| Network and other containers | Untrusted | Plaintext Flower traffic can be observed or modified by an actor with host or network access. No peer identity is verified. |
-| Dashboard user or process | Untrusted unless the operator controls host access | The dashboard has no application authentication and can expose model and metric artifacts available to its process. |
+| Network and other containers | Untrusted | The base profile exposes plaintext Flower traffic. The secure overlay authenticates SuperNodes and encrypts configured Flower channels, but host compromise remains outside its boundary. |
+| Dashboard user or process | Untrusted unless authenticated by the production proxy | The base loopback profile has no application authentication; the production proxy authenticates users but can still expose artifacts available to the dashboard process. |
 | Dataset, packages, images, and CI actions | External supply chain | A compromised input or dependency can execute code, poison data, or exfiltrate accessible files. Pinning and vulnerability scans reduce but do not eliminate this risk. |
 
 Host compromise is not contained by this topology: the host operator can read
@@ -94,8 +94,9 @@ plaintext traffic.
 - Raw shards and artifacts are not encrypted at rest. Filesystem permissions and
   read-only mounts are the only repository-provided storage boundaries.
 - The global model and vocabulary can leak information when copied, queried, or
-  published. This repository has no membership-inference or model-update leakage
-  evaluation yet.
+  published. The repository supplies exact membership-inference and model-update
+  leakage evaluators, but those empirical attacks cannot prove privacy or cover
+  every adversary.
 - `use-update-noise` is an illustrative ablation, not formal differential
   privacy. It clips each tensor update separately and adds Gaussian noise, but
   defines no adjacency relation, sensitivity model, sampling analysis, or
@@ -105,13 +106,14 @@ plaintext traffic.
 
 ### Integrity
 
-- There is no client identity verification or message authentication. An actor
-  able to reach or control the local Flower services may impersonate a component
-  or tamper with traffic.
+- The base profile has no client identity verification or message authentication.
+  The secure overlay authenticates registered SuperNodes; it does not protect a
+  compromised authenticated client.
 - Clients can submit poisoned, malformed, non-finite, or incompatible parameters
   and dishonest metrics. The optional Huber path is an experimental robust
-  aggregation ablation, not proof of Byzantine security and not a substitute for
-  validation or anomaly detection.
+  aggregation ablation, not proof of Byzantine security. Shape, dtype, finite-value,
+  client-ID, and sample-count validation fail malformed rounds; MAD-based update
+  anomaly reports are diagnostic and do not reject otherwise valid updates.
 - Public manifests and completed artifacts are schema-checked and checksummed,
   but they are unsigned. A writer that can replace both an artifact and its
   checksum remains trusted.
@@ -120,16 +122,13 @@ plaintext traffic.
 
 ### Availability
 
-- The supported Compose topology provides four SuperNode/ClientApp pairs. The
-  server waits for at least four available clients and, with both participation
-  fractions set to `1.0`, selects every available client for fit and evaluation;
-  with the four-service topology, that means all four. FedProx retains its
-  `accept_failures=True` default, so it can aggregate the successful results from
-  a round with selected-client failures. A missing or slow client can delay
-  selection when fewer than four are available, and a round with no successful
-  results cannot be aggregated.
-- There are no production retry, timeout, disaster-recovery, rate-limit, or
-  denial-of-service controls.
+- The supported Compose topology provides four SuperNode/ClientApp pairs.
+  Fit participation is configurable, while evaluation and availability still
+  require the registered deployment set. Any selected-client failure fails the
+  round; a missing or slow required client can delay progress.
+- Checkpoint resume, backup, restore, rollback, canary, health checks, and bounded
+  resources improve recovery. There is no production rate limiting, multi-host
+  failover, or denial-of-service guarantee.
 - Model and artifact history improve recovery from completed local runs, but do
   not protect against host, volume, or operator failure.
 
@@ -142,6 +141,9 @@ plaintext traffic.
   is also read-only.
 - Host-facing SuperLink and dashboard ports bind to loopback in the supported
   local Compose topology.
+- The secure overlay supplies Flower TLS and authenticated SuperNode identities;
+  the production overlay supplies dashboard authentication and JSON access audit
+  records.
 - Artifact schema validation, path containment checks, regular-file checks,
   atomic selection, and checksums detect several corruption and path-confusion
   failures.
@@ -156,14 +158,13 @@ production security boundary.
 
 ## Required before production or privacy claims
 
-At minimum, a future deployment must add and test TLS for every Flower channel;
-mutual component authentication and certificate rotation; authorization and
-secret management; secure aggregation if the server must not inspect individual
-updates; formal differential privacy with an explicit mechanism, adjacency
-definition, sampling model, accountant, and published epsilon/delta when DP is
-claimed; update validation and poisoning defenses; authenticated dashboard
-access; encrypted storage; audit logs; incident response; backup and recovery;
-and leakage, membership-inference, malicious-client, and network-adversary tests.
+Before a production or privacy-preserving claim, a concrete deployment still
+needs organization-specific authorization and secret management; secure
+aggregation when the server must not inspect updates; encrypted storage; off-host
+monitoring/audit retention; incident response and availability targets; and
+network-adversary tests. Any differential-privacy claim additionally requires an
+explicit adjacency definition, sampling model, accountant, composition, and
+published epsilon/delta.
 
 The [secure-aggregation evaluation](docs/adr/0001-secure-aggregation.md) details
 the deferred Flower 1.32.1 integration, its protection boundary, and the evidence
