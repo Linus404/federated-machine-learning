@@ -112,8 +112,7 @@ def _load_bound_model(app_manifest: AppManifest, path: Path | None = None) -> An
     if model_bytes is None:
         raise FileNotFoundError(
             f"No model found in {snapshot.directory}. "
-            "Bitte zuerst (federated) Training starten, damit der Server "
-            "global_model.keras speichert."
+            "Run federated training first so the server saves global_model.keras."
         )
     with tempfile.TemporaryDirectory() as tmpdir:
         model_path = Path(tmpdir) / "global_model.keras"
@@ -314,9 +313,9 @@ def main() -> None:
 
         st.caption(f"Artifact root: {ARTIFACT_ROOT}")
         if st.session_state.auto_refresh:
-            st.caption("Auto refresh aktiv")
+            st.caption("Auto refresh active")
         else:
-            st.caption("Auto refresh aus")
+            st.caption("Auto refresh off")
 
     col_left, col_right = st.columns([1.1, 1.3])
 
@@ -340,7 +339,7 @@ def main() -> None:
                 st.markdown(f"**{positive_prob * 100:.1f}%**")
                 st.markdown(f"**Prediction:** {label}")
             except (FileNotFoundError, OSError, ValueError, tf.errors.OpError) as error:
-                st.error(f"Fehler bei der Vorhersage: {error}")
+                st.error(f"Prediction failed: {error}")
 
     with col_right:
         st.subheader("Training metrics")
@@ -348,8 +347,8 @@ def main() -> None:
         df_metrics = load_metrics()
         if df_metrics is None:
             st.info(
-                "Noch keine Trainingsmetriken gefunden. Wenn gerade ein neuer Lauf startet, "
-                "ist das am Anfang normal."
+                "No training metrics found yet. This is expected while a new run "
+                "starts."
             )
         else:
             st.caption(f"Loaded {len(df_metrics)} metric rows")
@@ -363,7 +362,8 @@ def main() -> None:
                 st.line_chart(chart_data)
             else:
                 st.warning(
-                    "metrics.csv hat nicht die erwarteten Spalten ('round', 'loss', 'accuracy')."
+                    "metrics.csv is missing the expected round, loss, or accuracy "
+                    "columns."
                 )
 
             st.subheader("Client evaluation accuracy")

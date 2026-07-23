@@ -103,7 +103,7 @@ federated learning system.
 - [ ] Explain key design decisions and rejected alternatives.
 - [ ] Add a limitations and responsible-use section.
 - [ ] Add a model card and dataset card.
-- [ ] Standardize all dashboard text to one language.
+- [x] Standardize all dashboard text to one language.
 - [ ] Remove stale branch instructions and clean up the research notebook.
 - [ ] Add a roadmap and a resume-ready project summary.
 
