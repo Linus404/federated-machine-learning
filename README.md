@@ -18,8 +18,8 @@ a claim of production privacy.
 
 ## Results first
 
-The published compact campaign contains **36 completed cells**: four strategies,
-IID plus two Dirichlet non-IID partitions, and three registered seeds. Every cell
+The published academic campaign contains **60 completed cells**: four strategies,
+IID plus two Dirichlet non-IID partitions, and five registered seeds. Every cell
 ran 20 epochs/rounds against the same checksum-verified test set. Values below are
 mean accuracy with sample variance in parentheses; full precision, recall, F1,
 ROC-AUC, confusion matrices, timing, communication, and raw per-seed records are in
@@ -29,23 +29,23 @@ registered work are documented in [`EXPERIMENTS.md`](EXPERIMENTS.md).
 
 | Strategy | IID | Dirichlet 0.5 | Dirichlet 0.1 |
 | --- | ---: | ---: | ---: |
-| Local only | 0.8534 (0.000001) | 0.6724 (0.001691) | 0.5661 (0.006228) |
-| **FedAvg** | **0.8876 (0.000001)** | **0.8639 (0.000425)** | **0.7094 (0.014169)** |
-| FedProx | 0.8223 (0.000237) | 0.7204 (0.006207) | 0.5702 (0.008122) |
-| FedProx + Huber | 0.8225 (0.000022) | 0.7090 (0.011094) | 0.5861 (0.009837) |
+| Local only | 0.8527 (0.000003) | 0.6752 (0.002560) | 0.5766 (0.003322) |
+| **FedAvg** | **0.8870 (0.000001)** | **0.8635 (0.000267)** | **0.7738 (0.014868)** |
+| FedProx | 0.8209 (0.000175) | 0.7183 (0.005656) | 0.6642 (0.020728) |
+| FedProx + Huber | 0.8217 (0.000037) | 0.7201 (0.006952) | 0.6660 (0.016873) |
 
 ### Findings
 
 - **FedAvg won every clean-data partition in this registered configuration.** Its
-  IID mean accuracy was 88.76%, versus 85.34% for independent local models.
+  IID mean accuracy was 88.70%, versus 85.27% for independent local models.
 - **Heterogeneity was the dominant difficulty.** Moving FedAvg from IID to
-  Dirichlet 0.1 reduced mean accuracy from 88.76% to 70.94% and materially increased
+  Dirichlet 0.1 reduced mean accuracy from 88.70% to 77.38% and materially increased
   seed variance.
 - **FedProx was not automatically beneficial.** With the preregistered `mu=0.1`, it
   converged later and underperformed FedAvg. Huber aggregation did not recover that
   gap on clean updates; robust methods are trade-offs, not universal upgrades.
-- FedAvg's zero-based mean convergence round moved from 3.0 (IID) to 6.67
-  (Dirichlet 0.5) and 12.33 (Dirichlet 0.1).
+- FedAvg's zero-based mean convergence round moved from 3.0 (IID) to 6.0
+  (Dirichlet 0.5) and 8.6 (Dirichlet 0.1).
 - Every four-client federated cell moved 1,293,768,960 serialized Flower parameter
   bytes over 20 rounds. The count excludes transport framing, TLS, and control
   messages by definition.
@@ -57,7 +57,7 @@ synthetic workload. See
 [`results/aggregation-benchmark.json`](results/aggregation-benchmark.json) and the
 [interpretation limits](docs/PERFORMANCE_AND_ROBUSTNESS.md).
 
-All 36 training cells were produced from clean commit
+All 60 training cells were produced from clean commit
 `e903f196f14f7ffdd7b75e1871de702fd1a24397`, dataset revision
 `e6281661ce1c48d982bc483cf8a173c1bbeb5d31`, and protocol checksum
 `sha256:75d7b3a77dc43d9216e3c7324f7972fb40866050a9f61885ff1555f6319baaa3`.
@@ -145,15 +145,15 @@ uv run --env-file .env.protocol python -m src.experiment_matrix \
   --output-dir artifacts/portfolio-results \
   --strategies local_only fedavg fedprox fedprox_huber \
   --partitions iid_stratified dirichlet_0.5 dirichlet_0.1 \
-  --seeds 67 101 211 \
+  --seeds 67 101 211 307 401 \
   --client-data-dir 'artifacts/portfolio-data/clients/client-{partition}' \
   --public-artifact-dir artifacts/portfolio-data/public \
   --evaluation-artifact-dir artifacts/portfolio-data/evaluation --quiet
 ```
 
-The full protocol additionally registers five seeds, median/trimmed-mean
-strategies, 16/64-client scale cells, and larger robustness/privacy campaigns.
-The checked-in evidence is the 36-cell comparison above plus the synthetic
+The full protocol additionally registers median/trimmed-mean strategies,
+16/64-client scale cells, and larger robustness/privacy campaigns.
+The checked-in evidence is the 60-cell comparison above plus the synthetic
 aggregation benchmark. [`EXPERIMENTS.md`](EXPERIMENTS.md) lists the unexecuted
 cells and ranks the most useful academic extensions.
 
