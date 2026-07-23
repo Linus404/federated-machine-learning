@@ -55,8 +55,7 @@ tokenize their own mounted reviews, and no centrally tokenized partitions are
 generated. The evaluation directory is immutable and evaluation-only: it must not
 be mounted into ClientApp, the dashboard, or the current training ServerApp. Only
 the baseline evaluator consumes it, after training has completed; the preparation
-command itself performs no evaluation. The canonical classification metrics are
-added separately in PR15.
+command itself performs no evaluation.
 
 The server does not read raw shard files during training, but it receives each
 client's resulting model parameters, sample counts, training metrics, and
@@ -86,15 +85,19 @@ Each output directory must be new. The centralized command trains one model on
 the union of the registered fitted rows and validates on their registered
 validation union. The local-only command trains one independent model per
 registered IID client and reports the unweighted mean of their untouched-test
-loss and accuracy. Both commands reconstruct the frozen `iid_stratified`
+accuracy, precision, recall, F1, and ROC-AUC. Each model also retains its ordered
+raw float32 probabilities and confusion matrix. Both commands reconstruct the
+frozen `iid_stratified`
 assignment from the complete validated train-shard union, derive validation,
 model, Dropout, and per-epoch training-order seeds from the frozen namespaces,
 finish every training call before loading the evaluation artifact, and write the
 trained model files plus canonical `results.json` with the effective inputs. The
 CLI enforces four clients, 20 epochs, batch size 64, validation fraction 0.2, and
-one of the five frozen seeds; seed 67 is the default. PR15 adds the complete
-frozen classification metric set; later experiment-matrix work executes the
-remaining registered seeds and non-IID partitions.
+one of the five frozen seeds; seed 67 is the default. Later experiment-matrix
+work executes the remaining registered seeds and non-IID partitions.
+The current baseline validation curves remain Keras loss/accuracy history; the
+experiment runner must evaluate the fixed validation rows through the canonical
+evaluator after every epoch before claiming complete protocol conformance.
 
 ## Direct Flower simulation
 

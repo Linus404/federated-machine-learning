@@ -17,6 +17,7 @@ import numpy as np
 
 from src.app_manifest import AppManifest, load_app_manifest
 from src.artifact_compatibility import canonical_json_bytes
+from src.classification_metrics import evaluate_classifier
 from src.evaluation_artifact import (
     load_evaluation_artifact_snapshot,
     load_scientific_protocol,
@@ -577,7 +578,7 @@ def _validation_curve(history: Any, epochs: int) -> list[dict[str, float | int]]
 
 def _evaluate_model(
     model: Any, test_data: tuple[np.ndarray, np.ndarray]
-) -> dict[str, float]:
+) -> tuple[dict[str, Any], np.ndarray]:
     """Evaluate one trained model on the untouched test artifact.
 
     Parameters
@@ -589,21 +590,23 @@ def _evaluate_model(
 
     Returns
     -------
-    dict of str to float
-        Finite test loss and accuracy.
-
-    Raises
-    ------
-    ValueError
-        If Keras returns incomplete or non-finite metrics.
+    tuple of dict and numpy.ndarray
+        JSON-compatible metrics and raw float32 probabilities.
     """
-    result = model.evaluate(*test_data, verbose=0)
-    if not isinstance(result, (list, tuple)) or len(result) != 2:
-        raise ValueError("baseline evaluation must return loss and accuracy")
-    metrics = {"loss": float(result[0]), "accuracy": float(result[1])}
-    if any(not math.isfinite(value) for value in metrics.values()):
-        raise ValueError("baseline test metrics must be finite")
-    return metrics
+    result = evaluate_classifier(model, *test_data)
+    metrics = {
+        name: result[name]
+        for name in (
+            "accuracy",
+            "confusion_matrix",
+            "precision",
+            "recall",
+            "f1",
+            "roc_auc",
+            "roc_auc_status",
+        )
+    }
+    return metrics, result["probabilities"]
 
 
 def _fit_model(
@@ -681,7 +684,9 @@ def _load_test_data(
         Tokenized untouched test examples and labels.
     """
     snapshot = load_evaluation_artifact_snapshot(args.evaluation_artifact_dir)
-    return tokenize_rows(snapshot.rows, manifest)
+    token_ids, _ = tokenize_rows(snapshot.rows, manifest)
+    labels = np.asarray([row[2] for row in snapshot.rows], dtype=np.int64)
+    return token_ids, labels
 
 
 def _run_centralized(
@@ -689,7 +694,7 @@ def _run_centralized(
     manifest: AppManifest,
     protocol: Mapping[str, Any],
     splits: list[RowSplit],
-) -> tuple[dict[str, Any], list[Any]]:
+) -> tuple[dict[str, Any], list[Any], list[np.ndarray]]:
     """Train and evaluate the centralized baseline.
 
     Parameters
@@ -706,7 +711,7 @@ def _run_centralized(
     Returns
     -------
     tuple of dict and list
-        JSON result payload and trained model list.
+        JSON result payload, trained model list, and raw predictions.
     """
     rows, (train_data, validation_data) = _combined_split(splits, manifest)
     cell_id = _cell_id(args)
@@ -723,6 +728,9 @@ def _run_centralized(
         cell_id,
         -1,
     )
+    test_metrics, probabilities = _evaluate_model(
+        model, _load_test_data(args, manifest)
+    )
     result = {
         "baseline": "centralized",
         "config": _result_config(args),
@@ -731,10 +739,11 @@ def _run_centralized(
             "model_initialization": model_seed,
         },
         "validation": _validation_curve(history, args.epochs),
-        "test": _evaluate_model(model, _load_test_data(args, manifest)),
+        "test": test_metrics,
         "models": ["centralized.keras"],
+        "predictions": ["centralized-predictions.npy"],
     }
-    return result, [model]
+    return result, [model], [probabilities]
 
 
 def _run_local_only(
@@ -742,7 +751,7 @@ def _run_local_only(
     manifest: AppManifest,
     protocol: Mapping[str, Any],
     splits: list[RowSplit],
-) -> tuple[dict[str, Any], list[Any]]:
+) -> tuple[dict[str, Any], list[Any], list[np.ndarray]]:
     """Train and evaluate one independent model per client.
 
     Parameters
@@ -759,7 +768,7 @@ def _run_local_only(
     Returns
     -------
     tuple of dict and list
-        JSON result payload and trained models in client ID order.
+        JSON result payload, trained models, and raw predictions.
     """
     models: list[Any] = []
     clients: list[dict[str, Any]] = []
@@ -793,19 +802,23 @@ def _run_local_only(
         )
 
     test_data = _load_test_data(args, manifest)
+    predictions: list[np.ndarray] = []
     for client, model in zip(clients, models):
-        client["test"] = _evaluate_model(model, test_data)
+        client["test"], probabilities = _evaluate_model(model, test_data)
+        client["predictions"] = f"client-{client['client_id']}-predictions.npy"
+        predictions.append(probabilities)
     result = {
         "baseline": "local_only",
         "config": _result_config(args),
         "clients": clients,
         "test_mean": {
             metric: fmean(client["test"][metric] for client in clients)
-            for metric in ("loss", "accuracy")
+            for metric in ("accuracy", "precision", "recall", "f1", "roc_auc")
         },
         "models": [client["model"] for client in clients],
+        "predictions": [client["predictions"] for client in clients],
     }
-    return result, models
+    return result, models, predictions
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -842,13 +855,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             args.client_count,
             args.validation_split,
         )
-        result, models = (
+        result, models, predictions = (
             _run_centralized(args, manifest, protocol, splits)
             if args.baseline == "centralized"
             else _run_local_only(args, manifest, protocol, splits)
         )
         for filename, model in zip(result["models"], models):
             model.save(str(output_dir / filename))
+        for filename, probabilities in zip(result["predictions"], predictions):
+            np.save(output_dir / filename, probabilities, allow_pickle=False)
         (output_dir / "results.json").write_bytes(canonical_json_bytes(result))
     except BaseException:
         shutil.rmtree(output_dir)

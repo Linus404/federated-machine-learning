@@ -94,6 +94,31 @@ def model(history: SimpleNamespace, evaluation: tuple[float, float]) -> MagicMoc
     return value
 
 
+def canonical_evaluation(score: float) -> dict[str, object]:
+    """Return a canonical evaluator-shaped result fixture.
+
+    Parameters
+    ----------
+    score : float
+        Scalar value used for every reported metric.
+
+    Returns
+    -------
+    dict of str to object
+        Complete evaluator result including raw probabilities.
+    """
+    return {
+        "accuracy": score,
+        "confusion_matrix": [[1, 0], [0, 1]],
+        "precision": score,
+        "recall": score,
+        "f1": score,
+        "roc_auc": score,
+        "roc_auc_status": "defined",
+        "probabilities": np.array([0.25, 0.75], dtype=np.float32),
+    }
+
+
 class BaselineTrainingTests(unittest.TestCase):
     def setUp(self) -> None:
         """Create shared validated artifact and array fixtures."""
@@ -253,6 +278,10 @@ class BaselineTrainingTests(unittest.TestCase):
                     "src.baseline_training.build_model_from_manifest",
                     return_value=trained_model,
                 ) as build_model_from_manifest,
+                patch(
+                    "src.baseline_training.evaluate_classifier",
+                    return_value=canonical_evaluation(0.8),
+                ),
                 patch("src.baseline_training.keras.utils.set_random_seed") as set_seed,
             ):
                 result = run(args)
@@ -280,7 +309,18 @@ class BaselineTrainingTests(unittest.TestCase):
                 np.array([[4], [5], [6], [7]], dtype=np.int32),
             )
             self.assertFalse(fit_kwargs["shuffle"])
-            self.assertEqual(result["test"], {"loss": 0.4, "accuracy": 0.8})
+            self.assertEqual(
+                result["test"],
+                {
+                    "accuracy": 0.8,
+                    "confusion_matrix": [[1, 0], [0, 1]],
+                    "precision": 0.8,
+                    "recall": 0.8,
+                    "f1": 0.8,
+                    "roc_auc": 0.8,
+                    "roc_auc_status": "defined",
+                },
+            )
             self.assertEqual(
                 result["config"],
                 {
@@ -293,6 +333,9 @@ class BaselineTrainingTests(unittest.TestCase):
                 },
             )
             self.assertTrue((args.output_dir / "centralized.keras").is_file())
+            np.testing.assert_array_equal(
+                np.load(args.output_dir / "centralized-predictions.npy"), [0.25, 0.75]
+            )
             self.assertEqual(
                 json.loads((args.output_dir / "results.json").read_text()), result
             )
@@ -364,6 +407,12 @@ class BaselineTrainingTests(unittest.TestCase):
                     "src.baseline_training.build_model_from_manifest",
                     side_effect=models,
                 ) as build_model_from_manifest,
+                patch(
+                    "src.baseline_training.evaluate_classifier",
+                    side_effect=[
+                        canonical_evaluation(score) for score in (0.7, 0.9, 0.5, 0.9)
+                    ],
+                ),
                 patch("src.baseline_training.keras.utils.set_random_seed") as set_seed,
             ):
                 result = run(args)
@@ -381,19 +430,33 @@ class BaselineTrainingTests(unittest.TestCase):
                     call(self.manifest, dropout_seed=204),
                 ],
             )
-            self.assertEqual(result["test_mean"], {"loss": 0.5, "accuracy": 0.75})
+            self.assertEqual(
+                result["test_mean"],
+                {
+                    "accuracy": 0.75,
+                    "precision": 0.75,
+                    "recall": 0.75,
+                    "f1": 0.75,
+                    "roc_auc": 0.75,
+                },
+            )
             self.assertEqual(
                 [client["test"] for client in result["clients"]],
                 [
-                    {"loss": 0.6, "accuracy": 0.7},
-                    {"loss": 0.4, "accuracy": 0.9},
-                    {"loss": 0.8, "accuracy": 0.5},
-                    {"loss": 0.2, "accuracy": 0.9},
+                    {
+                        key: value
+                        for key, value in canonical_evaluation(score).items()
+                        if key != "probabilities"
+                    }
+                    for score in (0.7, 0.9, 0.5, 0.9)
                 ],
             )
             for client_id in range(4):
                 self.assertTrue(
                     (args.output_dir / f"client-{client_id}.keras").is_file()
+                )
+                self.assertTrue(
+                    (args.output_dir / f"client-{client_id}-predictions.npy").is_file()
                 )
 
     def test_save_failure_removes_owned_output_directory(self) -> None:
@@ -438,6 +501,10 @@ class BaselineTrainingTests(unittest.TestCase):
                 patch(
                     "src.baseline_training.build_model_from_manifest",
                     return_value=trained_model,
+                ),
+                patch(
+                    "src.baseline_training.evaluate_classifier",
+                    return_value=canonical_evaluation(0.8),
                 ),
                 patch("src.baseline_training.keras.utils.set_random_seed"),
             ):
