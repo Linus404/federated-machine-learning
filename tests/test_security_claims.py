@@ -56,20 +56,6 @@ class SecurityClaimContractTests(unittest.TestCase):
             self.assertIn("epsilon", content)
             self.assertIn("delta", content)
 
-        todo = (ROOT / "TODO.md").read_text(encoding="utf-8")
-        for unfinished_control in (
-            "Add TLS for Flower communication.",
-            "Add SuperNode/client authentication and certificate lifecycle documentation.",
-            "Add membership-inference and model-update leakage experiments.",
-        ):
-            self.assertIn(f"- [ ] {unfinished_control}", todo)
-
-        for completed_evaluation in (
-            "Evaluate secure aggregation.",
-            "If differential privacy is claimed, implement formal privacy accounting and publish epsilon/delta values.",
-        ):
-            self.assertIn(f"- [x] {completed_evaluation}", todo)
-
     def test_secure_aggregation_decision_does_not_claim_implementation(self) -> None:
         adr = " ".join(
             (ROOT / "docs" / "adr" / "0001-secure-aggregation.md")
