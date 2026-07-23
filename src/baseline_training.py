@@ -209,7 +209,27 @@ def _validate_args(args: argparse.Namespace, protocol: Mapping[str, Any]) -> Non
             )
     if type(args.seed) is not int or args.seed not in protocol["seeding"]["seeds"]:
         raise ValueError("seed must be one of the frozen registered seeds")
-    template = str(args.client_data_dir)
+    _validate_client_data_template(args.client_data_dir)
+
+
+def _validate_client_data_template(value: object) -> None:
+    """Require the client directory template to expose only ``partition``.
+
+    Parameters
+    ----------
+    value : object
+        Candidate path template.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If the template is malformed or has another replacement field.
+    """
+    template = str(value)
     try:
         fields = [
             field
@@ -436,6 +456,8 @@ def _training_orders(
     cell_id: str,
     client_id: int,
     epochs: int,
+    *,
+    round_index: int = -1,
 ) -> list[np.ndarray]:
     """Return registered fitted-row positions for every epoch.
 
@@ -453,6 +475,8 @@ def _training_orders(
         Client ID, or ``-1`` for centralized training.
     epochs : int
         Number of epoch orders to derive.
+    round_index : int, optional
+        Federated round index, or ``-1`` for baseline training.
 
     Returns
     -------
@@ -470,7 +494,7 @@ def _training_orders(
     for epoch in range(epochs):
         namespace = template.format(
             cell_id=cell_id,
-            round_index=-1,
+            round_index=round_index,
             epoch_index=epoch,
             client_id=client_id,
         )

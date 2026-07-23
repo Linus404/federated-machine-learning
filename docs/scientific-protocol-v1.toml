@@ -5,7 +5,7 @@ amendment_policy = "Changes require a separately reviewed protocol version befor
 
 [scope]
 purpose = "Preregistered, executable specification for the later PR12 experiment runner and its generated comparative results."
-implementation_status = "This repository revision freezes the protocol before the experiment runner is split out; it does not contain a runner that executes the registered matrix. No matrix cell or comparative result may be claimed as executed by this revision."
+implementation_status = "src/strategy_runner.py executes one four-client iid_stratified local-only or federated strategy contract at a time with live canonical validation. It does not orchestrate the registered multi-partition, multi-scale, threat, or multi-seed matrix, so no comparative result may be claimed as executed by this revision."
 reviewed_server_boundary = "src/server_app.py is the current deployment/demo server, not the registered experiment runner. It exposes FedProx with either Flower sample-weighted aggregation or the Huber aggregate, requires an exact configured client-ID set for fitting, validates that submitted sample counts are positive built-in integers but does not independently derive the registered fitted-row counts, and performs client-local evaluation aggregation. It does not implement threat transforms, FedMedian, FedTrimmedAvg, deterministic protocol partition construction, the server-held validation union, the untouched-test schedule, privacy analyses, or matrix orchestration."
 deployment_configuration = "The deployment defaults to expected-client-count=4 because compose.yaml registers client IDs 0 through 3. Changing expected-client-count changes only the deployment server's exact fit-result set; it does not select or execute a protocol matrix client_scale cell."
 experiment_runner_requirement = "A later runner claiming protocol conformance must implement every registered cell and validation/evaluation boundary exactly, including client scales 4, 16, and 64, registered strategies and threats, no client evaluation, one server-held validation-union evaluation per round, final untouched-test evaluation, hard cell failure, and provenance. Reusing src/server_app.py without those additions is non-conformant."
@@ -645,7 +645,7 @@ tpr = [0.0, 1.0]
 roc_auc = 0.5
 
 [provenance]
-implementation_status = "Preregistered contract for the future experiment runner. src/server_app.py and src/run_provenance.py do not implement this schema, must not claim conformance, and must not be interpreted as having produced protocol experiment provenance."
+implementation_status = "Preregistered contract for later matrix orchestration. src/server_app.py, src/strategy_runner.py, and src/run_provenance.py do not implement this complete schema, must not claim full-matrix conformance, and must not be interpreted as having produced complete protocol experiment provenance."
 schema_name = "federated-imdb-experiment-provenance"
 schema_version = 1
 manifest_filename = "provenance.json"
