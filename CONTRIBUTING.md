@@ -60,7 +60,5 @@ changes before merging.
 
 ## Legal note
 
-The repository is currently marked `UNLICENSED` and does not grant a general
-license to use, copy, modify, or distribute its contents. Only contribute work
-you have the right to submit. Accepting a contribution does not by itself
-change the repository's licensing status.
+The repository is distributed under the [MIT License](LICENSE). Only contribute
+work you have the right to submit under those terms.
