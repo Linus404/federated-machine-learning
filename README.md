@@ -1,288 +1,268 @@
-# Federated Machine Learning
+# Federated Sentiment Analysis
 
-This research demo simulates competing streaming platforms that jointly train a
-sentiment classifier. The local data-preparation command centrally creates all
-demo shards; it does not demonstrate ingestion from independent data owners.
+[![CI](https://github.com/Linus404/federated-machine-learning/actions/workflows/ci.yml/badge.svg)](https://github.com/Linus404/federated-machine-learning/actions/workflows/ci.yml)
 
-## Project scope
+A reproducible federated-learning pet project that trains an IMDB sentiment
+classifier with Keras, TensorFlow, and Flower. It compares local-only,
+centralized, FedAvg, FedProx, and robust aggregation strategies while preserving
+an untouched test set and verifiable experiment artifacts.
 
-This university-origin pet project demonstrates reproducible local federated
-learning experiments, artifact handling, and honest security and privacy
-boundaries. It assumes a trusted single-user operator, a local filesystem, and
-centrally prepared demo data.
+This project began as a university assignment. Its goal is a credible local
+demonstration and a compact scientific comparison—not a production federated
+learning platform.
 
-The finish line is a compact IID/non-IID comparison, a runnable local
-end-to-end demo, and published results and limitations. Production transport,
-authentication, monitoring, disaster recovery, cloud hardening, and large-scale
-deployment are intentionally out of scope.
+## Scope and status
 
-## Project setup
+The project assumes a trusted single-user operator, a local POSIX filesystem,
+and centrally prepared demo data.
 
-This project uses [uv](https://docs.astral.sh/uv/) to manage Python versions and dependencies.
+| Capability | Status |
+| --- | --- |
+| Frozen IMDB dataset revision and deterministic preparation | Complete |
+| Untouched, checksum-verified test artifact | Complete |
+| Centralized and local-only baselines | Complete |
+| Single-cell IID strategy runner | Complete |
+| FedAvg, FedProx, Huber, median, and trimmed-mean aggregation | Complete |
+| Canonical metrics and raw prediction artifacts | Complete |
+| Local Flower and Docker demonstrations | Complete |
+| Compact multi-seed IID/non-IID comparison | Next |
+| Published comparative results | Pending the completed matrix |
+| Production deployment and operational hardening | Out of scope |
 
-### Install uv
+Smoke runs and isolated strategy runs are not presented as benchmark results.
+Comparative values will be published only after the compact matrix has been
+executed against the frozen protocol.
 
-**macOS / Linux**
+## Architecture
+
+```mermaid
+flowchart LR
+    P[Central demo preparation] --> C[Four raw client shards]
+    P --> V[Public vocabulary and manifest]
+    P --> T[Untouched test artifact]
+
+    C --> A[Four Flower ClientApps]
+    V --> A
+    A --> S[SuperLink and ServerApp]
+    S --> H[Versioned run history]
+    H --> D[Streamlit dashboard]
+
+    C --> R[Offline experiment runner]
+    V --> R
+    T --> R
+    R --> E[Models, predictions, and results]
+```
+
+The preparation command centrally creates all demo shards. Client-scoped
+storage models the runtime boundary only; it is not evidence that the data came
+from independent organizations. The untouched test artifact is available only
+to offline evaluators after training and is not mounted into ClientApp,
+ServerApp, or the dashboard.
+
+## Reproduce one experiment
+
+### Requirements
+
+- macOS, Linux, or WSL 2
+- [uv](https://docs.astral.sh/uv/)
+- Docker with Compose only for the distributed container demonstration
+
+The supported Python versions are 3.11 through 3.13.
+On Windows, use WSL 2 rather than native PowerShell.
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
+uv sync --frozen
 ```
 
-The project requires POSIX filesystem semantics. On Windows, use WSL 2 rather
-than native PowerShell.
-
-### Install dependencies
+Prepare four client shards, the shared vocabulary, and the untouched evaluation
+artifact:
 
 ```bash
-uv sync
+uv run --env-file .env.protocol python -m src.data_prep \
+  --partitions 4 \
+  --client-shard-dir artifacts/clients \
+  --public-artifact-dir artifacts/public \
+  --evaluation-artifact-dir artifacts/evaluation
 ```
 
-Every documented local Python entry point uses `--env-file .env.protocol` so the
-frozen hash seed, Keras backend, and TensorFlow determinism settings exist before
-the interpreter starts. Missing or conflicting startup values are rejected; do
-not set them later from Python code.
-
-## Artifact preparation
-
-Prepare the raw client shards, shared public vocabulary, and immutable untouched
-evaluation dataset:
+Run one registered FedAvg cell:
 
 ```bash
-uv run --env-file .env.protocol python -m src.data_prep --partitions 4 --client-shard-dir artifacts/clients --public-artifact-dir artifacts/public --evaluation-artifact-dir artifacts/evaluation
+uv run --env-file .env.protocol python -m src.strategy_runner fedavg \
+  --output-dir artifacts/strategies/fedavg
 ```
 
-This command loads `stanfordnlp/imdb` configuration `plain_text` at the frozen
-revision, verifies every official split and raw/content SHA-256, creates every raw
-review/label shard from the training split only, and publishes a vocabulary
-adapted on that same split. It writes the official test split in ascending source
-order to the selected prepared generation, with stable `test:<row-index>`
-identities and a strict checksum manifest. One atomic `.prepared-current`
-switch selects the matching client, public, and evaluation directories together;
-an interruption leaves the prior generation selected. The unsupervised split is
-verified and excluded. The
-generated directories simulate client-scoped
-storage only after this centralized preparation; they are not evidence that data
-originated at or remained hidden within independent organizations. Clients
-tokenize their own mounted reviews, and no centrally tokenized partitions are
-generated. The evaluation directory is immutable and evaluation-only: it must not
-be mounted into ClientApp, the dashboard, or the current training ServerApp. Only
-the baseline evaluator consumes it, after training has completed; the preparation
-command itself performs no evaluation.
+Each output directory must be new. The run writes:
 
-The server does not read raw shard files during training, but it receives each
-client's resulting model parameters, sample counts, training metrics, and
-per-client evaluation loss, accuracy, and client ID before or during aggregation.
-Those values can leak information about client data. The model uses a normal
-trainable embedding, not pretrained GloVe vectors or an embedding matrix.
+- `results.json` with the effective configuration and canonical metrics;
+- one `.npy` file for every ordered validation and test prediction vector;
+- the final `.keras` model.
 
-Train one client locally from its raw shard:
+Inspect the result with:
 
 ```bash
-uv run --env-file .env.protocol python -m src.local_training --client-data-dir artifacts/clients/client-0 --public-artifact-dir artifacts/public --run-artifact-dir artifacts/local-runs
+python -m json.tool artifacts/strategies/fedavg/results.json
 ```
 
-The local command treats `--run-artifact-dir` as a reusable history root. Every
-training invocation writes to a new `runs/<run_id>` directory; finalization binds
-its regular files into a checksum-verified artifact snapshot.
+## Experiment commands
 
-Train the centralized or local-only baseline from the four prepared client
-shards, then evaluate on the untouched test artifact:
+### Baselines
 
 ```bash
-uv run --env-file .env.protocol python -m src.baseline_training centralized --output-dir artifacts/baselines/centralized
-uv run --env-file .env.protocol python -m src.baseline_training local-only --output-dir artifacts/baselines/local-only
+uv run --env-file .env.protocol python -m src.baseline_training centralized \
+  --output-dir artifacts/baselines/centralized
+
+uv run --env-file .env.protocol python -m src.baseline_training local-only \
+  --output-dir artifacts/baselines/local-only
 ```
 
-Each output directory must be new. The centralized command trains one model on
-the union of the registered fitted rows and validates on their registered
-validation union. The local-only command trains one independent model per
-registered IID client and reports the unweighted mean of their untouched-test
-accuracy, precision, recall, F1, and ROC-AUC. Each model also retains its ordered
-raw float32 probabilities and confusion matrix. Both commands reconstruct the
-frozen `iid_stratified`
-assignment from the complete validated train-shard union, derive validation,
-model, Dropout, and per-epoch training-order seeds from the frozen namespaces,
-finish every training call before loading the evaluation artifact, and write the
-trained model files plus canonical `results.json` with the effective inputs. The
-CLI enforces four clients, 20 epochs, batch size 64, validation fraction 0.2, and
-one of the five frozen seeds; seed 67 is the default. Later experiment-matrix
-work executes the remaining registered seeds and non-IID partitions.
-The baseline validation curves remain Keras loss/accuracy history. The strategy
-runner below instead evaluates the fixed validation rows through the canonical
-evaluator after every epoch or round.
+The centralized baseline trains on the union of the registered fitted rows. The
+local-only baseline trains one model per client and reports their unweighted
+mean. Both evaluate on the untouched test artifact only after training.
 
-Run one four-client IID strategy contract with live canonical validation after
-every local-only epoch or federated round:
+### Federated and robust strategies
 
 ```bash
-uv run --env-file .env.protocol python -m src.strategy_runner fedavg --output-dir artifacts/strategies/fedavg
+uv run --env-file .env.protocol python -m src.strategy_runner STRATEGY \
+  --output-dir OUTPUT_DIRECTORY
 ```
 
-The accepted strategy names are `local_only`, `fedavg`, `fedprox`,
-`fedprox_huber`, `fedmedian`, and `fedtrimmedavg`. Each output directory must be
-new. This runner saves the model, direct per-epoch or per-round float32
-validation predictions, final untouched-test predictions, and `results.json`.
-It intentionally runs one `iid_stratified` seed cell at a time. Follow-up work is
-limited to the compact multi-seed IID/non-IID comparison and its published
-summary.
+| Strategy | Meaning |
+| --- | --- |
+| `local_only` | One independent model per client |
+| `fedavg` | Sample-weighted federated averaging |
+| `fedprox` | FedAvg with the registered proximal objective |
+| `fedprox_huber` | FedProx with multidimensional Huber aggregation |
+| `fedmedian` | Coordinate-wise median aggregation |
+| `fedtrimmedavg` | Coordinate-wise trimmed-mean aggregation |
 
-## Direct Flower simulation
+The current runner executes one four-client `iid_stratified` cell for one of the
+registered seeds `67`, `101`, `211`, `307`, or `401`. It performs 20 epochs or
+rounds with batch size 64 and evaluates the fixed validation rows through the
+canonical evaluator after every epoch or round.
 
-Run the Flower app directly using the per-partition raw directories generated
-above. This is the fast local development path and does not use Docker:
+The canonical evaluator reports accuracy, precision, recall, F1, ROC-AUC, and
+the confusion matrix. It also preserves the exact float32 probabilities used to
+derive those metrics.
+
+### Single-client training
 
 ```bash
-uv run --env-file .env.protocol flwr run . --stream --federation-config "num-supernodes=4"
+uv run --env-file .env.protocol python -m src.local_training \
+  --client-data-dir artifacts/clients/client-0 \
+  --public-artifact-dir artifacts/public \
+  --run-artifact-dir artifacts/local-runs
 ```
 
-Run the dashboard against the selected server artifact directory:
+Each invocation creates a new immutable `runs/<run_id>` directory beneath the
+history root.
+
+## Run the Flower demonstration
+
+### Direct local simulation
+
+After preparing the artifacts, run:
 
 ```bash
-FML_SERVER_ARTIFACT_DIR=artifacts/server uv run --env-file .env.protocol streamlit run dashboard.py
+uv run --env-file .env.protocol flwr run . --stream \
+  --federation-config "num-supernodes=4"
 ```
 
-### Runtime paths
-
-The Flower configuration uses separate paths for public artifacts, server output,
-and raw client shards. Data preparation also uses the separate evaluation-only
-path `artifacts/evaluation`, overridable with `--evaluation-artifact-dir` or
-`FML_EVALUATION_ARTIFACT_DIR`. Its default client path is
-`artifacts/clients/client-{partition}`. You can override paths with Flower run
-config, for example:
+Start the dashboard against the selected server run:
 
 ```bash
-uv run --env-file .env.protocol flwr run . --stream --federation-config "num-supernodes=4" --run-config "client-data-dir='artifacts/clients/client-{partition}' server-artifact-dir='artifacts/server' public-artifact-dir='artifacts/public'"
+FML_SERVER_ARTIFACT_DIR=artifacts/server \
+  uv run --env-file .env.protocol streamlit run dashboard.py
 ```
 
-The dashboard reads the completed run selected by the atomic `current.json` index
-under `FML_SERVER_ARTIFACT_DIR` and reads public artifacts from
-`FML_PUBLIC_ARTIFACT_DIR`. Each ClientApp uses `CLIENT_DATA_DIR` for its one
-mounted client-scoped shard.
+### Distributed local Docker runtime
 
-The server never clears its configured artifact root. It writes each experiment to
-`runs/<run_id>` and advances `current.json` only after the run has a model,
-metrics, provenance, and verified SHA-256 checksums. Existing completed runs remain
-available for comparison:
-
-```bash
-uv run --env-file .env.protocol flwr run . --stream --federation-config "num-supernodes=4" --run-config "use-update-noise=false use-huber=false"
-uv run --env-file .env.protocol flwr run . --stream --federation-config "num-supernodes=4" --run-config "use-update-noise=false use-huber=true huber-threshold=10.0"
-uv run --env-file .env.protocol flwr run . --stream --federation-config "num-supernodes=4" --run-config "use-update-noise=true use-huber=false"
-```
-
-`use-huber` enables an experimental robust aggregation path for outlier-resistance
-experiments; it is not a Byzantine-security guarantee. `use-update-noise` is an
-illustrative ablation, not formal differential privacy: it has no privacy
-accountant, composition or sensitivity model, or published epsilon/delta and must
-not be presented as a privacy guarantee.
-
-Every server run and the documented local-training command create an immutable
-`run_manifest.json` before training. It
-contains a UUID, the Flower run ID, creation time, complete run configuration,
-Python/OS/package versions, Git revision and worktree state when available, known
-seeds, and SHA-256 checksums for the public manifest and vocabulary. Each completed
-`artifact_manifest.json` binds the saved model, metrics, and provenance file bytes
-to their SHA-256 checksums, which consumers validate and snapshot before loading.
-Set
-`FML_CODE_REVISION` to the full Git object ID in images that do not contain `.git`.
-Client shard identities and checksums are not collected by the server manifest.
-In this demo the operator still created all shards centrally; the boundary only
-describes what ServerApp reads at runtime.
-
-`artifact-retention-runs` defaults to `10`. Retention orders validated run
-manifests by `(created_at, run_id)`, keeps the newest configured count, and never
-deletes the active or currently selected run. Malformed or unrecognized run
-directories are left untouched for manual recovery.
-
-## Local distributed Docker runtime
-
-Prepare the four client shards, public artifacts, and host-only evaluation
-artifact before starting the runtime:
-
-```bash
-uv run --env-file .env.protocol python -m src.data_prep --partitions 4 --client-shard-dir artifacts/clients --public-artifact-dir artifacts/public --evaluation-artifact-dir artifacts/evaluation
-```
-
-Build the single application image and start the separate SuperLink, ServerApp,
-four SuperNode/ClientApp pairs, and dashboard services:
+The Compose stack runs one SuperLink, one ServerApp, four
+SuperNode/ClientApp pairs, and the dashboard:
 
 ```bash
 FML_CODE_REVISION="$(git rev-parse HEAD)" docker compose up --build -d
-```
-
-The launch command passes the exact host Git revision to ServerApp and every
-ClientApp without adding repository metadata to the image.
-
-Submit the Flower app to the running local federation:
-
-```bash
 uv run --env-file .env.protocol python -m src.flower_config
 uv run --env-file .env.protocol flwr run . local-docker --stream
 ```
 
-Flower 1.32.1 reads SuperLink connection profiles from `~/.flwr/config.toml` rather
-than the project configuration. The configuration command preserves unrelated
-profiles, rejects an existing `local-docker` profile unless it already points to
-the loopback Control API with insecure local transport, and waits until exactly
-four SuperNodes are registered online. The insecure connection is appropriate
-only for this loopback-only local runtime; do not use it for a remote or public
-SuperLink.
+Open <http://127.0.0.1:8501>, then stop the stack with:
 
-The dashboard is available at <http://127.0.0.1:8501>. Each ClientApp receives
-only its matching shard from the selected prepared generation as a read-only
-mount. Public artifacts from that same generation are read-only in every
-consuming service; only ServerApp can write
-`artifacts/server`, which the dashboard mounts read-only. The untouched
-`artifacts/evaluation` directory is not mounted into this PR13 runtime. Stop the
-runtime with `docker compose down`.
+```bash
+docker compose down
+```
 
-### Security and privacy scope
+Each ClientApp receives only its matching raw shard as a read-only mount. Public
+artifacts are read-only, only ServerApp can write the server history, and the
+untouched evaluation artifact is not mounted into the runtime.
+
+The `local-docker` Flower profile uses insecure loopback transport. It must not
+be used for a remote or public SuperLink.
+
+## Reproducibility and artifacts
+
+The frozen contract lives in
+[`docs/scientific-protocol-v1.toml`](docs/scientific-protocol-v1.toml). It pins
+the dataset revision, split checksums, model settings, seeds, partition rules,
+training order, strategy parameters, metrics, and statistical rules.
+
+Every documented Python entry point uses `.env.protocol` so the hash seed,
+TensorFlow determinism flags, and Keras backend are set before Python starts.
+Missing or conflicting values fail immediately.
+
+Server runs are stored under `artifacts/server/runs/<run_id>`. A run becomes
+current only after its model, metrics, provenance, and SHA-256 artifact manifest
+have been finalized. Existing runs remain available for comparison, and
+retention never removes the active or selected run.
+
+See [`COMPATIBILITY.md`](COMPATIBILITY.md) for schema compatibility and
+regeneration rules.
+
+## Security and privacy limitations
 
 This repository does not implement TLS, client or SuperNode authentication,
-secure aggregation, or formal differential privacy. The dashboard has no
-application authentication. Model parameters, metrics, sample counts, and
-artifacts can leak information even though ServerApp does not read raw shard
-files. The [secure-aggregation evaluation](docs/adr/0001-secure-aggregation.md)
-records why Flower SecAgg+ adoption is deferred. See the explicit
-[threat model](THREAT_MODEL.md) for assets, trust boundaries, attack surfaces,
-and requirements that must be met before production or privacy claims.
+secure aggregation, formal differential privacy, or dashboard authentication.
 
-### Deployment scope
+Model parameters, metrics, sample counts, and saved artifacts may leak
+information about client data. The optional update-noise setting is an
+illustrative ablation, not formal differential privacy. It has no privacy
+accountant, composition analysis, sensitivity model, or epsilon/delta guarantee.
 
-The previous multi-host Google Cloud deployment was removed because the project
-currently has no cloud access for live validation. The supported deployment path
-is the local Docker runtime above. Reintroduce a cloud deployment only when it can
-be tested end to end against real infrastructure.
+The supported deployment target is local execution. Cloud deployment,
+monitoring, disaster recovery, canary releases, and other production operations
+are intentionally outside the pet-project finish line.
+
+See [`THREAT_MODEL.md`](THREAT_MODEL.md),
+[`SECURITY.md`](SECURITY.md), and the
+[secure-aggregation decision](docs/adr/0001-secure-aggregation.md) for the
+detailed boundaries.
 
 ## Development
 
-Add dependencies with:
+Run the same local quality gates used by CI:
 
 ```bash
-uv add package-name
+uv sync --frozen
+uv run ruff format --check .
+uv run ruff check .
+uv run mypy
+uv run --env-file .env.protocol coverage run -m unittest discover -s tests
+uv run --env-file .env.protocol coverage report
+docker compose config --quiet
 ```
 
-Upgrade locked dependencies with:
+CI validates Python 3.11, 3.12, and 3.13, scans dependencies and containers, and
+builds and smoke-tests the application image.
 
-```bash
-uv lock --upgrade
-```
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a change.
 
-Before committing, format and check the codebase:
+## Technology
 
-```bash
-uv run --env-file .env.protocol ruff format .
-uv run --env-file .env.protocol ruff check .
-```
-
-See [COMPATIBILITY.md](COMPATIBILITY.md) for the application and artifact
-versioning policy and supported regeneration path.
-
-Open a new branch for each feature and use pull requests for review.
-
-## Tech stack
-
-1. Data preparation: Hugging Face Datasets and pandas
-2. Local machine learning: Keras with TensorFlow
-3. Federated machine learning: Flower
-4. Dashboard and analysis: Streamlit
+- [Flower](https://flower.ai/) for federated orchestration
+- [Keras](https://keras.io/) and
+  [TensorFlow](https://www.tensorflow.org/) for model training
+- [Hugging Face Datasets](https://huggingface.co/docs/datasets/) for the pinned
+  IMDB dataset
+- [Streamlit](https://streamlit.io/) for the local dashboard
+- NumPy for deterministic artifacts and metric inputs
