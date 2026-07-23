@@ -74,17 +74,17 @@ federated learning system.
 - [ ] Add model checkpoints and documented resume behavior.
 - [x] Introduce model and artifact versioning with retention rules.
 - [x] Preserve experiment history instead of relying on manually selected artifact directories.
-- [ ] Add health checks for containers and deployed services.
+- [x] Add health checks for containers and deployed services.
 - [ ] Add monitoring dashboards and alerts for deployed runs.
 - [ ] Define backup, restore, rollback, and disaster-recovery procedures.
 
 ## P1 — Deployment hardening
 
-- [ ] Run containers as a non-root user.
-- [ ] Pin base images by digest and define an update policy.
-- [ ] Add read-only root filesystems where possible.
-- [ ] Drop unnecessary Linux capabilities and enable `no-new-privileges`.
-- [ ] Add CPU, memory, and process limits.
+- [x] Run containers as a non-root user.
+- [x] Pin base images by digest and define an update policy.
+- [x] Add read-only root filesystems where possible.
+- [x] Drop unnecessary Linux capabilities and enable `no-new-privileges`.
+- [x] Add CPU, memory, and process limits.
 - [ ] Protect the Streamlit dashboard with authentication or an authenticated proxy.
 - [ ] Re-enable and correctly configure CORS and XSRF protection.
 - [ ] Replace ad-hoc cloud provisioning with reviewed infrastructure as code.

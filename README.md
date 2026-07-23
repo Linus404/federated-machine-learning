@@ -215,8 +215,14 @@ docker compose down
 ```
 
 Each ClientApp receives only its matching raw shard as a read-only mount. Public
-artifacts are read-only, only ServerApp can write the server history, and the
-untouched evaluation artifact is not mounted into the runtime.
+artifacts are read-only, only ServerApp can write the `server-artifacts` volume,
+the dashboard mounts that volume read-only, and the untouched evaluation
+artifact is not mounted into the runtime.
+
+Containers run as an unprivileged user with read-only root filesystems, dropped
+Linux capabilities, `no-new-privileges`, health checks, and CPU, memory, and
+process limits. The limits are local safety ceilings, not capacity-planning
+recommendations.
 
 The `local-docker` Flower profile uses insecure loopback transport. It must not
 be used for a remote or public SuperLink.
@@ -283,6 +289,10 @@ docker compose config --quiet
 
 CI validates Python 3.11, 3.12, and 3.13, scans dependencies and containers, and
 builds and smoke-tests the application image.
+
+The Docker base image is pinned by digest. Dependabot checks the retained tag
+weekly; base-image updates must pass the container build, smoke test, and
+vulnerability scan before merging.
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a change.
 

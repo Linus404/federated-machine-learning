@@ -68,7 +68,7 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         supernode_defaults = self.compose.split("services:\n", maxsplit=1)[0]
         self.assertIn("x-supernode: &supernode", supernode_defaults)
         self.assertIn("healthcheck:", supernode_defaults)
-        self.assertIn('127.0.0.1", 9094', supernode_defaults)
+        self.assertIn('127.0.0.1", 9095', supernode_defaults)
         self.assertNotIn('127.0.0.1", 9099', supernode_defaults)
 
         for service in ["serverapp"] + [f"supernode-{index}" for index in range(4)]:
@@ -105,7 +105,9 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         for service, command in expected_commands.items():
             with self.subTest(service=service):
                 block = service_block(self.compose, service)
-                self.assertRegex(block, r"<<: \*(flower-service|clientapp|supernode)")
+                self.assertRegex(
+                    block, r"<<: \*(flower-service|superexec|clientapp|supernode)"
+                )
                 self.assertIn(command, block)
                 self.assertNotIn("flwr run", block)
 
@@ -149,7 +151,52 @@ class DistributedDeploymentContractTests(unittest.TestCase):
     def test_image_includes_runtime_scientific_protocol(self) -> None:
         dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
 
-        self.assertIn("COPY docs/scientific-protocol-v1.toml ./docs/", dockerfile)
+        self.assertIn(
+            "docs/scientific-protocol-v1.toml ./docs/",
+            dockerfile,
+        )
+
+    def test_image_and_services_drop_root_privileges(self) -> None:
+        dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+        defaults = self.compose.split("x-superexec:", maxsplit=1)[0]
+
+        self.assertIn("USER 1000:1000", dockerfile)
+        self.assertIn("/app/state", dockerfile)
+        self.assertIn("read_only: true", defaults)
+        self.assertIn("cap_drop:\n    - ALL", defaults)
+        self.assertIn("no-new-privileges:true", defaults)
+
+    def test_services_have_resource_limits_and_writable_temporary_space(self) -> None:
+        defaults = self.compose.split("x-superexec:", maxsplit=1)[0]
+
+        self.assertIn("cpus: 2.0", defaults)
+        self.assertIn("mem_limit: 4g", defaults)
+        self.assertIn("pids_limit: 512", defaults)
+        self.assertIn("/tmp:size=512m,mode=1777", defaults)
+
+    def test_base_image_is_pinned_and_checked_for_updates(self) -> None:
+        dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+        dependabot = Path(".github/dependabot.yml").read_text(encoding="utf-8")
+
+        self.assertRegex(
+            dockerfile.splitlines()[0],
+            r"^FROM ghcr\.io/astral-sh/uv:python3\.12-bookworm-slim"
+            r"@sha256:[0-9a-f]{64}$",
+        )
+        self.assertIn("package-ecosystem: docker", dependabot)
+        self.assertIn("interval: weekly", dependabot)
+
+    def test_every_service_has_a_health_check(self) -> None:
+        defaults = self.compose.split("services:\n", maxsplit=1)[0]
+
+        self.assertIn("x-superexec: &superexec", defaults)
+        self.assertIn("x-supernode: &supernode", defaults)
+        self.assertEqual(
+            self.compose.count("--health-server-address 0.0.0.0:9095"),
+            9,
+        )
+        self.assertIn("healthcheck:", service_block(self.compose, "superlink"))
+        self.assertIn("healthcheck:", service_block(self.compose, "dashboard"))
 
     def test_contract_helpers_follow_project_docstring_conventions(self) -> None:
         docstring = service_block.__doc__ or ""
@@ -219,13 +266,14 @@ class DistributedDeploymentContractTests(unittest.TestCase):
 
     def test_server_outputs_have_one_writer_and_read_only_dashboard(self) -> None:
         self.assertIn(
-            "./artifacts/server:/app/artifacts/server\n",
+            "server-artifacts:/app/artifacts/server\n",
             service_block(self.compose, "serverapp"),
         )
         self.assertIn(
-            "./artifacts/server:/app/artifacts/server:ro",
+            "server-artifacts:/app/artifacts/server:ro",
             service_block(self.compose, "dashboard"),
         )
+        self.assertIn("server-artifacts:", self.compose)
 
     def test_local_superlink_profile_uses_user_flower_config(self) -> None:
         pyproject = Path("pyproject.toml").read_text(encoding="utf-8")

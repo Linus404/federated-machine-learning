@@ -1,11 +1,36 @@
 x-flower-service: &flower-service
   image: federated-machine-learning:latest
   restart: unless-stopped
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  cpus: 2.0
+  mem_limit: 4g
+  pids_limit: 512
+  tmpfs:
+    - /tmp:size=512m,mode=1777
   env_file:
     - .env.protocol
 
-x-clientapp: &clientapp
+x-superexec: &superexec
   <<: *flower-service
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      - >-
+        import socket;
+        socket.create_connection(("127.0.0.1", 9095), timeout=2).close()
+    interval: 5s
+    timeout: 3s
+    retries: 12
+    start_period: 10s
+
+x-clientapp: &clientapp
+  <<: *superexec
   environment:
     CLIENT_DATA_DIR: /app/client-data
     FML_CODE_REVISION: "${FML_CODE_REVISION:-}"
@@ -20,7 +45,7 @@ x-supernode: &supernode
       - -c
       - >-
         import socket;
-        socket.create_connection(("127.0.0.1", 9094), timeout=2).close()
+        socket.create_connection(("127.0.0.1", 9095), timeout=2).close()
     interval: 5s
     timeout: 3s
     retries: 12
@@ -55,13 +80,14 @@ services:
       - superlink-state:/app/state
 
   serverapp:
-    <<: *flower-service
+    <<: *superexec
     command: >
       uv run --no-sync
       flower-superexec
       --insecure
       --plugin-type serverapp
       --appio-api-address superlink:9091
+      --health-server-address 0.0.0.0:9095
     environment:
       FML_CODE_REVISION: "${FML_CODE_REVISION:-}"
       FML_PUBLIC_ARTIFACT_DIR: /app/artifacts/public
@@ -71,7 +97,7 @@ services:
         condition: service_healthy
     volumes:
       - ./artifacts/.prepared-current/public:/app/artifacts/public:ro
-      - ./artifacts/server:/app/artifacts/server
+      - server-artifacts:/app/artifacts/server
 
   supernode-0:
     <<: *supernode
@@ -82,6 +108,7 @@ services:
       --superlink superlink:9092
       --node-config partition-id=0
       --clientappio-api-address 0.0.0.0:9094
+      --health-server-address 0.0.0.0:9095
       --isolation process
     depends_on:
       superlink:
@@ -95,6 +122,7 @@ services:
       --insecure
       --plugin-type clientapp
       --appio-api-address supernode-0:9094
+      --health-server-address 0.0.0.0:9095
     depends_on:
       supernode-0:
         condition: service_healthy
@@ -114,6 +142,7 @@ services:
       --superlink superlink:9092
       --node-config partition-id=1
       --clientappio-api-address 0.0.0.0:9094
+      --health-server-address 0.0.0.0:9095
       --isolation process
     depends_on:
       superlink:
@@ -127,6 +156,7 @@ services:
       --insecure
       --plugin-type clientapp
       --appio-api-address supernode-1:9094
+      --health-server-address 0.0.0.0:9095
     depends_on:
       supernode-1:
         condition: service_healthy
@@ -146,6 +176,7 @@ services:
       --superlink superlink:9092
       --node-config partition-id=2
       --clientappio-api-address 0.0.0.0:9094
+      --health-server-address 0.0.0.0:9095
       --isolation process
     depends_on:
       superlink:
@@ -159,6 +190,7 @@ services:
       --insecure
       --plugin-type clientapp
       --appio-api-address supernode-2:9094
+      --health-server-address 0.0.0.0:9095
     depends_on:
       supernode-2:
         condition: service_healthy
@@ -178,6 +210,7 @@ services:
       --superlink superlink:9092
       --node-config partition-id=3
       --clientappio-api-address 0.0.0.0:9094
+      --health-server-address 0.0.0.0:9095
       --isolation process
     depends_on:
       superlink:
@@ -191,6 +224,7 @@ services:
       --insecure
       --plugin-type clientapp
       --appio-api-address supernode-3:9094
+      --health-server-address 0.0.0.0:9095
     depends_on:
       supernode-3:
         condition: service_healthy
@@ -208,6 +242,18 @@ services:
       streamlit run dashboard.py
       --server.address=0.0.0.0
       --server.port=8501
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen("http://127.0.0.1:8501/_stcore/health", timeout=2).read()
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
     environment:
       FML_PUBLIC_ARTIFACT_DIR: /app/artifacts/public
       FML_SERVER_ARTIFACT_DIR: /app/artifacts/server
@@ -215,7 +261,8 @@ services:
       - "127.0.0.1:8501:8501"
     volumes:
       - ./artifacts/.prepared-current/public:/app/artifacts/public:ro
-      - ./artifacts/server:/app/artifacts/server:ro
+      - server-artifacts:/app/artifacts/server:ro
 
 volumes:
+  server-artifacts:
   superlink-state:

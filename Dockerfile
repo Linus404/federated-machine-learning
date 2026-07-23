@@ -1,8 +1,9 @@
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim@sha256:e5b65587bce7de595f299855d7385fe7fca39b8a74baa261ba1b7147afa78e58
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_PROJECT_ENVIRONMENT=/opt/fml-venv \
+    HOME=/tmp \
     PYTHONHASHSEED=0 \
     TF_ENABLE_ONEDNN_OPTS=0 \
     TF_DETERMINISTIC_OPS=1 \
@@ -16,16 +17,18 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN apt-get update \
-    && apt-get upgrade --yes \
-    && rm -rf /var/lib/apt/lists/*
+RUN groupadd --gid 1000 app \
+    && useradd --uid 1000 --gid app --home-dir /app --shell /usr/sbin/nologin app
 
-COPY pyproject.toml uv.lock dashboard.py ./
+COPY --chown=app:app pyproject.toml uv.lock dashboard.py ./
 RUN uv sync --frozen --no-dev
 
-COPY src ./src
-COPY docs/scientific-protocol-v1.toml ./docs/
+COPY --chown=app:app src ./src
+COPY --chown=app:app docs/scientific-protocol-v1.toml ./docs/
 
-RUN mkdir -p /app/artifacts/public /app/artifacts/server
+RUN mkdir -p /app/artifacts/public /app/artifacts/server /app/state \
+    && chown -R app:app /app/artifacts /app/state
+
+USER 1000:1000
 
 CMD ["uv", "run", "--no-sync", "flwr", "run", ".", "--stream", "--federation-config", "num-supernodes=4"]

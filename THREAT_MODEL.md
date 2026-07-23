@@ -147,6 +147,9 @@ plaintext traffic.
   failures.
 - CI runs tests, type and format checks, secret scanning, dependency scanning,
   container scanning, and Compose validation.
+- Containers run as a non-root user with read-only root filesystems, all Linux
+  capabilities dropped, `no-new-privileges`, bounded CPU, memory, and process
+  counts, and explicit health checks.
 
 These are engineering safeguards, not evidence of privacy preservation or a
 production security boundary.
