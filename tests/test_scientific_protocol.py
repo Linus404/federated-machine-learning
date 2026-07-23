@@ -589,7 +589,8 @@ class ScientificProtocolTests(unittest.TestCase):
         self.assertEqual(self.protocol["status"], "frozen")
         scope = self.protocol["scope"]
         self.assertIn("later PR12 experiment runner", scope["purpose"])
-        self.assertIn("does not contain a runner", scope["implementation_status"])
+        self.assertIn("src/strategy_runner.py", scope["implementation_status"])
+        self.assertIn("does not orchestrate", scope["implementation_status"])
         self.assertIn(
             "not the registered experiment runner", scope["reviewed_server_boundary"]
         )

@@ -86,7 +86,8 @@ class AggregationProtocolTests(unittest.TestCase):
     def test_protocol_scope_does_not_claim_current_matrix_execution(self) -> None:
         scope = self.protocol["scope"]
 
-        self.assertIn("does not contain a runner", scope["implementation_status"])
+        self.assertIn("src/strategy_runner.py", scope["implementation_status"])
+        self.assertIn("does not orchestrate", scope["implementation_status"])
         self.assertIn(
             "not the registered experiment runner", scope["reviewed_server_boundary"]
         )

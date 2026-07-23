@@ -99,6 +99,20 @@ The current baseline validation curves remain Keras loss/accuracy history; the
 experiment runner must evaluate the fixed validation rows through the canonical
 evaluator after every epoch before claiming complete protocol conformance.
 
+Run one four-client IID strategy contract with live canonical validation after
+every local-only epoch or federated round:
+
+```bash
+uv run --env-file .env.protocol python -m src.strategy_runner fedavg --output-dir artifacts/strategies/fedavg
+```
+
+The accepted strategy names are `local_only`, `fedavg`, `fedprox`,
+`fedprox_huber`, `fedmedian`, and `fedtrimmedavg`. Each output directory must be
+new. This runner saves the model, direct per-epoch or per-round float32
+validation predictions, final untouched-test predictions, and `results.json`.
+It intentionally runs one `iid_stratified` seed cell at a time; later matrix
+work adds non-IID partitions, client scales, threats, and comparative summaries.
+
 ## Direct Flower simulation
 
 Run the Flower app directly using the per-partition raw directories generated
