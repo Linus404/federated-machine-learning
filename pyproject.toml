@@ -3,7 +3,7 @@ name = "federated-machine-learning"
 version = "0.2.0"
 description = "Federated sentiment analysis using Flower and Keras"
 readme = "README.md"
-license = "UNLICENSED"
+license = "MIT"
 authors = [
     { name = "LeLinus", email = "linus.code404@gmail.com" }
 ]

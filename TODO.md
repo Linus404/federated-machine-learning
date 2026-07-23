@@ -11,7 +11,7 @@ federated learning system.
 - [x] Measure test coverage and define a meaningful minimum coverage threshold.
 - [x] Add Docker build and Compose validation smoke tests to CI.
 - [x] Add dependency, secret, and container vulnerability scanning.
-- [ ] Choose an open-source license and add a `LICENSE` file.
+- [x] Choose an open-source license and add a `LICENSE` file.
 - [x] Add `CONTRIBUTING.md`, `SECURITY.md`, and pull-request/issue templates.
 - [x] Move notebook-only dependencies such as `ipykernel` and `nbformat` out of runtime dependencies.
 - [x] Align Ruff's target Python version with the supported Python versions.
