@@ -1,6 +1,14 @@
 x-flower-service: &flower-service
-  image: federated-machine-learning:latest
+  image: ${FML_IMAGE:-federated-machine-learning:latest}
   restart: unless-stopped
+  labels:
+    org.opencontainers.image.revision: "${FML_RELEASE:-development}"
+    org.federated-ml.environment: "${FML_ENVIRONMENT:-development}"
+  logging:
+    driver: local
+    options:
+      max-size: "${FML_LOG_MAX_SIZE:-10m}"
+      max-file: "${FML_LOG_MAX_FILES:-5}"
   read_only: true
   cap_drop:
     - ALL

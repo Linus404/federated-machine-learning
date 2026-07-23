@@ -3,6 +3,86 @@
 These procedures cover the supported single-host Compose demonstration. They do
 not establish production disaster recovery.
 
+## Environment separation
+
+Use a distinct Compose project and reviewed environment file for each
+environment. Copy the matching file from `deploy/environments/`, keep the
+result outside Git, and replace every placeholder. Production and canary
+`FML_IMAGE` values must be immutable registry digests; `FML_RELEASE` records the
+matching Git commit in container labels.
+
+```bash
+docker compose --env-file /secure/config/production.env \
+  -f compose.yaml -f compose.secure.yaml -f compose.production.yaml config --quiet
+docker compose -p fml-production --env-file /secure/config/production.env \
+  -f compose.yaml -f compose.secure.yaml -f compose.production.yaml up -d --wait --no-build
+```
+
+The base Compose file is the development environment. The production overlay
+removes the dashboard's direct host port and adds the authenticated proxy.
+Production and canary commands also require the secure Flower credentials
+described below.
+
+## Dashboard authentication
+
+Create an Apache-compatible SHA-512 password file outside the repository. The
+command prompts without echoing the password; do not put the cleartext password
+in an environment file or shell history.
+
+```bash
+install -d -m 0700 /secure/federated-ml
+printf 'operator:%s\n' "$(openssl passwd -6)" \
+  > /secure/federated-ml/dashboard.htpasswd
+chmod 0444 /secure/federated-ml/dashboard.htpasswd
+```
+
+Set `FML_DASHBOARD_HTPASSWD_FILE` to that absolute path. Nginx is digest-pinned,
+runs as UID 101 with all capabilities dropped, and records the authenticated
+username in its JSON access log. The file must be container-readable because
+Compose file-backed secrets preserve host mode; its `0700` parent prevents
+other host users from traversing to the password hash. The dashboard remains
+loopback-only by default; remote access should terminate TLS before this proxy.
+
+## Centralized single-host logs
+
+Every container uses Docker's `local` logging driver with bounded rotation.
+This is the supported single-host collection point: application JSON events and
+proxy authentication records are available through one Compose project.
+
+```bash
+mkdir -p audit
+docker compose -p fml-production --env-file /secure/config/production.env \
+  -f compose.yaml -f compose.secure.yaml -f compose.production.yaml logs \
+  --no-color --timestamps > "audit/containers-$(date -u +%Y%m%dT%H%M%SZ).log"
+sha256sum audit/containers-*.log > audit/SHA256SUMS
+```
+
+Export and protect logs before rotation when retention or incident evidence is
+required. Docker logs are operational audit records, not immutable compliance
+storage; forward them from the host when off-host retention is required.
+
+## Canary and rollback
+
+Run a candidate as a separate Compose project with the canary example's
+non-conflicting loopback ports and isolated named volumes:
+
+```bash
+docker compose -p fml-canary --env-file /secure/config/canary.env \
+  -f compose.yaml -f compose.secure.yaml -f compose.production.yaml up -d --wait --no-build
+docker compose -p fml-canary --env-file /secure/config/canary.env \
+  -f compose.yaml -f compose.secure.yaml -f compose.production.yaml ps --status running
+```
+
+Record the current production `FML_IMAGE`, `FML_RELEASE`, and volume backup
+before promotion. Promote only by changing the production file to the verified
+candidate digest and running `up -d --wait --no-build`. Roll back by restoring
+the previous `FML_IMAGE` and `FML_RELEASE` values and running the same command;
+restore volumes only when the compatibility policy requires it.
+
+No cloud infrastructure-as-code is supplied because this project defines no
+cloud provider, region, network boundary, identity system, or availability
+target. Fabricating provider resources would not be a deployable contract.
+
 ## Secure Flower transport and SuperNode authentication
 
 The default Compose file is loopback-only and intentionally insecure. The

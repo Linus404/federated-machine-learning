@@ -1,0 +1,47 @@
+services:
+  dashboard:
+    ports: !reset []
+
+  dashboard-proxy:
+    image: nginx:1.28.1-alpine@sha256:52e3ada4d978443601f286cc2f9e7b95c82aa3ad5a78ce9c6b94ce00258e68cc
+    user: "101:101"
+    entrypoint: ["nginx", "-g", "daemon off;"]
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    cpus: 0.5
+    mem_limit: 128m
+    pids_limit: 64
+    tmpfs:
+      - /var/cache/nginx:size=32m,mode=0755,uid=101,gid=101
+      - /var/run:size=1m,mode=0755,uid=101,gid=101
+    logging:
+      driver: local
+      options:
+        max-size: "${FML_LOG_MAX_SIZE:-10m}"
+        max-file: "${FML_LOG_MAX_FILES:-5}"
+    labels:
+      org.opencontainers.image.revision: "${FML_RELEASE:-unset}"
+      org.federated-ml.environment: "${FML_ENVIRONMENT:-production}"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+    depends_on:
+      dashboard:
+        condition: service_healthy
+    ports:
+      - "${FML_DASHBOARD_BIND:-127.0.0.1:8501}:8080"
+    volumes:
+      - ./deploy/nginx/dashboard.conf:/etc/nginx/nginx.conf:ro
+    secrets:
+      - dashboard_htpasswd
+
+secrets:
+  dashboard_htpasswd:
+    file: ${FML_DASHBOARD_HTPASSWD_FILE:-./secrets/dashboard.htpasswd}

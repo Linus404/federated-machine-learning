@@ -112,7 +112,10 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         }
 
         self.assertEqual(
-            self.compose.count("image: federated-machine-learning:latest"), 1
+            self.compose.count(
+                "image: ${FML_IMAGE:-federated-machine-learning:latest}"
+            ),
+            1,
         )
         for service, command in expected_commands.items():
             with self.subTest(service=service):
@@ -185,6 +188,28 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         self.assertIn("mem_limit: 4g", defaults)
         self.assertIn("pids_limit: 512", defaults)
         self.assertIn("/tmp:size=512m,mode=1777", defaults)
+
+    def test_single_host_logs_are_centrally_retained_by_docker(self) -> None:
+        defaults = self.compose.split("x-superexec:", maxsplit=1)[0]
+
+        self.assertIn("driver: local", defaults)
+        self.assertIn('max-size: "${FML_LOG_MAX_SIZE:-10m}"', defaults)
+        self.assertIn('max-file: "${FML_LOG_MAX_FILES:-5}"', defaults)
+
+    def test_release_image_and_environment_are_operator_controlled(self) -> None:
+        defaults = self.compose.split("x-superexec:", maxsplit=1)[0]
+
+        self.assertIn(
+            "image: ${FML_IMAGE:-federated-machine-learning:latest}", defaults
+        )
+        self.assertIn(
+            'org.opencontainers.image.revision: "${FML_RELEASE:-development}"',
+            defaults,
+        )
+        self.assertIn(
+            'org.federated-ml.environment: "${FML_ENVIRONMENT:-development}"',
+            defaults,
+        )
 
     def test_base_image_is_pinned_and_checked_for_updates(self) -> None:
         dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
@@ -341,6 +366,81 @@ class SecureDeploymentContractTests(unittest.TestCase):
                 self.assertIn("--auth-supernode-private-key", supernode)
                 self.assertIn("--appio-ssl-certfile", supernode)
                 self.assertIn("--root-certificates", clientapp)
+
+
+class ProductionDeploymentContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.compose = Path("compose.production.yaml").read_text(encoding="utf-8")
+        cls.proxy = Path("deploy/nginx/dashboard.conf").read_text(encoding="utf-8")
+        cls.operations = Path("OPERATIONS.md").read_text(encoding="utf-8")
+
+    def test_production_exposes_dashboard_only_through_authenticated_proxy(
+        self,
+    ) -> None:
+        dashboard = service_block(self.compose, "dashboard")
+        proxy = service_block(self.compose, "dashboard-proxy")
+
+        self.assertIn("ports: !reset []", dashboard)
+        self.assertIn("dashboard_htpasswd", proxy)
+        self.assertIn("${FML_DASHBOARD_BIND:-127.0.0.1:8501}:8080", proxy)
+        self.assertIn("auth_basic", self.proxy)
+        self.assertIn(
+            "auth_basic_user_file /run/secrets/dashboard_htpasswd", self.proxy
+        )
+
+    def test_proxy_image_is_pinned_and_runs_without_root_privileges(self) -> None:
+        proxy = service_block(self.compose, "dashboard-proxy")
+
+        self.assertRegex(
+            proxy,
+            r"image: nginx:1\.28\.1-alpine@sha256:[0-9a-f]{64}",
+        )
+        self.assertIn('user: "101:101"', proxy)
+        self.assertIn("read_only: true", proxy)
+        self.assertIn("cap_drop:", proxy)
+        self.assertIn("- ALL", proxy)
+        self.assertIn("no-new-privileges:true", proxy)
+
+    def test_proxy_emits_authentication_identity_in_json_access_logs(self) -> None:
+        self.assertIn("escape=json", self.proxy)
+        self.assertIn('"user":"$remote_user"', self.proxy)
+        self.assertIn("access_log /dev/stdout audit_json", self.proxy)
+
+    def test_environment_examples_separate_bindings_and_release_inputs(self) -> None:
+        development = Path("deploy/environments/development.env.example").read_text(
+            encoding="utf-8"
+        )
+        production = Path("deploy/environments/production.env.example").read_text(
+            encoding="utf-8"
+        )
+        staging = Path("deploy/environments/staging.env.example").read_text(
+            encoding="utf-8"
+        )
+        canary = Path("deploy/environments/canary.env.example").read_text(
+            encoding="utf-8"
+        )
+
+        for environment in (development, staging, production, canary):
+            self.assertIn("FML_IMAGE=", environment)
+            self.assertIn("FML_RELEASE=", environment)
+            self.assertIn("FML_ENVIRONMENT=", environment)
+        self.assertIn("FML_ENVIRONMENT=staging", staging)
+        self.assertIn("127.0.0.1:19093", canary)
+        self.assertIn("127.0.0.1:18501", canary)
+        self.assertIn("FML_DASHBOARD_HTPASSWD_FILE=", production)
+        self.assertNotIn("password=", production.lower())
+
+    def test_operations_define_auditable_canary_and_rollback_without_cloud_iac(
+        self,
+    ) -> None:
+        self.assertIn("## Environment separation", self.operations)
+        self.assertIn("## Dashboard authentication", self.operations)
+        self.assertIn("## Centralized single-host logs", self.operations)
+        self.assertIn("## Canary and rollback", self.operations)
+        self.assertIn("docker compose -p fml-canary", self.operations)
+        self.assertIn("FML_IMAGE", self.operations)
+        self.assertIn("No cloud infrastructure-as-code", self.operations)
 
 
 if __name__ == "__main__":
