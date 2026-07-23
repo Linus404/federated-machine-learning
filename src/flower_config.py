@@ -17,6 +17,7 @@ from src.flower_readiness import (
 
 LOCAL_SUPERLINK_PROFILE = "local-docker"
 LOCAL_SUPERLINK_ADDRESS = "127.0.0.1:9093"
+CLIENT_COUNT_ENVIRONMENT_VARIABLE = "FML_CLIENT_COUNT"
 LOCAL_SUPERLINK_SETTINGS = {
     "address": LOCAL_SUPERLINK_ADDRESS,
     "insecure": True,
@@ -137,7 +138,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         Parsed command-line values.
     """
     parser = argparse.ArgumentParser(
-        description="Configure local Docker Flower and wait for its four SuperNodes."
+        description="Configure local Docker Flower and wait for its SuperNodes."
     )
     parser.add_argument(
         "--config",
@@ -149,9 +150,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--readiness-timeout",
         type=float,
         default=DEFAULT_READINESS_TIMEOUT_SECONDS,
-        help="seconds to wait for all four SuperNodes (default: 120)",
+        help="seconds to wait for all required SuperNodes (default: 120)",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--client-count",
+        type=int,
+        default=os.environ.get(
+            CLIENT_COUNT_ENVIRONMENT_VARIABLE,
+            str(DEFAULT_EXPECTED_ONLINE_SUPERNODES),
+        ),
+        help=(
+            "required SuperNode count "
+            f"(default: ${CLIENT_COUNT_ENVIRONMENT_VARIABLE} or "
+            f"{DEFAULT_EXPECTED_ONLINE_SUPERNODES})"
+        ),
+    )
+    args = parser.parse_args(argv)
+    if args.client_count < 1:
+        parser.error("--client-count must be positive")
+    return args
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -171,7 +188,7 @@ def main(argv: list[str] | None = None) -> None:
         created = ensure_local_superlink_profile(args.config)
         wait_for_online_supernodes(
             address=LOCAL_SUPERLINK_ADDRESS,
-            expected_online=DEFAULT_EXPECTED_ONLINE_SUPERNODES,
+            expected_online=args.client_count,
             timeout_seconds=args.readiness_timeout,
         )
     except (TimeoutError, ValueError) as error:
@@ -179,7 +196,7 @@ def main(argv: list[str] | None = None) -> None:
     action = "created" if created else "validated"
     print(f"{action} [superlink.{LOCAL_SUPERLINK_PROFILE}] in {args.config}")
     print(
-        f"validated exactly {DEFAULT_EXPECTED_ONLINE_SUPERNODES} online SuperNodes "
+        f"validated exactly {args.client_count} online SuperNodes "
         f"at {LOCAL_SUPERLINK_ADDRESS}"
     )
 

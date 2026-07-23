@@ -81,7 +81,7 @@ class LocalFlowerProfileTests(unittest.TestCase):
 
             self.assertEqual(config_path.read_text(encoding="utf-8"), invalid)
 
-    def test_main_waits_for_four_online_supernodes(self) -> None:
+    def test_main_waits_for_configured_online_supernodes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.toml"
 
@@ -92,14 +92,32 @@ class LocalFlowerProfileTests(unittest.TestCase):
                         str(config_path),
                         "--readiness-timeout",
                         "7.5",
+                        "--client-count",
+                        "6",
                     ]
                 )
 
             wait.assert_called_once_with(
                 address="127.0.0.1:9093",
-                expected_online=4,
+                expected_online=6,
                 timeout_seconds=7.5,
             )
+
+    def test_main_reads_client_count_from_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+
+            with (
+                patch.dict("os.environ", {"FML_CLIENT_COUNT": "3"}),
+                patch("src.flower_config.wait_for_online_supernodes") as wait,
+            ):
+                main(["--config", str(config_path)])
+
+            self.assertEqual(wait.call_args.kwargs["expected_online"], 3)
+
+    def test_main_rejects_non_positive_client_count(self) -> None:
+        with self.assertRaises(SystemExit):
+            main(["--client-count", "0"])
 
 
 if __name__ == "__main__":

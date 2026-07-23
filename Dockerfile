@@ -11,6 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     KERAS_BACKEND=tensorflow \
     FML_PUBLIC_ARTIFACT_DIR=/app/artifacts/public \
     FML_SERVER_ARTIFACT_DIR=/app/artifacts/server \
+    FML_CLIENT_COUNT=4 \
     RAY_memory_usage_threshold=0.99 \
     MALLOC_ARENA_MAX=2 \
     PYTHONWARNINGS=ignore
@@ -32,4 +33,4 @@ RUN mkdir -p /app/artifacts/public /app/artifacts/server /app/state \
 
 USER 1000:1000
 
-CMD ["uv", "run", "--no-sync", "flwr", "run", ".", "--stream", "--federation-config", "num-supernodes=4"]
+CMD ["sh", "-c", "exec uv run --no-sync flwr run . --stream --federation-config \"num-supernodes=${FML_CLIENT_COUNT}\" --run-config \"expected-client-count=${FML_CLIENT_COUNT}\""]

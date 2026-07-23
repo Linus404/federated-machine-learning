@@ -56,7 +56,7 @@ federated learning system.
 
 - [ ] Add a real end-to-end Flower test with multiple clients and at least one training round.
 - [ ] Add a containerized end-to-end smoke test.
-- [ ] Make the required client count configurable throughout server and deployment code.
+- [x] Make the required client count configurable throughout server and deployment code.
 - [ ] Test partial client participation, disconnects, timeouts, and failed rounds.
 - [x] Test malformed, missing, incompatible, and corrupted manifests and artifacts.
 - [x] Test invalid model updates, incompatible tensor shapes, NaN values, and empty aggregation inputs.
