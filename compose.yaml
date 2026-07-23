@@ -242,6 +242,8 @@ services:
       streamlit run dashboard.py
       --server.address=0.0.0.0
       --server.port=8501
+      --server.enableCORS=true
+      --server.enableXsrfProtection=true
     healthcheck:
       test:
         - CMD

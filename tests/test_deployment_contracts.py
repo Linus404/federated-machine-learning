@@ -55,6 +55,12 @@ class DistributedDeploymentContractTests(unittest.TestCase):
         self.assertIn('"127.0.0.1:9093:9093"', service_block(self.compose, "superlink"))
         self.assertIn('"127.0.0.1:8501:8501"', service_block(self.compose, "dashboard"))
 
+    def test_dashboard_enables_browser_request_protections(self) -> None:
+        dashboard = service_block(self.compose, "dashboard")
+
+        self.assertIn("--server.enableCORS=true", dashboard)
+        self.assertIn("--server.enableXsrfProtection=true", dashboard)
+
     def test_superlink_state_survives_container_restarts(self) -> None:
         superlink = service_block(self.compose, "superlink")
 

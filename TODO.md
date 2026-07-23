@@ -86,7 +86,7 @@ federated learning system.
 - [x] Drop unnecessary Linux capabilities and enable `no-new-privileges`.
 - [x] Add CPU, memory, and process limits.
 - [ ] Protect the Streamlit dashboard with authentication or an authenticated proxy.
-- [ ] Re-enable and correctly configure CORS and XSRF protection.
+- [x] Re-enable and correctly configure CORS and XSRF protection.
 - [ ] Replace ad-hoc cloud provisioning with reviewed infrastructure as code.
 - [ ] Separate development, staging, and production configuration.
 - [ ] Add centralized log collection and deployment audit trails.
