@@ -9,7 +9,7 @@ assignees: ""
 ## Problem
 
 Describe the user or research problem. Explain why the current behavior is not
-sufficient and link related issues or `TODO.md` items.
+sufficient and link related issues.
 
 ## Proposed outcome
 

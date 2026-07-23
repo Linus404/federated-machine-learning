@@ -4,7 +4,7 @@
 
 ## Related work
 
-<!-- Link an issue or identify the TODO.md item. Use "None" when not applicable. -->
+<!-- Link an issue. Use "None" when not applicable. -->
 
 ## Verification
 

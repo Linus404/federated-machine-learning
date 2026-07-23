@@ -40,6 +40,37 @@ epochs/rounds and the same untouched 25,000-review test set. Metric cells show m
   FedAvg, 4.23 for Huber, and 11.43 for median/trimmed mean. This synthetic result
   is not presented as sentiment-model accuracy.
 
+## Paired descriptive comparisons
+
+Each difference below pairs the same three seeds before averaging. Positive
+values favor FedAvg; values are accuracy percentage points.
+
+| Partition | FedAvg − local only | FedAvg − FedProx | FedAvg − FedProx + Huber |
+| --- | ---: | ---: | ---: |
+| IID | +3.42 | +6.53 | +6.51 |
+| Dirichlet `α=0.5` | +19.16 | +14.36 | +15.49 |
+| Dirichlet `α=0.1` | +14.33 | +13.92 | +12.32 |
+
+FedAvg exceeded every comparator's accuracy in each of the nine paired
+seed-and-partition comparisons. The severe non-IID F1 differences were less
+stable: one seed favored local-only and both proximal strategies over FedAvg.
+Three seeds are enough for descriptive paired differences, not a precise
+confidence interval.
+
+The heterogeneity penalty below compares each non-IID cell with the same
+strategy and seed under IID.
+
+| Strategy | `α=0.5` − IID | `α=0.1` − IID |
+| --- | ---: | ---: |
+| Local only | −18.10 | −28.73 |
+| FedAvg | −2.36 | −17.82 |
+| FedProx | −10.19 | −25.21 |
+| FedProx + Huber | −11.35 | −23.64 |
+
+These comparisons support the narrow conclusion that FedAvg tolerated moderate
+heterogeneity best in this campaign. They do not establish a general ranking of
+federated optimizers or robust aggregators.
+
 ## Reproduce
 
 Prepare the pinned IMDB artifacts, then run:
@@ -64,3 +95,5 @@ campaign. Three seeds support a mean and sample variance but not a strong
 population-level claim. Communication counts cover serialized Flower Parameters
 protobufs and exclude metadata, TLS, and transport framing. Full machine-readable
 evidence is in [`portfolio-matrix.json`](portfolio-matrix.json).
+The project-wide experiment inventory and recommended extensions are in
+[`../EXPERIMENTS.md`](../EXPERIMENTS.md).

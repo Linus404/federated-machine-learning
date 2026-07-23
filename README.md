@@ -6,7 +6,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 ![Docker Compose](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
 
-A reproducible federated-learning pet project that asks a concrete question:
+A reproducible academic federated-learning project that asks a concrete question:
 **how much does client heterogeneity change sentiment-classification quality, and
 when do federated or robust aggregation strategies help?**
 
@@ -24,6 +24,8 @@ ran 20 epochs/rounds against the same checksum-verified test set. Values below a
 mean accuracy with sample variance in parentheses; full precision, recall, F1,
 ROC-AUC, confusion matrices, timing, communication, and raw per-seed records are in
 [`results/portfolio-matrix.json`](results/portfolio-matrix.json).
+The complete experiment inventory and the boundary between executed and
+registered work are documented in [`EXPERIMENTS.md`](EXPERIMENTS.md).
 
 | Strategy | IID | Dirichlet 0.5 | Dirichlet 0.1 |
 | --- | ---: | ---: | ---: |
@@ -149,10 +151,11 @@ uv run --env-file .env.protocol python -m src.experiment_matrix \
   --evaluation-artifact-dir artifacts/portfolio-data/evaluation --quiet
 ```
 
-The full protocol additionally registers five seeds, median/trimmed-mean strategies,
-16/64-client scale cells, and larger robustness/privacy campaigns. The checked-in
-portfolio result is deliberately the 36-cell comparison above, not a claim that the
-maximum 290-cell research budget was executed.
+The full protocol additionally registers five seeds, median/trimmed-mean
+strategies, 16/64-client scale cells, and larger robustness/privacy campaigns.
+The checked-in evidence is the 36-cell comparison above plus the synthetic
+aggregation benchmark. [`EXPERIMENTS.md`](EXPERIMENTS.md) lists the unexecuted
+cells and ranks the most useful academic extensions.
 
 Each cell writes `results.json`, raw `.npy` predictions, model files, and
 `provenance.json` with the Git revision/dirty state, effective configuration,
@@ -213,8 +216,8 @@ and teardown are documented in [`OPERATIONS.md`](OPERATIONS.md).
   deployment alerts, and release/audit labels.
 - TLS, SuperNode identity authentication, dashboard proxy authentication, non-root
   read-only containers, dropped capabilities, resource limits, and pinned images.
-- Empirical membership-inference and update-leakage evaluators with exact frozen
-  metrics and explicit evidence requirements; see
+- Registered membership-inference and update-leakage evaluators with exact frozen
+  metrics and explicit evidence requirements; no attack result is published; see
   [`docs/PRIVACY_EVALUATION.md`](docs/PRIVACY_EVALUATION.md).
 
 ## Security, privacy, and limitations

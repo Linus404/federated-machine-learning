@@ -8,12 +8,18 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 DOCUMENTS = (
     ROOT / "README.md",
+    ROOT / "EXPERIMENTS.md",
+    ROOT / "MODEL_CARD.md",
+    ROOT / "DATASET_CARD.md",
     ROOT / "SECURITY.md",
     ROOT / "THREAT_MODEL.md",
     ROOT / "COMPATIBILITY.md",
     ROOT / "CONTRIBUTING.md",
+    ROOT / "docs" / "PERFORMANCE_AND_ROBUSTNESS.md",
+    ROOT / "docs" / "PRIVACY_EVALUATION.md",
     ROOT / "docs" / "adr" / "0001-secure-aggregation.md",
     ROOT / "docs" / "SECURITY_PRIVACY_REVIEW.md",
+    ROOT / "results" / "portfolio-matrix.md",
 )
 
 

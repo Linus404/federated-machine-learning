@@ -5,7 +5,7 @@ and easy to review.
 
 ## Before opening an issue
 
-- Search existing issues and `TODO.md` before proposing duplicate work.
+- Search existing issues before proposing duplicate work.
 - Use the bug report or feature request template so maintainers receive the
   information needed to reproduce or evaluate the change.
 - Report suspected vulnerabilities through the private process in
@@ -37,8 +37,9 @@ uv run --env-file .env.protocol ruff check .
 uv run --env-file .env.protocol mypy
 ```
 
-Use `uv run --env-file .env.protocol ruff format .` to apply formatting. If a check cannot run in your
-environment, explain why in the pull request rather than marking it complete.
+Use `uv run --env-file .env.protocol ruff format .` to apply formatting. If a
+check cannot run in your environment, explain why in the pull request rather
+than marking it complete.
 
 Changes to experiment behavior or reported results must include enough
 configuration, seed, dataset, and artifact information to reproduce the claim.
@@ -49,7 +50,7 @@ experiments as production guarantees.
 
 - Open one pull request per coherent change.
 - Explain the problem, the chosen solution, and any user-visible impact.
-- Link the relevant issue or `TODO.md` item.
+- Link the relevant issue.
 - Include the exact verification commands and their outcomes.
 - Update documentation when commands, configuration, or behavior changes.
 - Do not commit generated artifacts, datasets, credentials, or secrets.
