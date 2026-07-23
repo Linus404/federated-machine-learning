@@ -53,7 +53,7 @@ flowchart LR
     R --> E[Models, predictions, and results]
 ```
 
-The preparation command centrally creates every demo shard. Client-scoped
+The preparation command centrally creates all demo shards. Client-scoped
 storage models the runtime boundary only; it is not evidence that the data came
 from independent organizations. The untouched test artifact is available only
 to offline evaluators after training and is not mounted into ClientApp,
@@ -68,6 +68,7 @@ ServerApp, or the dashboard.
 - Docker with Compose only for the distributed container demonstration
 
 The supported Python versions are 3.11 through 3.13.
+On Windows, use WSL 2 rather than native PowerShell.
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -220,18 +221,13 @@ regeneration rules.
 
 ## Security and privacy limitations
 
-This repository does **not** implement:
-
-- TLS for Flower communication;
-- client or SuperNode authentication;
-- secure aggregation;
-- formal differential privacy;
-- dashboard authentication.
+This repository does not implement TLS, client or SuperNode authentication,
+secure aggregation, formal differential privacy, or dashboard authentication.
 
 Model parameters, metrics, sample counts, and saved artifacts may leak
 information about client data. The optional update-noise setting is an
-illustrative ablation without a privacy accountant, composition analysis,
-sensitivity model, or epsilon/delta guarantee.
+illustrative ablation, not formal differential privacy. It has no privacy
+accountant, composition analysis, sensitivity model, or epsilon/delta guarantee.
 
 The supported deployment target is local execution. Cloud deployment,
 monitoring, disaster recovery, canary releases, and other production operations
