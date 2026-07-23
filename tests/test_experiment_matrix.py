@@ -36,11 +36,17 @@ def _result(strategy: str, partition: str, seed: int) -> dict[str, object]:
         "roc_auc": seed / 100,
         "confusion_matrix": [[seed, 0], [0, seed]],
     }
-    return {
+    result = {
         "strategy": strategy,
         "config": {"partition": partition, "seed": seed},
         "test_mean" if strategy == "local_only" else "test": metrics,
     }
+    result["system"] = {
+        "client_training_time_ns": seed * 1_000,
+        "communication": {"total_bytes": seed * 10},
+        "convergence_round": seed % 20,
+    }
+    return result
 
 
 class ExperimentMatrixTests(unittest.TestCase):
@@ -81,6 +87,10 @@ class ExperimentMatrixTests(unittest.TestCase):
             metric = payload["aggregates"][0]["metrics"]["accuracy"]
             self.assertAlmostEqual(metric["mean"], 0.84)
             self.assertAlmostEqual(metric["sample_variance"], 0.0578)
+            self.assertEqual(
+                payload["aggregates"][0]["system"]["communication_bytes"]["mean"],
+                840,
+            )
             self.assertEqual(
                 payload["cells"][0]["result"]["test"]["confusion_matrix"],
                 [[67, 0], [0, 67]],

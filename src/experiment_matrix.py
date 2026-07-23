@@ -19,6 +19,7 @@ from src.strategy_runner import (
 
 DEFAULT_STRATEGIES = ("local_only", "fedavg", "fedprox", "fedprox_huber")
 METRICS = ("accuracy", "precision", "recall", "f1", "roc_auc")
+SYSTEM_METRICS = ("training_time_ns", "communication_bytes", "convergence_round")
 
 
 def _ordered_selection(
@@ -119,6 +120,41 @@ def _validate_result(
     return result
 
 
+def _cell_system_metrics(result: Mapping[str, Any]) -> dict[str, float]:
+    """Return normalized system metrics available for one cell.
+
+    Parameters
+    ----------
+    result : mapping of str to Any
+        Persisted strategy-runner result.
+
+    Returns
+    -------
+    dict of str to float
+        Training time and, for federated cells, communication and convergence.
+    """
+    system = result.get("system")
+    if not isinstance(system, Mapping):
+        return {}
+    training_time = system.get(
+        "client_training_time_ns", system.get("training_time_ns")
+    )
+    metrics = (
+        {"training_time_ns": float(training_time)}
+        if isinstance(training_time, int) and not isinstance(training_time, bool)
+        else {}
+    )
+    communication = system.get("communication")
+    if isinstance(communication, Mapping):
+        total_bytes = communication.get("total_bytes")
+        if isinstance(total_bytes, int) and not isinstance(total_bytes, bool):
+            metrics["communication_bytes"] = float(total_bytes)
+    convergence = system.get("convergence_round")
+    if isinstance(convergence, int) and not isinstance(convergence, bool):
+        metrics["convergence_round"] = float(convergence)
+    return metrics
+
+
 def _aggregate(cells: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Aggregate final-test metrics across seeds by strategy and partition.
 
@@ -142,6 +178,11 @@ def _aggregate(cells: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
             name: [float(_cell_metrics(cell["result"])[name]) for cell in group]
             for name in METRICS
         }
+        cell_system_metrics = [_cell_system_metrics(cell["result"]) for cell in group]
+        system_values = {
+            name: [metrics[name] for metrics in cell_system_metrics if name in metrics]
+            for name in SYSTEM_METRICS
+        }
         summaries.append(
             {
                 "strategy": strategy,
@@ -155,6 +196,16 @@ def _aggregate(cells: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
                         else None,
                     }
                     for name, samples in values.items()
+                },
+                "system": {
+                    name: {
+                        "mean": fmean(samples),
+                        "sample_variance": variance(samples)
+                        if len(samples) > 1
+                        else None,
+                    }
+                    for name, samples in system_values.items()
+                    if samples
                 },
             }
         )
@@ -208,6 +259,7 @@ def _markdown(payload: Mapping[str, Any]) -> str:
                 )
                 + " |"
             )
+        lines.extend(("", "System metrics retain nanoseconds and bytes in JSON."))
     return "\n".join(lines) + "\n"
 
 
