@@ -48,6 +48,7 @@ from src.evaluation_artifact import (
     load_evaluation_artifact_snapshot,
     load_scientific_protocol,
 )
+from src.experiment_provenance import write_experiment_provenance
 from src.huber_strategy import _flatten, _unflatten, huber_aggregate
 from src.local_training import build_model_from_manifest, tokenize_rows
 from src.paths import default_evaluation_artifact_dir, default_public_artifact_dir
@@ -951,6 +952,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         for filename, model in zip(result["models"], models, strict=True):
             model.save(str(output_dir / filename))
         (output_dir / "results.json").write_bytes(canonical_json_bytes(result))
+        write_experiment_provenance(
+            output_dir,
+            result=result,
+            public_manifest=manifest,
+            evaluation_snapshot=load_evaluation_artifact_snapshot(
+                args.evaluation_artifact_dir
+            ),
+            client_snapshots=snapshots,
+            protocol=protocol,
+        )
     except BaseException:
         shutil.rmtree(output_dir)
         raise
