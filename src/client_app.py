@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 import os
+import hashlib
 from pathlib import Path
+from time import perf_counter_ns
 from typing import Any
 
 from src.protocol_runtime import validate_protocol_runtime
@@ -11,7 +13,7 @@ import keras
 import numpy as np
 from flwr.client import NumPyClient
 from flwr.clientapp import ClientApp
-from flwr.common import NDArrays, Scalar
+from flwr.common import NDArrays, Scalar, ndarrays_to_parameters, serde
 
 from src import parse_run_config_bool
 from src.app_manifest import configured_value, load_app_manifest
@@ -28,6 +30,50 @@ UPDATE_NOISE_L2_NORM_CLIP = 1.0
 UPDATE_NOISE_MULTIPLIER = 0.001
 CLIENT_DATA_DIR_ENV = "CLIENT_DATA_DIR"
 PROXIMAL_MU_CONFIG_KEY = "proximal_mu"
+SERVER_ROUND_CONFIG_KEY = "server_round"
+DEFAULT_EXPERIMENT_SEED = 67
+
+
+def _client_seed(master_seed: int, client_id: int, server_round: int) -> int:
+    """Derive a deterministic Keras seed for one client round.
+
+    Parameters
+    ----------
+    master_seed : int
+        Run-level seed.
+    client_id : int
+        Stable client partition ID.
+    server_round : int
+        Zero for construction or a positive Flower round.
+
+    Returns
+    -------
+    int
+        Positive TensorFlow-compatible seed.
+    """
+    material = f"{master_seed}|client-{client_id}|round-{server_round}".encode()
+    return (
+        int.from_bytes(hashlib.sha256(material).digest()[:8], "big") % 2_147_483_647
+        or 1
+    )
+
+
+def _parameter_payload_bytes(weights: NDArrays) -> int:
+    """Return exact serialized Flower ``Parameters`` protobuf bytes.
+
+    Parameters
+    ----------
+    weights : list of numpy.ndarray
+        Complete model tensors in model order.
+
+    Returns
+    -------
+    int
+        Serialized parameter bytes excluding message and transport framing.
+    """
+    return len(
+        serde.parameters_to_proto(ndarrays_to_parameters(weights)).SerializeToString()
+    )
 
 
 def _proximal_penalty(local_weights: list[Any], global_weights: list[Any]) -> Any:
@@ -57,6 +103,7 @@ class SentimentClient(NumPyClient):
         use_update_noise: bool = False,
         update_noise_l2_norm_clip: float = UPDATE_NOISE_L2_NORM_CLIP,
         update_noise_multiplier: float = UPDATE_NOISE_MULTIPLIER,
+        seed: int = DEFAULT_EXPERIMENT_SEED,
     ) -> None:
         validate_protocol_runtime()
         self.client_data_dir = resolve_dir(client_data_dir)
@@ -66,6 +113,9 @@ class SentimentClient(NumPyClient):
         self.use_update_noise = use_update_noise
         self.update_noise_l2_norm_clip = update_noise_l2_norm_clip
         self.update_noise_multiplier = update_noise_multiplier
+        if type(seed) is not int:
+            raise ValueError("seed must be a built-in integer")
+        self.seed = seed
         self.train_data: ArrayPair
         self.val_data: ArrayPair
         manifest = load_app_manifest(
@@ -74,6 +124,7 @@ class SentimentClient(NumPyClient):
         self.train_data, self.val_data = load_client_shard(
             self.client_data_dir, manifest, self.client_id, validation_split
         )
+        keras.utils.set_random_seed(_client_seed(seed, client_id, 0))
         self.model = build_model_from_manifest(manifest)
 
     def _add_update_noise(
@@ -197,15 +248,25 @@ class SentimentClient(NumPyClient):
     ) -> tuple[NDArrays, int, dict[str, Scalar]]:
         """Train with illustrative update-noise, not formal differential privacy."""
         self.model.set_weights(parameters)
+        server_round = config.get(SERVER_ROUND_CONFIG_KEY, 0)
+        if type(server_round) is not int or server_round < 0:
+            raise ValueError("server_round must be a non-negative built-in integer")
+        keras.utils.set_random_seed(
+            _client_seed(self.seed, self.client_id, server_round)
+        )
         if PROXIMAL_MU_CONFIG_KEY in config:
             self._configure_proximal_loss(float(config[PROXIMAL_MU_CONFIG_KEY]))
         weights_before = [w.copy() for w in self.model.get_weights()]
-        history = self.model.fit(
-            *self.train_data,
-            epochs=self.epochs,
-            batch_size=self.batch_size,
-            verbose=0,
-        )
+        started_at = perf_counter_ns()
+        try:
+            history = self.model.fit(
+                *self.train_data,
+                epochs=self.epochs,
+                batch_size=self.batch_size,
+                verbose=0,
+            )
+        finally:
+            training_time_ns = perf_counter_ns() - started_at
         trained_weights = self.model.get_weights()
         weights = (
             self._add_update_noise(weights_before, trained_weights)
@@ -216,6 +277,9 @@ class SentimentClient(NumPyClient):
             name: float(values[-1]) for name, values in history.history.items()
         }
         metrics["client_id"] = self.client_id
+        metrics["training_time_ns"] = training_time_ns
+        metrics["request_parameter_bytes"] = _parameter_payload_bytes(parameters)
+        metrics["response_parameter_bytes"] = _parameter_payload_bytes(weights)
         log_event(
             self.logger,
             logging.INFO,
@@ -223,6 +287,9 @@ class SentimentClient(NumPyClient):
             "fit_completed",
             client_id=self.client_id,
             examples=len(self.train_data[0]),
+            training_time_ns=training_time_ns,
+            request_parameter_bytes=metrics["request_parameter_bytes"],
+            response_parameter_bytes=metrics["response_parameter_bytes"],
             update_noise=self.use_update_noise,
         )
 
@@ -277,6 +344,7 @@ def client_fn(context: Any) -> Any:
         update_noise_multiplier=float(
             run_config.get("update-noise-multiplier", UPDATE_NOISE_MULTIPLIER)
         ),
+        seed=int(run_config.get("experiment-seed", DEFAULT_EXPERIMENT_SEED)),
     )
     client.logger = structured_logger("client")
     log_event(

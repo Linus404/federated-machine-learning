@@ -65,6 +65,7 @@ class ClientConfigTests(unittest.TestCase):
             use_update_noise=True,
             update_noise_l2_norm_clip=2.0,
             update_noise_multiplier=0.5,
+            seed=67,
             client_data_dir=client_app.resolve_dir("data/client-3"),
         )
 
@@ -152,6 +153,7 @@ class UpdateNoiseFitTests(unittest.TestCase):
         client.use_update_noise = use_update_noise
         client.update_noise_l2_norm_clip = 1.0
         client.update_noise_multiplier = 0.001
+        client.seed = 67
         return client
 
     def test_fit_returns_trained_weights_when_update_noise_is_disabled(self) -> None:
@@ -165,7 +167,13 @@ class UpdateNoiseFitTests(unittest.TestCase):
         client._add_update_noise.assert_not_called()
         np.testing.assert_array_equal(weights[0], np.array([1.0, 2.0], dtype="float32"))
         self.assertEqual(num_examples, 2)
-        self.assertEqual(metrics, {"loss": 0.2, "accuracy": 0.9, "client_id": 3})
+        self.assertEqual(
+            {name: metrics[name] for name in ("loss", "accuracy", "client_id")},
+            {"loss": 0.2, "accuracy": 0.9, "client_id": 3},
+        )
+        self.assertGreaterEqual(metrics["training_time_ns"], 0)
+        self.assertGreater(metrics["request_parameter_bytes"], 0)
+        self.assertGreater(metrics["response_parameter_bytes"], 0)
 
     def test_fit_applies_update_noise_when_enabled(self) -> None:
         client = self.make_client(use_update_noise=True)

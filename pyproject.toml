@@ -42,6 +42,7 @@ public-artifact-dir = "artifacts/public"
 server-artifact-dir = "artifacts/server"
 artifact-retention-runs = 10
 expected-client-count = 4
+experiment-seed = 67
 client-data-dir = "artifacts/clients/client-{partition}"
 proximal-mu = 0.1
 use-huber = false

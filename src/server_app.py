@@ -9,8 +9,10 @@ import tempfile
 import warnings
 from numbers import Real
 from pathlib import Path
+from time import perf_counter_ns
 from typing import Any
 
+import keras
 import numpy as np
 from flwr.common import (
     Context,
@@ -283,6 +285,16 @@ def _validate_fit_results(
                 )
             if not np.all(np.isfinite(weight)):
                 raise ValueError("fit result model weights must contain finite values")
+        for name in (
+            "training_time_ns",
+            "request_parameter_bytes",
+            "response_parameter_bytes",
+        ):
+            value = fit_result.metrics.get(name)
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(
+                    f"fit result {name} must be a non-negative built-in integer"
+                )
         decoded_weights.append(weights)
     return ordered_results, decoded_weights
 
@@ -419,6 +431,7 @@ class SentimentServer(FedProx):
 
     expected_client_ids: frozenset[int]
     expected_weight_shapes: tuple[tuple[int, ...], ...]
+    experiment_seed: int
     logger: logging.Logger | None = None
 
     def __init__(
@@ -443,6 +456,7 @@ class SentimentServer(FedProx):
         self.app_manifest = app_manifest
         self.huber_threshold = huber_threshold
         self.use_huber = use_huber
+        self._round_started_at_ns: dict[int, int] = {}
         write_server_artifact_manifest(
             self.artifact_dir, app_manifest=self.app_manifest
         )
@@ -498,6 +512,40 @@ class SentimentServer(FedProx):
         if artifact_lock is not None:
             artifact_lock.release()
 
+    def configure_fit(self, server_round, parameters, client_manager):
+        """Record availability before selecting clients for one fit round.
+
+        Parameters
+        ----------
+        server_round : int
+            One-based Flower server round.
+        parameters : Parameters
+            Current global model parameters.
+        client_manager : Any
+            Flower client manager for the active run.
+
+        Returns
+        -------
+        list[Any]
+            Fit instructions selected by the parent strategy.
+        """
+        round_starts = getattr(self, "_round_started_at_ns", {})
+        self._round_started_at_ns = round_starts
+        round_starts[server_round] = perf_counter_ns()
+        configured = super().configure_fit(server_round, parameters, client_manager)
+        for _, fit_instructions in configured:
+            fit_instructions.config["server_round"] = server_round
+        log_event(
+            self.logger,
+            logging.INFO,
+            "fit round configured",
+            "fit_round_configured",
+            round=server_round,
+            available_clients=client_manager.num_available(),
+            selected_clients=len(configured),
+        )
+        return configured
+
     def aggregate_fit(self, server_round, results, failures):
         """Aggregate one complete, validated fit round or hard-fail.
 
@@ -523,6 +571,9 @@ class SentimentServer(FedProx):
             If the result set, an input, or the aggregate violates the runtime
             aggregation contract.
         """
+        round_started_at = getattr(self, "_round_started_at_ns", {}).pop(
+            server_round, perf_counter_ns()
+        )
         try:
             parameters: Parameters | None
             if failures:
@@ -565,6 +616,16 @@ class SentimentServer(FedProx):
             model.set_weights(aggregate_weights)
             model.save(str(self.model_path))
             _write_checkpoint(self.artifact_dir, server_round, aggregate_weights)
+            telemetry = {
+                name: sum(
+                    int(result.metrics.get(name, 0)) for _, result in ordered_results
+                )
+                for name in (
+                    "training_time_ns",
+                    "request_parameter_bytes",
+                    "response_parameter_bytes",
+                )
+            }
             log_event(
                 self.logger,
                 logging.INFO,
@@ -572,7 +633,16 @@ class SentimentServer(FedProx):
                 "fit_round_completed",
                 round=server_round,
                 clients=len(ordered_results),
+                failures=len(failures),
                 aggregation="huber" if self.use_huber else "fedprox",
+                round_duration_ns=perf_counter_ns() - round_started_at,
+                communication_scope=(
+                    "serialized Flower Parameters protobufs; excludes message "
+                    "metadata, TLS, and transport framing"
+                ),
+                training_time_ns=telemetry["training_time_ns"],
+                request_parameter_bytes=telemetry["request_parameter_bytes"],
+                response_parameter_bytes=telemetry["response_parameter_bytes"],
             )
         except BaseException:
             log_event(
@@ -582,6 +652,9 @@ class SentimentServer(FedProx):
                 "fit_round_failed",
                 exc_info=True,
                 round=server_round,
+                successful_clients=len(results),
+                failures=len(failures),
+                round_duration_ns=perf_counter_ns() - round_started_at,
             )
             self._release_artifact_lock()
             raise
@@ -690,6 +763,7 @@ def create_strategy(
     use_huber: bool = False,
     huber_threshold: float = DEFAULT_HUBER_THRESHOLD,
     resume_from_checkpoint: str | Path | None = None,
+    seed: int = 67,
 ) -> SentimentServer:
     """Create the deployment strategy with exact-round validation.
 
@@ -719,6 +793,8 @@ def create_strategy(
         Explicit checkpoint from an earlier run. Resume starts a new immutable run,
         uses these weights as round-zero parameters, and executes ``final_round`` new
         rounds; metrics and round numbers do not continue from the source run.
+    seed : int, optional
+        Run-level Keras initialization seed.
 
     Returns
     -------
@@ -732,11 +808,14 @@ def create_strategy(
     """
     if type(min_clients) is not int or min_clients <= 0:
         raise ValueError("min_clients must be a positive built-in integer")
+    if type(seed) is not int:
+        raise ValueError("seed must be a built-in integer")
     resolved_artifact_dir = resolve_dir(artifact_dir or default_server_artifact_dir())
 
     app_manifest = load_app_manifest(
         public_artifact_dir=public_artifact_dir,
     )
+    keras.utils.set_random_seed(seed)
     initial_model = build_model_from_manifest(app_manifest)
     initial_weights = initial_model.get_weights()
     expected_weight_shapes = tuple(weight.shape for weight in initial_weights)
@@ -767,6 +846,7 @@ def create_strategy(
     )
     strategy.expected_client_ids = frozenset(range(min_clients))
     strategy.expected_weight_shapes = expected_weight_shapes
+    strategy.experiment_seed = seed
     return strategy
 
 
@@ -841,6 +921,7 @@ def server_fn(context: Context) -> ServerAppComponents:
                 run_config.get("huber-threshold", DEFAULT_HUBER_THRESHOLD)
             ),
             resume_from_checkpoint=run_config.get("resume-from-checkpoint"),
+            seed=int(run_config.get("experiment-seed", 67)),
         )
         prune_run_history(artifact_root, retention_runs, active_run_dir=run_dir)
         strategy.logger = structured_logger("server")
