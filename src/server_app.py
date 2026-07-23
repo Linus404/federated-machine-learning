@@ -7,6 +7,7 @@ import math
 import os
 import tempfile
 import warnings
+from collections.abc import Mapping
 from numbers import Real
 from pathlib import Path
 from time import perf_counter_ns
@@ -112,7 +113,7 @@ def _sorted_fit_results(
         if not isinstance(result, tuple) or len(result) != 2:
             raise ValueError(f"every {result_kind} result must be a pair")
         metrics = getattr(result[1], "metrics", None)
-        if not isinstance(metrics, dict):
+        if not isinstance(metrics, Mapping):
             raise ValueError(f"every {result_kind} result must contain metrics")
         client_id = metrics.get("client_id")
         if type(client_id) is not int:
