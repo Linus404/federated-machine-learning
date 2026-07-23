@@ -6,6 +6,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import keras
+import numpy as np
+
 from src.app_manifest import load_app_manifest
 from src.artifact_compatibility import (
     PUBLIC_ARTIFACT_SCHEMA_VERSION,
@@ -15,6 +18,7 @@ from tests.test_artifact_flow import write_client_artifacts
 from src.artifact_history import resolve_current_run_dir
 from src.local_training import (
     DEFAULT_VALIDATION_SEED,
+    build_model,
     load_client_shard_snapshot,
     train,
 )
@@ -25,6 +29,32 @@ from src.run_provenance import (
 
 
 class LocalTrainingTests(unittest.TestCase):
+    def test_model_round_trip_preserves_architecture_and_weights(self) -> None:
+        """Verify that the supported Keras format reloads the project model.
+
+        Returns
+        -------
+        None
+        """
+        model = build_model(
+            vocab_size=16,
+            sequence_length=8,
+            embedding_dim=4,
+            dropout_seed=67,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "model.keras"
+            model.save(path)
+            restored = keras.models.load_model(path)
+
+        self.assertEqual(restored.input_shape, model.input_shape)
+        self.assertEqual(restored.output_shape, model.output_shape)
+        for expected, actual in zip(
+            model.get_weights(), restored.get_weights(), strict=True
+        ):
+            np.testing.assert_array_equal(actual, expected)
+
     def test_train_binds_validated_private_shard_in_immutable_run_manifest(
         self,
     ) -> None:
