@@ -455,6 +455,7 @@ def build_model(
     vocab_size: int,
     sequence_length: int,
     embedding_dim: int,
+    dropout_seed: int | None = None,
 ) -> Any:
     """Build the sentiment model reused by local and federated training.
 
@@ -466,6 +467,8 @@ def build_model(
         Exact frozen token sequence length.
     embedding_dim : int
         Exact frozen embedding dimension.
+    dropout_seed : int or None, optional
+        Explicit deterministic Dropout seed for registered experiments.
 
     Returns
     -------
@@ -495,7 +498,7 @@ def build_model(
     )(x)
     x = keras.layers.GlobalMaxPooling1D()(x)
     x = keras.layers.Dense(32, activation="relu")(x)
-    x = keras.layers.Dropout(0.3)(x)
+    x = keras.layers.Dropout(0.3, seed=dropout_seed)(x)
 
     outputs = keras.layers.Dense(1, activation="sigmoid")(x)
 
@@ -615,13 +618,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def build_model_from_manifest(manifest: AppManifest) -> Any:
+def build_model_from_manifest(
+    manifest: AppManifest, *, dropout_seed: int | None = None
+) -> Any:
     """Build the sentiment model from public manifest metadata.
 
     Parameters
     ----------
     manifest : AppManifest
         Manifest containing the model dimensions.
+    dropout_seed : int or None, optional
+        Explicit deterministic Dropout seed for registered experiments.
 
     Returns
     -------
@@ -634,6 +641,7 @@ def build_model_from_manifest(manifest: AppManifest) -> Any:
         payload["vocabulary_size"],
         payload["sequence_length"],
         payload["embedding_dim"],
+        dropout_seed,
     )
 
 

@@ -6,9 +6,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
+import keras
 import numpy as np
 
-from src.baseline_training import run
+from src.baseline_training import (
+    _derive_seed,
+    _registered_iid_splits,
+    _training_orders,
+    run,
+)
+from src.evaluation_artifact import load_scientific_protocol
+from src.local_training import build_model
 
 
 def baseline_args(root: Path, baseline: str) -> argparse.Namespace:
@@ -86,9 +94,14 @@ def model(history: SimpleNamespace, evaluation: tuple[float, float]) -> MagicMoc
 class BaselineTrainingTests(unittest.TestCase):
     def setUp(self) -> None:
         """Create shared validated artifact and array fixtures."""
+        self.protocol = load_scientific_protocol()
         self.manifest = SimpleNamespace(payload={"dataset": {"rows": 4}})
         self.snapshots = [training_snapshot(0, 2), training_snapshot(1, 3)]
-        self.splits = [
+        self.row_splits = [
+            ((self.snapshots[0].rows[0],), (self.snapshots[0].rows[1],)),
+            ((self.snapshots[1].rows[0],), (self.snapshots[1].rows[1],)),
+        ]
+        self.array_splits = [
             (
                 (np.array([[0]], dtype=np.int32), np.array([0], dtype=np.float32)),
                 (np.array([[2]], dtype=np.int32), np.array([1], dtype=np.float32)),
@@ -98,6 +111,20 @@ class BaselineTrainingTests(unittest.TestCase):
                 (np.array([[3]], dtype=np.int32), np.array([0], dtype=np.float32)),
             ),
         ]
+        self.combined_rows = (
+            (self.snapshots[0].rows[0], self.snapshots[1].rows[0]),
+            (self.snapshots[0].rows[1], self.snapshots[1].rows[1]),
+        )
+        self.combined_arrays = (
+            (
+                np.array([[0], [1]], dtype=np.int32),
+                np.array([0, 1], dtype=np.float32),
+            ),
+            (
+                np.array([[2], [3]], dtype=np.int32),
+                np.array([1, 0], dtype=np.float32),
+            ),
+        )
         self.test_data = (
             np.array([[10], [11]], dtype=np.int32),
             np.array([0, 1], dtype=np.float32),
@@ -105,6 +132,59 @@ class BaselineTrainingTests(unittest.TestCase):
         self.history = SimpleNamespace(
             history={"val_loss": [0.5], "val_accuracy": [0.75]}
         )
+
+    def test_registered_iid_and_validation_assignments_match_golden_rows(self) -> None:
+        rows = tuple(
+            (f"train:{index}", f"review {index}", 0 if index < 20 else 1)
+            for index in range(40)
+        )
+        splits = _registered_iid_splits(
+            [SimpleNamespace(rows=rows)], self.protocol, 67, 4, 0.2
+        )
+
+        self.assertEqual(
+            [
+                [int(row[0].removeprefix("train:")) for row in fitted]
+                for fitted, _ in splits
+            ],
+            [
+                [6, 13, 16, 19, 35, 37, 38, 39],
+                [2, 3, 7, 17, 23, 27, 31, 36],
+                [8, 10, 15, 18, 22, 28, 29, 30],
+                [0, 5, 9, 12, 21, 24, 26, 32],
+            ],
+        )
+        self.assertEqual(
+            [
+                [int(row[0].removeprefix("train:")) for row in validation]
+                for _, validation in splits
+            ],
+            [[4, 20], [14, 34], [11, 33], [1, 25]],
+        )
+
+    def test_registered_seed_and_training_orders_match_golden_values(self) -> None:
+        self.assertEqual(
+            _derive_seed(
+                67,
+                "partition/iid/4/round--1/epoch--1/client--1/label-0",
+            ),
+            7719479962854520267,
+        )
+        rows = tuple(
+            (f"train:{index}", f"review {index}", index % 2) for index in range(8)
+        )
+        orders = _training_orders(rows, self.protocol, 67, "CELL", -1, 2)
+        self.assertEqual(
+            [order.tolist() for order in orders],
+            [[2, 6, 5, 3, 0, 7, 4, 1], [7, 0, 2, 4, 3, 6, 1, 5]],
+        )
+
+    def test_model_uses_registered_explicit_dropout_seed(self) -> None:
+        built = build_model(16, 8, 4, dropout_seed=123)
+        dropout = next(
+            layer for layer in built.layers if isinstance(layer, keras.layers.Dropout)
+        )
+        self.assertEqual(dropout.seed, 123)
 
     def test_centralized_trains_before_loading_untouched_test_data(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -125,6 +205,10 @@ class BaselineTrainingTests(unittest.TestCase):
 
             with (
                 patch(
+                    "src.baseline_training.load_scientific_protocol",
+                    return_value=self.protocol,
+                ),
+                patch(
                     "src.baseline_training.load_app_manifest",
                     return_value=self.manifest,
                 ),
@@ -133,8 +217,17 @@ class BaselineTrainingTests(unittest.TestCase):
                     side_effect=self.snapshots,
                 ) as load_shard,
                 patch(
-                    "src.baseline_training._tokenize_client_shard",
-                    side_effect=self.splits,
+                    "src.baseline_training._registered_iid_splits",
+                    return_value=self.row_splits,
+                ),
+                patch(
+                    "src.baseline_training._combined_split",
+                    return_value=(self.combined_rows, self.combined_arrays),
+                ),
+                patch("src.baseline_training._model_seeds", return_value=(101, 202)),
+                patch(
+                    "src.baseline_training._training_orders",
+                    return_value=[np.array([0, 1])],
                 ),
                 patch(
                     "src.baseline_training.load_evaluation_artifact_snapshot",
@@ -146,7 +239,7 @@ class BaselineTrainingTests(unittest.TestCase):
                 patch(
                     "src.baseline_training.build_model_from_manifest",
                     return_value=trained_model,
-                ),
+                ) as build_model_from_manifest,
                 patch("src.baseline_training.keras.utils.set_random_seed") as set_seed,
             ):
                 result = run(args)
@@ -158,10 +251,14 @@ class BaselineTrainingTests(unittest.TestCase):
                     call(str(Path(tmpdir) / "client-1"), self.manifest, 1),
                 ]
             )
-            set_seed.assert_called_once_with(67)
+            set_seed.assert_called_once_with(101)
+            build_model_from_manifest.assert_called_once_with(
+                self.manifest, dropout_seed=202
+            )
             fit_args, fit_kwargs = trained_model.fit.call_args
+            batches = fit_args[0]
             np.testing.assert_array_equal(
-                fit_args[0], np.array([[0], [1]], dtype=np.int32)
+                batches[0][0], np.array([[0], [1]], dtype=np.int32)
             )
             np.testing.assert_array_equal(
                 fit_kwargs["validation_data"][0],
@@ -169,6 +266,17 @@ class BaselineTrainingTests(unittest.TestCase):
             )
             self.assertFalse(fit_kwargs["shuffle"])
             self.assertEqual(result["test"], {"loss": 0.4, "accuracy": 0.8})
+            self.assertEqual(
+                result["config"],
+                {
+                    "batch_size": 4,
+                    "client_count": 2,
+                    "epochs": 1,
+                    "partition": "iid_stratified",
+                    "seed": 67,
+                    "validation_split": 0.25,
+                },
+            )
             self.assertTrue((args.output_dir / "centralized.keras").is_file())
             self.assertEqual(
                 json.loads((args.output_dir / "results.json").read_text()), result
@@ -201,6 +309,10 @@ class BaselineTrainingTests(unittest.TestCase):
 
             with (
                 patch(
+                    "src.baseline_training.load_scientific_protocol",
+                    return_value=self.protocol,
+                ),
+                patch(
                     "src.baseline_training.load_app_manifest",
                     return_value=self.manifest,
                 ),
@@ -209,8 +321,20 @@ class BaselineTrainingTests(unittest.TestCase):
                     side_effect=self.snapshots,
                 ),
                 patch(
-                    "src.baseline_training._tokenize_client_shard",
-                    side_effect=self.splits,
+                    "src.baseline_training._registered_iid_splits",
+                    return_value=self.row_splits,
+                ),
+                patch(
+                    "src.baseline_training._tokenize_split",
+                    side_effect=self.array_splits,
+                ),
+                patch(
+                    "src.baseline_training._model_seeds",
+                    side_effect=[(101, 201), (102, 202)],
+                ),
+                patch(
+                    "src.baseline_training._training_orders",
+                    side_effect=[[np.array([0])], [np.array([0])]],
                 ),
                 patch(
                     "src.baseline_training.load_evaluation_artifact_snapshot",
@@ -222,13 +346,20 @@ class BaselineTrainingTests(unittest.TestCase):
                 patch(
                     "src.baseline_training.build_model_from_manifest",
                     side_effect=models,
-                ),
+                ) as build_model_from_manifest,
                 patch("src.baseline_training.keras.utils.set_random_seed") as set_seed,
             ):
                 result = run(args)
 
             self.assertEqual(events, ["fit-0", "fit-1", "test"])
-            self.assertEqual(set_seed.call_args_list, [call(67), call(68)])
+            self.assertEqual(set_seed.call_args_list, [call(101), call(102)])
+            self.assertEqual(
+                build_model_from_manifest.call_args_list,
+                [
+                    call(self.manifest, dropout_seed=201),
+                    call(self.manifest, dropout_seed=202),
+                ],
+            )
             self.assertEqual(result["test_mean"], {"loss": 0.5, "accuracy": 0.8})
             self.assertEqual(
                 [client["test"] for client in result["clients"]],
@@ -239,6 +370,66 @@ class BaselineTrainingTests(unittest.TestCase):
             )
             self.assertTrue((args.output_dir / "client-0.keras").is_file())
             self.assertTrue((args.output_dir / "client-1.keras").is_file())
+
+    def test_save_failure_removes_owned_output_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = baseline_args(Path(tmpdir), "centralized")
+            trained_model = model(self.history, (0.4, 0.8))
+            trained_model.save.side_effect = OSError("model save failed")
+
+            with (
+                patch(
+                    "src.baseline_training.load_scientific_protocol",
+                    return_value=self.protocol,
+                ),
+                patch(
+                    "src.baseline_training.load_app_manifest",
+                    return_value=self.manifest,
+                ),
+                patch(
+                    "src.baseline_training.load_client_shard_snapshot",
+                    side_effect=self.snapshots,
+                ),
+                patch(
+                    "src.baseline_training._registered_iid_splits",
+                    return_value=self.row_splits,
+                ),
+                patch(
+                    "src.baseline_training._combined_split",
+                    return_value=(self.combined_rows, self.combined_arrays),
+                ),
+                patch("src.baseline_training._model_seeds", return_value=(101, 202)),
+                patch(
+                    "src.baseline_training._training_orders",
+                    return_value=[np.array([0, 1])],
+                ),
+                patch(
+                    "src.baseline_training.load_evaluation_artifact_snapshot",
+                    return_value=SimpleNamespace(rows=(("test:0", "test", 0),)),
+                ),
+                patch(
+                    "src.baseline_training.tokenize_rows", return_value=self.test_data
+                ),
+                patch(
+                    "src.baseline_training.build_model_from_manifest",
+                    return_value=trained_model,
+                ),
+                patch("src.baseline_training.keras.utils.set_random_seed"),
+            ):
+                with self.assertRaisesRegex(OSError, "model save failed"):
+                    run(args)
+
+            self.assertFalse(args.output_dir.exists())
+
+    def test_invalid_client_template_fails_before_creating_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = baseline_args(Path(tmpdir), "centralized")
+            args.client_data_dir = "{{partition}}"
+
+            with self.assertRaisesRegex(ValueError, "contain"):
+                run(args)
+
+            self.assertFalse(args.output_dir.exists())
 
 
 if __name__ == "__main__":

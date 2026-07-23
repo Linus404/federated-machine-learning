@@ -83,14 +83,18 @@ uv run --env-file .env.protocol python -m src.baseline_training local-only --out
 ```
 
 Each output directory must be new. The centralized command trains one model on
-the union of the deterministic fitted client rows and validates on the union of
-their validation rows. The local-only command trains one independent model per
-client and reports the unweighted mean of their untouched-test loss and accuracy.
-Both commands finish every training call before loading the evaluation artifact,
-write the trained model files plus canonical `results.json`, and default to four
-clients, 20 epochs, batch size 64, validation fraction 0.2, and seed 67. PR15 adds
-the complete frozen classification metric set; later experiment-matrix work adds
-the remaining registered seeds and non-IID partitions.
+the union of the registered fitted rows and validates on their registered
+validation union. The local-only command trains one independent model per
+registered IID client and reports the unweighted mean of their untouched-test
+loss and accuracy. Both commands reconstruct the frozen `iid_stratified`
+assignment from the complete validated train-shard union, derive validation,
+model, Dropout, and per-epoch training-order seeds from the frozen namespaces,
+finish every training call before loading the evaluation artifact, and write the
+trained model files plus canonical `results.json` with the effective inputs. They
+default to four clients, 20 epochs, batch size 64, validation fraction 0.2, and
+seed 67. PR15 adds the complete frozen classification metric set; later
+experiment-matrix work adds the remaining registered seeds and non-IID
+partitions.
 
 ## Direct Flower simulation
 
