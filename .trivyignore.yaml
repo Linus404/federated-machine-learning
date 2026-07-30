@@ -27,3 +27,11 @@ vulnerabilities:
     statement: >-
       Flower 1.32.1 pins Ray 2.55.1, whose ray_dist.jar bundles this Jackson
       release. Re-evaluate when Flower permits a Ray release with the fix.
+  - id: CVE-2026-57516
+    purls:
+      - pkg:pypi/ray@2.55.1
+    expired_at: 2026-08-20
+    statement: >-
+      Flower 1.32.1 pins Ray 2.55.1, while the first fixed release is 2.56.0.
+      This project does not call ray.data.read_webdataset. Re-evaluate when
+      Flower permits Ray 2.56.

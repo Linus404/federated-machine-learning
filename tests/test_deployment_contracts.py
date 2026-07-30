@@ -225,7 +225,7 @@ class DistributedDeploymentContractTests(unittest.TestCase):
 
         self.assertRegex(
             dockerfile.splitlines()[0],
-            r"^FROM ghcr\.io/astral-sh/uv:python3\.12-bookworm-slim"
+            r"^FROM ghcr\.io/astral-sh/uv:python3\.12-trixie-slim"
             r"@sha256:[0-9a-f]{64}$",
         )
         self.assertIn("package-ecosystem: docker", dependabot)

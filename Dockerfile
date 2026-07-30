@@ -1,4 +1,4 @@
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim@sha256:e5b65587bce7de595f299855d7385fe7fca39b8a74baa261ba1b7147afa78e58
+FROM ghcr.io/astral-sh/uv:python3.12-trixie-slim@sha256:837853d0f4703dbada56fd0807ea1db01eccca02db0af3b1f0cee5e902077107
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
