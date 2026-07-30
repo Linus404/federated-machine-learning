@@ -659,7 +659,7 @@ class ArtifactFlowTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
+            root = Path(tmpdir).resolve()
             evaluation_dir = root / "evaluation"
             test_rows = [
                 {"text": "untouched negative", "label": 0},
@@ -1065,7 +1065,7 @@ class ArtifactFlowTests(unittest.TestCase):
 
     def test_preparation_lock_rejects_concurrent_writer_before_loading(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
+            root = Path(tmpdir).resolve()
             roots = {
                 "client": root / "clients",
                 "public": root / "public",

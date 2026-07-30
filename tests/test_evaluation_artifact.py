@@ -73,7 +73,7 @@ class EvaluationArtifactTests(unittest.TestCase):
 
     def test_publication_is_deterministic_ordered_and_fully_verifiable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
+            root = Path(tmpdir).resolve()
             first = publish_evaluation_artifact(
                 self.rows, root / "first", protocol=self.protocol
             )
@@ -116,7 +116,7 @@ class EvaluationArtifactTests(unittest.TestCase):
 
     def test_publication_rejects_existing_and_symlink_destinations(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
+            root = Path(tmpdir).resolve()
             existing = root / "existing"
             existing.mkdir()
             with self.assertRaisesRegex(FileExistsError, "refusing replacement"):
@@ -131,7 +131,7 @@ class EvaluationArtifactTests(unittest.TestCase):
 
     def test_publication_cleans_owned_crash_residue_and_retries(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
+            root = Path(tmpdir).resolve()
             residue = root / ".evaluation.crashed.staging"
             residue.mkdir()
             (residue / "partial.jsonl").write_bytes(b"partial")
@@ -147,7 +147,7 @@ class EvaluationArtifactTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
+            root = Path(tmpdir).resolve()
             external = root / "external"
             external.mkdir()
             residue = external / ".evaluation.hostile.staging"
@@ -173,7 +173,7 @@ class EvaluationArtifactTests(unittest.TestCase):
 
     def test_publication_rejects_linked_residue_without_external_deletion(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
+            root = Path(tmpdir).resolve()
             external = root / "external"
             external.mkdir()
             marker = external / "must-survive"
@@ -205,7 +205,9 @@ class EvaluationArtifactTests(unittest.TestCase):
         for name, mutate in mutations.items():
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmpdir:
                 artifact = publish_evaluation_artifact(
-                    self.rows, Path(tmpdir) / "evaluation", protocol=self.protocol
+                    self.rows,
+                    Path(tmpdir).resolve() / "evaluation",
+                    protocol=self.protocol,
                 )
                 records_path = artifact / EVALUATION_RECORDS_FILENAME
                 mutate(records_path)
@@ -226,7 +228,7 @@ class EvaluationArtifactTests(unittest.TestCase):
                     load_evaluation_artifact_snapshot(artifact, protocol=self.protocol)
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
+            root = Path(tmpdir).resolve()
             artifact = publish_evaluation_artifact(
                 self.rows, root / "evaluation", protocol=self.protocol
             )
@@ -239,7 +241,7 @@ class EvaluationArtifactTests(unittest.TestCase):
 
         if os.name != "nt":
             with tempfile.TemporaryDirectory() as tmpdir:
-                root = Path(tmpdir)
+                root = Path(tmpdir).resolve()
                 artifact = publish_evaluation_artifact(
                     self.rows, root / "evaluation", protocol=self.protocol
                 )
@@ -253,7 +255,9 @@ class EvaluationArtifactTests(unittest.TestCase):
     def test_loader_rejects_manifest_schema_drift(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             artifact = publish_evaluation_artifact(
-                self.rows, Path(tmpdir) / "evaluation", protocol=self.protocol
+                self.rows,
+                Path(tmpdir).resolve() / "evaluation",
+                protocol=self.protocol,
             )
             manifest_path = artifact / EVALUATION_MANIFEST_FILENAME
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -266,7 +270,9 @@ class EvaluationArtifactTests(unittest.TestCase):
     def test_loader_rejects_unmanifested_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             artifact = publish_evaluation_artifact(
-                self.rows, Path(tmpdir) / "evaluation", protocol=self.protocol
+                self.rows,
+                Path(tmpdir).resolve() / "evaluation",
+                protocol=self.protocol,
             )
             (artifact / "unexpected.txt").write_text("unbound", encoding="utf-8")
 
@@ -372,7 +378,7 @@ class EvaluationArtifactTests(unittest.TestCase):
         vectorizer = build_vectorizer(dataset["train"]["text"])
         with tempfile.TemporaryDirectory() as tmpdir:
             artifact = publish_evaluation_artifact(
-                dataset["test"], Path(tmpdir) / "evaluation"
+                dataset["test"], Path(tmpdir).resolve() / "evaluation"
             )
             snapshot = load_evaluation_artifact_snapshot(artifact)
 
