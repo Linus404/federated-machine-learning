@@ -1,0 +1,116 @@
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("KERAS_BACKEND", "tensorflow")
+
+import numpy as np
+
+from src.local_training import (
+    DEFAULT_EMBEDDING_DIM,
+    DEFAULT_LOCAL_EPOCHS,
+    build_model,
+    load_partition,
+    vocab_size,
+)
+from src.paths import data_dir_path, default_data_dir
+
+CLIP = 1.0
+
+
+def add_layer_noise(w_before: np.ndarray, w_after: np.ndarray, clip: float, multiplier: float) -> np.ndarray:
+    """Same clip-then-noise mechanism as SentimentClient._add_update_noise, isolated to one layer."""
+    update = w_after - w_before
+    norm = np.linalg.norm(update)
+    update = update / max(1.0, norm / clip)
+    if multiplier > 0:
+        noise = np.random.normal(0, multiplier * clip, update.shape)
+        update = update + noise
+    return update
+
+
+def rare_ground_truth_vocab(x_train: np.ndarray, max_doc_freq: int = 3) -> set:
+    """Words appearing in at most max_doc_freq documents — hard to guess by chance."""
+    doc_freq = {}
+    for doc in x_train:
+        for token in set(doc.tolist()):
+            if token != 0:
+                doc_freq[token] = doc_freq.get(token, 0) + 1
+    return {t for t, f in doc_freq.items() if f <= max_doc_freq}
+
+
+def predicted_vocab(embedding_update: np.ndarray, top_k: int) -> set:
+    """Rows of the embedding update with the largest norm -> predicted 'used' words."""
+    row_norms = np.linalg.norm(embedding_update, axis=1)
+    idx = np.argsort(row_norms)[-top_k:]
+    return set(int(i) for i in idx)
+
+
+def precision_recall_f1(predicted: set, truth: set) -> tuple:
+    if not predicted:
+        return 0.0, 0.0, 0.0
+    tp = len(predicted & truth)
+    precision = tp / len(predicted)
+    recall = tp / len(truth) if truth else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    return precision, recall, f1
+
+
+def full_ground_truth_vocab(x_train: np.ndarray) -> set:
+    """Every non-padding token id actually seen by this client (used vs never-used)."""
+    ids = np.unique(x_train)
+    return set(int(i) for i in ids if i != 0)
+
+
+def predicted_used_vocab(embedding_update: np.ndarray, threshold: float = 1e-6) -> set:
+    """Rows with non-negligible gradient norm -> predicted 'used' words."""
+    row_norms = np.linalg.norm(embedding_update, axis=1)
+    return set(int(i) for i in np.where(row_norms > threshold)[0])
+
+
+def run_leakage_test(
+    partition: int = 0,
+    noise_multiplier: float = 0.0,
+    data_dir=None,
+    embedding_dim: int = DEFAULT_EMBEDDING_DIM,
+    epochs: int = DEFAULT_LOCAL_EPOCHS,
+    batch_size: int = 64,
+) -> None:
+    resolved_data_dir = data_dir_path(data_dir)
+    (x_train, y_train), _ = load_partition(resolved_data_dir, partition, validation_split=0.2)
+
+    model = build_model(vocab_size(resolved_data_dir), x_train.shape[1], embedding_dim)
+    weights_before = [w.copy() for w in model.get_weights()]
+
+    model.fit(x_train, y_train, epochs=epochs, batch_size=batch_size, verbose=0)
+    weights_after = model.get_weights()
+
+    embedding_update = add_layer_noise(
+        weights_before[0], weights_after[0], clip=CLIP, multiplier=noise_multiplier
+    )
+
+    truth = full_ground_truth_vocab(x_train)
+    predicted = predicted_used_vocab(embedding_update)
+    precision, recall, f1 = precision_recall_f1(predicted, truth)
+
+    print(f"noise_multiplier={noise_multiplier}")
+    print(f"  true vocabulary size used by client: {len(truth)}")
+    print(f"  attacker recovered (top-{len(truth)} by gradient norm):")
+    print(f"    precision={precision:.3f}  recall={recall:.3f}  f1={f1:.3f}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Embedding-gradient vocabulary leakage test.")
+    parser.add_argument("--partition", type=int, default=0)
+    parser.add_argument("--noise-multiplier", type=float, default=0.0)
+    parser.add_argument("--data-dir", type=Path, default=default_data_dir())
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    run_leakage_test(partition=args.partition, noise_multiplier=args.noise_multiplier, data_dir=args.data_dir)
